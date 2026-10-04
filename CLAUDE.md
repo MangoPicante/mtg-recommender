@@ -25,14 +25,14 @@ git checkout main && git pull origin main && git fetch --prune
 
 ## Comment Style
 
-Comments should be **verbose and frequent** — this project leans toward over-explaining rather than under-explaining. The default "self-documenting code needs no comments" rule does **not** apply here.
+Comments should be **frequent but concise**. The default "self-documenting code needs no comments" rule does **not** apply — assume a reader cold-starting on the file; most non-trivial lines deserve some explanation. But explain in a sentence, not a paragraph.
 
-- Every module gets a top-of-file docstring describing what it does, the shape of its inputs/outputs, and any non-obvious invariants.
-- Every function gets a docstring. Public helpers get the full "why does this exist / what are the edge cases / what does the caller need to know" treatment — see `scryfall_fetch.py` for the house style.
-- Inline comments are encouraged whenever logic isn't immediately obvious from the code alone — especially around regexes, data-shape assumptions, timestamp handling, and anywhere a reader might ask "why this way?".
-- Prefer explaining the **why** (the hidden constraint, the Scryfall quirk, the past bug) over restating the **what**. But when the "what" is dense (nested comprehensions, non-trivial parsing), spell it out too.
+- Every module gets a top-of-file docstring: what it does, input/output shape, any non-obvious invariant. One or two short paragraphs — not a tour of every function.
+- Every function gets a docstring. Lead with one line stating what it does. Add a second paragraph only when the **why**, a hidden constraint, or an edge case genuinely needs it.
+- Inline comments go in wherever logic isn't obvious from the code — regexes, data-shape assumptions, timestamp quirks, workarounds. One or two lines each.
+- Prefer the **why** (the hidden constraint, the Scryfall quirk, the past bug) over the **what**. Restate the **what** only when the code is genuinely dense (nested comprehensions, bit-twiddling, non-trivial parsing).
 
-If a block of logic would make a new reader pause to figure out what's happening, add a comment.
+If a block would make a new reader pause, add a comment. If a comment can be cut in half without losing meaning, cut it.
 
 ## Commit Hygiene
 
