@@ -55,13 +55,13 @@ test-verbose:
 check *ARGS:
     mtg-check {{ARGS}}
 
-# Fetch oracle text into Mongo (`scryfall-fetch` wrapper; add --refresh to force).
-fetch *ARGS:
-    scryfall-fetch {{ARGS}}
+# Fetch oracle text into Mongo (`scryfall-fetch` wrapper; idempotent + diff-aware, no flags).
+fetch:
+    scryfall-fetch
 
-# Download oracle_tags bulk and attach tags to cards (`scryfall-fetch-tags`).
-tags *ARGS:
-    scryfall-fetch-tags {{ARGS}}
+# Download oracle_tags bulk and attach tags to cards (`scryfall-fetch-tags`; idempotent, no flags).
+tags:
+    scryfall-fetch-tags
 
 # Inspect what's in Mongo (`mtg-inspect` wrapper: card / tag / list / stats).
 inspect *ARGS:
@@ -79,10 +79,10 @@ embed-smoke:
 fuse *ARGS:
     mtg-embed fuse {{ARGS}}
 
-# Populate Mongo end-to-end: fetch → tag → embed cards + tags → fuse. Idempotent (reruns skip work the collection already covers); --refresh forces every step.
+# Populate Mongo end-to-end: fetch → tag → embed cards + tags → fuse. Idempotent and diff-aware — reruns re-encode only cards whose oracle_text or tags changed; `--refresh` on an embed step forces that step.
 populate *ARGS:
-    scryfall-fetch {{ARGS}}
-    scryfall-fetch-tags {{ARGS}}
+    scryfall-fetch
+    scryfall-fetch-tags
     mtg-embed cards {{ARGS}}
     mtg-embed tags {{ARGS}}
     mtg-embed fuse {{ARGS}}

@@ -1,36 +1,46 @@
-"""Fetch Scryfall oracle text into MongoDB (bulk-only).
+"""Fetch Scryfall oracle text into MongoDB (bulk-only, diff-aware).
 
 Downloads Scryfall's `oracle_cards` bulk file — a single gzip-compressed
-JSON Lines dump of every unique card — and upserts every entry into the
-cards collection. There is no per-card HTTP mode: fetching one card at
-a time against /cards/named was deleted because every real workflow in
-this project (embeddings, tag attachment, recommendations) wants the
-full cache anyway, and `extract-oracle` handles the "subset for a
-decklist" case against the already-populated cache.
+JSON Lines dump of every unique card — and merges only what actually
+changed into the cards collection.
+
+Per-card diff via `oracle_text_sha`:
+
+    Each card doc carries `oracle_text_sha` — the first 16 hex chars of
+    sha256(oracle_text). On a bulk merge, incoming cards are classified
+    as new / changed / unchanged by comparing the fresh sha against the
+    stored one. Unchanged cards get no write at all. Changed cards get
+    the owned fields re-set AND `text_embedding` + `card_vector`
+    `$unset` so downstream `mtg-embed cards` / `mtg-embed fuse` runs
+    re-encode them automatically (their default "skip if field exists"
+    path then rebuilds exactly what was invalidated — no --refresh
+    needed).
+
+    On a typical Scryfall snapshot bump only a handful of oracle texts
+    revise, so the merge becomes a tiny bulk_write rather than ~40k
+    pointless $set operations.
 
 Storage (MongoDB — see `storage.py` for connection details):
 
     cards collection — one document per card, _id = scryfall_id:
 
         {
-          "_id":        "<scryfall_id>",       # Mongo primary key
-          "scryfall_id":"<same as _id>",
-          "oracle_id":  "<Scryfall oracle id — the join key for tags>",
-          "name":       "...",
-          "names":      ["lightning bolt", "lightning bolt // lightning bolt"],
-                                               # lowered aliases on this doc;
-                                               # a multikey index makes
-                                               # `find({"names": lowered})`
-                                               # fast and ambiguity-tolerant.
-          "mana_cost":  "...",
-          "type_line":  "...",
-          "oracle_text":"...",
-          "updated_at": "<UTC ISO 8601>"
+          "_id":              "<scryfall_id>",       # Mongo primary key
+          "scryfall_id":      "<same as _id>",
+          "oracle_id":        "<join key for oracle_tags>",
+          "name":             "...",
+          "names":            ["lightning bolt", ...],  # lowered aliases
+          "mana_cost":        "...",
+          "type_line":        "...",
+          "oracle_text":      "...",
+          "oracle_text_sha":  "<16-hex sha256 prefix>", # the diff key
+          "updated_at":       "<snapshot ISO 8601>"
         }
 
-    `tags` is owned by the oracle_tags module and is deliberately NOT set
-    by this module — upserts use $set on the fields the fetcher owns so
-    an existing card's tags survive a bulk refresh.
+    `tags`, `text_embedding`, and `card_vector` are owned by other
+    modules; the fetcher uses $set on only its own fields and `$unset`
+    on the two downstream embedding fields when a card's oracle_text
+    changed. An unchanged card keeps every pre-existing field intact.
 
 Why id-primary + per-doc names array:
 
@@ -43,40 +53,21 @@ Why id-primary + per-doc names array:
     alias collection. The lookup helper lives here so downstream modules
     (`extract_oracle`, `explore`) can reuse it.
 
-Per-card `updated_at` semantics:
+Download triggers:
 
-    Every merged card is stamped with the snapshot's own `updated_at`
-    (the value Scryfall gives us for that dump), identical across every
-    card in a given merge. That makes the staleness scan a straight
-    `cached_entry.updated_at < snapshot.updated_at` compare and keeps
-    successive runs idempotent.
+    1. Empty cards collection, OR
+    2. The `meta` collection's stored snapshot timestamp doesn't match
+       the current `/bulk-data` metadata (snapshot moved since last run).
 
-Bulk-download triggers (any one is enough):
-
-    1. --refresh flag set.
-    2. Empty cards collection.
-    3. The `meta` collection records no previous merge, AND any cached
-       card's `updated_at` is older than the current bulk snapshot's
-       `updated_at` — merging refreshes that entry.
-
-    If none apply, skip the ~24 MB download.
-
-Rerun fast-path:
-
-    After a successful merge (or when the slow-path staleness scan
-    determines the cache is already current), the current snapshot's
-    `updated_at` is stored in the `meta` collection under
-    `_id = "oracle_cards"`. On a subsequent run, if the stored timestamp
-    matches the current `/bulk-data` metadata and the cache is non-empty,
-    the module skips without reading any card docs — O(1) Mongo work
-    (one `meta` read) instead of an O(n) scan of every card's
-    `updated_at`. The slow-path staleness scan remains as the correctness
-    fallback for pre-meta clusters and the first run after upgrading.
+    Otherwise skip the ~24 MB download: one `/bulk-data` call + one
+    `meta` read and we're done. This is the common `just populate`
+    rerun path. There is no `--refresh` flag — the diff detects every
+    legitimate reason to re-encode a card. To force a full rebuild (for
+    corruption recovery), drop the cards collection and rerun.
 
 Usage (after `pip install -e .`, with MONGODB_URI set in .env):
 
-    scryfall-fetch                 # pull if needed, else report snapshot already covered
-    scryfall-fetch --refresh       # force redownload + merge
+    scryfall-fetch                 # idempotent: no-op if snapshot already covered
 
 Equivalently from a source checkout without installing:
     python -m mtg_recommender.scryfall_fetch
@@ -85,11 +76,11 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import re
 import sys
 import urllib.request
-from datetime import datetime
 from pathlib import Path
 
 from pymongo import UpdateOne
@@ -120,6 +111,17 @@ HEADERS = {
 # ---------------------------------------------------------------------------
 # Card projection
 # ---------------------------------------------------------------------------
+
+def oracle_text_sha(oracle_text: str | None) -> str:
+    """Short content signature of the stored oracle_text.
+
+    First 16 hex chars of sha256 — 64 bits is overkill for distinguishing
+    ~40 k cards (birthday-collision probability on 40 k docs is ~4e-11).
+    The input is normalised to the empty string when None so a card
+    without oracle text still gets a stable sha rather than crashing.
+    """
+    return hashlib.sha256((oracle_text or "").encode("utf-8")).hexdigest()[:16]
+
 
 def build_names(raw: dict) -> list[str]:
     """Return the lowered-name array a card doc gets stored with.
@@ -227,6 +229,12 @@ def extract_card_fields(data: dict, updated_at: str) -> dict:
         "mana_cost": pick("mana_cost"),
         "type_line": pick("type_line"),
         "oracle_text": oracle_text,
+        # Content signature of the exact oracle_text we store (not the
+        # raw Scryfall field, since multi-face layouts join faces here).
+        # bulk_upsert_cards compares this against the stored sha to
+        # decide which docs actually need re-writing and which embedding
+        # fields to invalidate.
+        "oracle_text_sha": oracle_text_sha(oracle_text),
         "updated_at": updated_at,
     }
 
@@ -248,16 +256,26 @@ def http_get_json(url: str, timeout: int = 30) -> dict:
 #
 # Every mutating op targets only the fields THIS module owns and uses $set
 # (not replace) so an existing card's `tags` array — written by the
-# oracle_tags module — survives a bulk refresh. The fields owned here are:
+# oracle_tags module — survives a bulk merge. The fields owned here are:
 #
 #     _id, scryfall_id, oracle_id, name, names, mana_cost, type_line,
-#     oracle_text, updated_at
+#     oracle_text, oracle_text_sha, updated_at
+#
+# A content-change merge also $unsets `text_embedding` and `card_vector`
+# — not owned here, but conceptually downstream of oracle_text, so a
+# fresh text invalidates both. See bulk_upsert_cards.
 
 # Field keys scryfall_fetch sets on an upsert.
 _OWNED_FIELDS = (
     "scryfall_id", "oracle_id", "name", "names",
-    "mana_cost", "type_line", "oracle_text", "updated_at",
+    "mana_cost", "type_line", "oracle_text", "oracle_text_sha", "updated_at",
 )
+
+# Downstream fields the fetcher $unsets when a card's oracle_text changes.
+# Clearing them triggers re-encode / re-fuse on the next `mtg-embed` run
+# via that CLI's default "skip when field exists" path. Listed as a
+# constant so the invalidation surface is explicit.
+_DOWNSTREAM_INVALIDATED = ("text_embedding", "card_vector")
 
 
 def _set_payload(doc: dict) -> dict:
@@ -285,28 +303,74 @@ def upsert_card(coll: Collection, raw: dict, updated_at: str) -> bool:
     return True
 
 
-def bulk_upsert_cards(coll: Collection, bulk: list[dict], snapshot_updated_at: str) -> int:
-    """Upsert every card from a bulk list in a single pymongo bulk_write call.
+def bulk_upsert_cards(
+    coll: Collection, bulk: list[dict], snapshot_updated_at: str
+) -> tuple[int, int, int]:
+    """Diff-aware upsert of a bulk list. Returns (new, changed, unchanged).
 
-    `bulk_write` is massively faster than per-doc `update_one` for the
-    ~40k oracle_cards dump — pymongo batches ops under the hood and
-    sends them to the server in groups. `ordered=False` lets failures
-    on individual ops not stop the rest; a card with no `id` is just
-    skipped as it is in the single-doc path.
+    Loads every stored `oracle_text_sha` into memory first (one Mongo
+    read of ~40 k tiny docs), then classifies each incoming card against
+    its stored sha:
 
-    Returns the count of ops queued (which equals the count of cards
-    with a usable id — practically all of them for a real snapshot).
+      - unchanged (stored sha matches): emits no write at all.
+      - changed (stored sha differs): $set the owned fields AND $unset
+        `text_embedding` + `card_vector` so downstream re-encodes pick
+        up only the cards that actually need redoing.
+      - new (no stored sha): $set the owned fields with upsert=True; no
+        downstream fields exist yet so there's nothing to unset.
+
+    `bulk_write(ordered=False)` lets individual failed ops not stop the
+    rest. A card without an `id` in the raw dict is skipped (same
+    semantics as the single-doc path).
+
+    Why return a 3-tuple instead of just a count: the CLI reports it to
+    the user, and tests assert on the breakdown so a regression that
+    secretly rewrites every card is caught.
     """
+    # One projection scan of the whole collection. The index on _id makes
+    # this a sequential read of the smallest possible subdocument.
+    existing_shas: dict[str, str | None] = {
+        doc["_id"]: doc.get("oracle_text_sha")
+        for doc in coll.find({}, {"_id": 1, "oracle_text_sha": 1})
+    }
+
+    new_count = changed_count = unchanged_count = 0
     ops: list[UpdateOne] = []
     for raw in bulk:
         doc = extract_card_fields(raw, updated_at=snapshot_updated_at)
         sid = doc["_id"]
         if not sid:
             continue
-        ops.append(UpdateOne({"_id": sid}, {"$set": _set_payload(doc)}, upsert=True))
+        new_sha = doc["oracle_text_sha"]
+        stored_sha = existing_shas.get(sid)
+        if stored_sha == new_sha and sid in existing_shas:
+            # Content unchanged; owned-field churn (updated_at bump,
+            # name case-fix, etc.) isn't worth a write. Downstream
+            # embeddings stay valid.
+            unchanged_count += 1
+            continue
+        if sid not in existing_shas:
+            # New card — nothing downstream to invalidate.
+            ops.append(UpdateOne({"_id": sid}, {"$set": _set_payload(doc)}, upsert=True))
+            new_count += 1
+        else:
+            # Changed card — clear the two downstream fields so the
+            # next `mtg-embed cards` / `mtg-embed fuse` re-encodes it.
+            # Everything else owned by this module gets refreshed.
+            ops.append(
+                UpdateOne(
+                    {"_id": sid},
+                    {
+                        "$set": _set_payload(doc),
+                        "$unset": {field: "" for field in _DOWNSTREAM_INVALIDATED},
+                    },
+                )
+            )
+            changed_count += 1
+
     if ops:
         coll.bulk_write(ops, ordered=False)
-    return len(ops)
+    return new_count, changed_count, unchanged_count
 
 
 def find_cards_by_name(coll: Collection, name: str) -> list[dict]:
@@ -321,38 +385,6 @@ def find_cards_by_name(coll: Collection, name: str) -> list[dict]:
     function stays neutral and returns every matching doc.
     """
     return list(coll.find({"names": name.lower()}))
-
-
-def has_stale_cards(coll: Collection, snapshot_updated_at: str) -> bool:
-    """Does the cards collection hold any entry older than the current snapshot?
-
-    Timestamps are stored as ISO 8601 strings. ISO 8601 strings written
-    with the same fractional-second precision are directly string-comparable,
-    but Scryfall is not quite consistent about trailing zeros, so string
-    compare of e.g. "...40.749+00:00" vs "...40.749000+00:00" would
-    spuriously flag the former as older. We compare with
-    `datetime.fromisoformat` on both sides by doing the scan client-side
-    — one tiny read of `updated_at` plus `_id` per document is enough.
-
-    Returns True on the first stale entry found; iteration stops there.
-    Malformed or missing `updated_at` values are skipped (treated as
-    "not stale") so a corrupted doc doesn't force a 24 MB redownload.
-    """
-    snapshot_dt = datetime.fromisoformat(snapshot_updated_at)
-    # Project only the fields we need to keep the scan cheap. The server
-    # streams one small subdocument per card rather than the full ~2 KB
-    # payload.
-    for entry in coll.find({}, {"updated_at": 1}):
-        entry_ts = entry.get("updated_at")
-        if not entry_ts:
-            continue
-        try:
-            entry_dt = datetime.fromisoformat(entry_ts)
-        except ValueError:
-            continue
-        if entry_dt < snapshot_dt:
-            return True
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -487,22 +519,25 @@ def read_names(args: argparse.Namespace) -> list[str]:
 # Mode implementations
 # ---------------------------------------------------------------------------
 
-def run_bulk_mode(coll: Collection, refresh: bool) -> bool:
+def run_bulk_mode(coll: Collection) -> bool:
     """Ensure Mongo holds the current Scryfall oracle_cards snapshot.
 
-    Fast-path (common case on a rerun): if the `meta` collection records
-    that we've already merged this exact snapshot and the cache is
-    non-empty, skip without reading any card docs — one meta read is
-    enough. This is what makes `just populate` cheap to rerun.
+    Fast-path (the common `just populate` rerun): if `meta` records this
+    exact snapshot and the cache is non-empty, skip without reading any
+    card docs. One `/bulk-data` call + one `meta` read.
 
-    Slow-path (correctness fallback): on a pre-meta cluster, --refresh,
-    an empty cache, or a stored timestamp that doesn't match the current
-    `/bulk-data` metadata, fall through to the staleness scan. If every
-    card is at least as fresh as the snapshot, skip the download anyway
-    and record the snapshot timestamp so the next run hits the fast path.
+    Download-path: either `meta` is unset (fresh cluster), the stored
+    snapshot timestamp doesn't match the current one, or the collection
+    is empty. `bulk_upsert_cards` then diffs each incoming card against
+    its stored `oracle_text_sha` — unchanged cards get no write;
+    content-changed cards get re-set plus `$unset` on `text_embedding`
+    and `card_vector` so the next `mtg-embed` run picks up the real
+    delta instead of either re-encoding the world or missing the staleness.
 
     Returns True iff the collection changed, so `main` can print the
-    final doc count only when it's actually useful.
+    final count only when it's useful. There is no `--refresh` flag —
+    the diff is the source of truth. To force a full rebuild, drop the
+    cards collection and rerun.
     """
     meta = get_bulk_oracle_metadata()
     snapshot_updated_at = meta["updated_at"]
@@ -510,34 +545,24 @@ def run_bulk_mode(coll: Collection, refresh: bool) -> bool:
     cards_present = coll.estimated_document_count() > 0
     stored_snapshot = storage.get_snapshot_timestamp(META_SOURCE)
 
-    # Fast path: meta says we're already covering this snapshot. No card
-    # reads at all, so even a 40k-card collection reruns in milliseconds.
-    if not refresh and cards_present and stored_snapshot == snapshot_updated_at:
-        print(f"bulk  : already fresh (snapshot {snapshot_updated_at}); pass --refresh to force")
-        return False
-
-    needs_download = (
-        refresh
-        or not cards_present
-        or has_stale_cards(coll, snapshot_updated_at)
-    )
-
-    if not needs_download:
-        # Slow-path concluded nothing's stale. Record the snapshot so the
-        # next run upgrades to the fast path.
-        storage.set_snapshot_timestamp(META_SOURCE, snapshot_updated_at)
-        print(f"bulk  : collection already covers snapshot {snapshot_updated_at}")
+    # Fast path: meta says we're already covering this snapshot.
+    if cards_present and stored_snapshot == snapshot_updated_at:
+        print(f"bulk  : already fresh (snapshot {snapshot_updated_at})")
         return False
 
     bulk = download_bulk_oracle_cards(meta)
-    before = coll.estimated_document_count()
-    bulk_upsert_cards(coll, bulk, snapshot_updated_at)
-    after = coll.estimated_document_count()
+    new_count, changed_count, unchanged_count = bulk_upsert_cards(
+        coll, bulk, snapshot_updated_at
+    )
+    total = new_count + changed_count + unchanged_count
+    print(
+        f"bulk  : {new_count} new, {changed_count} changed, "
+        f"{unchanged_count} unchanged (of {total} in snapshot)"
+    )
     # Record the snapshot last so a crash mid-merge leaves meta un-set and
     # the next run retries rather than falsely claiming freshness.
     storage.set_snapshot_timestamp(META_SOURCE, snapshot_updated_at)
-    print(f"bulk  : collection now holds {after} unique cards (was {before})")
-    return True
+    return new_count > 0 or changed_count > 0
 
 
 # ---------------------------------------------------------------------------
@@ -546,13 +571,14 @@ def run_bulk_mode(coll: Collection, refresh: bool) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Download Scryfall's oracle_cards bulk and merge it into MongoDB."
+        description=(
+            "Download Scryfall's oracle_cards bulk and merge it into MongoDB. "
+            "Idempotent and diff-aware — rerun freely; only new/changed cards "
+            "produce writes, and content-changed cards invalidate stale "
+            "embeddings so `mtg-embed` picks them up automatically."
+        )
     )
-    parser.add_argument(
-        "--refresh", action="store_true",
-        help="Force redownload of the bulk snapshot even if the cache looks current.",
-    )
-    args = parser.parse_args()
+    parser.parse_args()  # no flags; parse to surface -h/--help cleanly
 
     # Ensure indexes before any read/write — idempotent on Mongo's side,
     # so the cost is one trip per CLI run and brand-new deployments work
@@ -560,7 +586,7 @@ def main() -> int:
     storage.ensure_indexes()
     coll = storage.cards_collection()
 
-    changed = run_bulk_mode(coll, args.refresh)
+    changed = run_bulk_mode(coll)
     if changed:
         total = coll.estimated_document_count()
         print(f"\nsaved {total} unique cards to MongoDB ({coll.database.name}.{coll.name})")

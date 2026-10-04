@@ -68,18 +68,30 @@ near-100 % unmatched rate usually means the cards cache was built
 before oracle_id was added to the projection; `scryfall-fetch
 --refresh` repopulates.
 
-Note on the --refresh / fresh-snapshot interaction: when the stored
-snapshot timestamp matches the current /bulk-data snapshot, the
-module skips the download AND the re-attach step. That's because the
-raw taggings aren't retained after import — only the catalog and the
-per-card tags array. A user who added new cards to the collection
-since the last tag import and wants them tagged should pass
---refresh to force a redownload.
+Download triggers:
+
+    - `meta` has no stored snapshot timestamp (fresh cluster), OR
+    - the stored snapshot timestamp doesn't match current `/bulk-data`
+      (upstream shipped a new snapshot), OR
+    - any card in the collection has no `tags` field (a prior
+      `scryfall-fetch` run added cards after the last tag import).
+
+    Otherwise skip the ~6 MB download: the catalog and per-card tags
+    arrays are still correct.
+
+Diff-aware attach: on an attach pass, `attach_tags_to_cards` loads the
+current oracle_id → tags mapping, compares to the new mapping, and
+writes only to oracle_ids whose tag list actually changed —
+`$unset`-ing `card_vector` on those cards so `mtg-embed fuse` re-fuses
+only what moved. Unchanged oracle_ids get no write at all.
+
+There is no `--refresh` flag — the auto-detect triggers above cover
+every legitimate reason to redownload. For debugging / corruption
+recovery, drop the stored meta entry or the tags collection.
 
 Usage (after `pip install -e .`, with MONGODB_URI set in .env):
 
-    scryfall-fetch-tags              # downloads if snapshot is new; attaches
-    scryfall-fetch-tags --refresh    # redownload even if snapshot matches
+    scryfall-fetch-tags              # idempotent; downloads only when needed
 
 Equivalently from a source checkout without installing:
 
@@ -278,54 +290,79 @@ def upsert_tag_catalog(coll: Collection, catalog: dict[str, dict]) -> None:
 def attach_tags_to_cards(
     coll: Collection,
     oracle_id_to_slugs: dict[str, list[str]],
-) -> tuple[int, int, int]:
-    """Set `tags` on every card doc. Returns (matched, empty, unmatched).
+) -> tuple[int, int, int, int]:
+    """Diff-aware set of per-card tags. Returns (changed_oids, matched, empty, unmatched).
 
-    Semantics:
-      - matched  : card had an oracle_id that appeared in the tagger
-                   data, and tags were attached.
-      - empty    : card had an oracle_id but no tags apply to it (empty
-                   list set), OR the card had no oracle_id at all. The
-                   important invariant is that every card ends up with
-                   a `tags` field so downstream code can rely on it
-                   existing.
-      - unmatched: oracle_ids in the tagger data that didn't correspond
-                   to any card. Expected to be large when the cards
-                   collection is a partial subset (e.g. one decklist).
+    Loads the current oracle_id → tags mapping from the collection (one
+    aggregation; same tags array for every reprint of the same gameplay
+    card, so we take any one of them with `$first`). Then compares to
+    the fresh `oracle_id_to_slugs` and writes only to oracle_ids whose
+    tag list actually changed, `$unset`-ing `card_vector` on those
+    cards so `mtg-embed fuse` re-fuses only what moved. Unchanged
+    oracle_ids get no write.
 
-    Implementation: clear every card's `tags` first (so a tag removed
-    upstream disappears from affected cards), then bulk-apply the new
-    tags one UpdateMany per oracle_id. The index on `oracle_id` keeps
-    this efficient; the full ~36k-op bulk_write fits well under
-    Mongo's single-command 16 MB limit.
+    Semantics of the returned counts:
+      - changed_oids: how many oracle_ids were actually written to —
+                      the "work done" number for a reader.
+      - matched : card has an oracle_id with ≥1 tag in the new mapping.
+      - empty   : card ended up with `tags: []` (no oracle_id, or an
+                  oracle_id with no entries in the mapping). Downstream
+                  code can rely on `tags` being present on every card.
+      - unmatched: tagger oracle_ids not in the cards collection
+                   (partial-cache cost; expected large on a decklist-
+                   sized cache).
+
+    One pre-pass ensures every card has at least `tags: []` set — a
+    freshly-fetched card from scryfall-fetch has no `tags` field at
+    all, which would break downstream code that assumes the field
+    exists.
     """
-    # Step 1: clear every card's tags so previously-tagged cards whose
-    # oracle_id has lost all its tags get an empty list rather than
-    # keeping stale data from a prior import.
-    coll.update_many({}, {"$set": {"tags": []}})
+    # Pre-pass: cards added by scryfall-fetch after a prior tag import
+    # have no `tags` field. Set them to [] so every doc has it; the
+    # per-oid writes below will overwrite the entries that actually
+    # have tags.
+    coll.update_many({"tags": {"$exists": False}}, {"$set": {"tags": []}})
 
-    # Step 2: bulk-apply new tags. UpdateMany per oracle_id uses the
-    # multikey-safe equality query against the indexed field.
-    ops = [
-        UpdateMany({"oracle_id": oid}, {"$set": {"tags": slugs}})
-        for oid, slugs in oracle_id_to_slugs.items()
-    ]
+    # Current per-oracle_id tags: one aggregation does what N find_ones
+    # would. `$first` is safe because every reprint of the same oracle
+    # entity should carry the same tag list.
+    current: dict[str, list[str]] = {}
+    for doc in coll.aggregate([
+        {"$match": {"oracle_id": {"$ne": None}}},
+        {"$group": {"_id": "$oracle_id", "tags": {"$first": "$tags"}}},
+    ]):
+        current[doc["_id"]] = doc.get("tags") or []
+
+    # Build the diff. Oracle_ids present in new OR current need checking;
+    # the symmetric difference catches both "new tags" and "all tags
+    # cleared".
+    all_oids = set(current.keys()) | set(oracle_id_to_slugs.keys())
+    ops: list[UpdateMany] = []
+    for oid in all_oids:
+        new_tags = oracle_id_to_slugs.get(oid, [])
+        old_tags = current.get(oid, [])
+        if new_tags == old_tags:
+            continue
+        # Content changed — $unset card_vector so the fused vector gets
+        # rebuilt from the new tag list on the next `mtg-embed fuse` run.
+        ops.append(
+            UpdateMany(
+                {"oracle_id": oid},
+                {"$set": {"tags": new_tags}, "$unset": {"card_vector": ""}},
+            )
+        )
     if ops:
         coll.bulk_write(ops, ordered=False)
 
-    # Step 3: tally up the three stats for the user-facing summary.
+    # Reporting.
     total = coll.estimated_document_count()
     matched = coll.count_documents({"tags": {"$ne": []}})
     empty = total - matched
-
-    # distinct() reads only the index metadata (not full docs); for
-    # ~40k cards this is a single tiny request. Filter out None in case
-    # some stale card lacks oracle_id.
     cards_oracle_ids = {oid for oid in coll.distinct("oracle_id") if oid}
     tagger_oracle_ids = set(oracle_id_to_slugs.keys())
     unmatched = len(tagger_oracle_ids - cards_oracle_ids)
 
-    return matched, empty, unmatched
+    return len(ops), matched, empty, unmatched
 
 
 # ---------------------------------------------------------------------------
@@ -334,13 +371,15 @@ def attach_tags_to_cards(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Download the Scryfall oracle_tags bulk and attach tags to the cards collection.",
+        description=(
+            "Download the Scryfall oracle_tags bulk and attach tags to the "
+            "cards collection. Idempotent and diff-aware — rerun freely; the "
+            "download fires only when the upstream snapshot moves or new "
+            "untagged cards are present, and attach writes only to oracle_ids "
+            "whose tag list actually changed."
+        ),
     )
-    parser.add_argument(
-        "--refresh", action="store_true",
-        help="Redownload even if the stored snapshot already matches the current one.",
-    )
-    args = parser.parse_args()
+    parser.parse_args()  # no flags; parse to surface -h/--help cleanly
 
     # Make sure the indexes we rely on exist. ensure_indexes is idempotent,
     # so a brand-new deployment and a long-running cluster hit the same
@@ -362,17 +401,22 @@ def main() -> int:
     meta = get_bulk_oracle_tags_metadata()
     snapshot_updated_at = meta["updated_at"]
     stored_snapshot = storage.get_snapshot_timestamp(META_SOURCE)
-    if stored_snapshot == snapshot_updated_at and not args.refresh:
-        print(f"tags  : already fresh (snapshot {snapshot_updated_at}); pass --refresh to force")
-        # The raw taggings aren't retained after import, so the attach
-        # step can't be rerun from state alone. If the user added new
-        # cards since the last tag import, --refresh is the way to pick
-        # them up.
-        print(
-            "        new cards added since last import? pass --refresh to re-attach.",
-            file=sys.stderr,
-        )
+
+    # The raw taggings aren't retained after import, so an attach can't
+    # be rerun from state alone. If any card is missing the `tags` field
+    # (added by a scryfall-fetch run after the last tag import), we need
+    # the raw data back to tag it — redownload even when the snapshot
+    # hasn't moved.
+    untagged_cards = cards_coll.count_documents({"tags": {"$exists": False}})
+
+    if stored_snapshot == snapshot_updated_at and untagged_cards == 0:
+        print(f"tags  : already fresh (snapshot {snapshot_updated_at})")
         return 0
+    if stored_snapshot == snapshot_updated_at and untagged_cards > 0:
+        print(
+            f"tags  : snapshot unchanged ({snapshot_updated_at}) but "
+            f"{untagged_cards} cards lack the tags field — redownloading to attach."
+        )
 
     # Step 2: download the bulk + build the catalog and inverted index.
     tags_raw = download_bulk_oracle_tags(meta)
@@ -386,12 +430,15 @@ def main() -> int:
     upsert_tag_catalog(tags_coll, catalog)
     print(f"saved  : {tags_coll.database.name}.{tags_coll.name}")
 
-    # Step 4: attach tags to cards.
-    matched, empty, unmatched = attach_tags_to_cards(cards_coll, oracle_id_to_slugs)
+    # Step 4: attach tags to cards (diff-aware).
+    changed_oids, matched, empty, unmatched = attach_tags_to_cards(
+        cards_coll, oracle_id_to_slugs
+    )
     total_cards = matched + empty
     print(
-        f"cards  : {matched}/{total_cards} tagged, {empty} without tags, "
-        f"{unmatched} tagger oracle_ids didn't match any cached card"
+        f"cards  : {matched}/{total_cards} tagged, {empty} without tags "
+        f"({changed_oids} oracle_ids updated, "
+        f"{unmatched} tagger oracle_ids didn't match any cached card)"
     )
 
     # Step 5: record the snapshot timestamp so a future run can skip
@@ -406,7 +453,8 @@ def main() -> int:
         # obvious remediation.
         print(
             "warning: no cards were tagged. The cards collection may predate the "
-            "oracle_id field — run `scryfall-fetch --refresh ...` to repopulate it.",
+            "oracle_id field — drop the cards collection and rerun scryfall-fetch "
+            "to repopulate it.",
             file=sys.stderr,
         )
         return 1
