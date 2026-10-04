@@ -1,0 +1,22 @@
+# Normalise line endings. Without this, Git on Windows converts LF <-> CRLF
+# on checkout/commit and spams "LF will be replaced by CRLF" warnings on
+# every change. `text=auto` tells Git to detect text files; `eol=lf` stores
+# them with LF endings in the repo (what the rest of the ecosystem expects)
+# while the working tree gets native endings on checkout.
+* text=auto eol=lf
+
+# Keep Windows shell scripts and PowerShell files as CRLF — some tools
+# expect it.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Binary file types: never touch.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
