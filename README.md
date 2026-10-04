@@ -128,7 +128,7 @@ network and will run offline. 96 tests, well under a second total.
 
 ## Project layout
 
-```
+```text
 mtg-recommender/
 ├── src/
 │   └── mtg_recommender/         # installable package
