@@ -177,7 +177,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
     total_tags = tags.estimated_document_count()
     top = _top_tags(limit=args.top)
 
-    tags_snapshot = storage.get_snapshot_timestamp("oracle_tags")
+    tags_snapshot = storage.get_meta_value("oracle_tags")
 
     print(f"cards.{cards.name}:")
     print(f"  total          : {total_cards}")

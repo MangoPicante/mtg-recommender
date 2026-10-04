@@ -542,7 +542,7 @@ class TestMainCLI(_MongoBackedTestCase):
 
         # Snapshot timestamp recorded for the freshness check.
         self.assertEqual(
-            storage.get_snapshot_timestamp(ot.META_SOURCE),
+            storage.get_meta_value(ot.META_SOURCE),
             "2026-10-03T21:00:32.494+00:00",
         )
 
@@ -555,7 +555,7 @@ class TestMainCLI(_MongoBackedTestCase):
         self.cards.insert_one(
             {"_id": "id-x", "oracle_id": "oracle-x", "tags": []}
         )
-        storage.set_snapshot_timestamp(ot.META_SOURCE, "2026-10-03T21:00:32.494+00:00")
+        storage.set_meta_value(ot.META_SOURCE, "2026-10-03T21:00:32.494+00:00")
         metadata_payload = {
             "data": [{
                 "type": "oracle_tags",
@@ -581,7 +581,7 @@ class TestMainCLI(_MongoBackedTestCase):
         self.cards.insert_one(
             {"_id": "id-bolt", "oracle_id": "oracle-bolt"}
         )  # no `tags` field
-        storage.set_snapshot_timestamp(ot.META_SOURCE, "2026-10-03T21:00:32.494+00:00")
+        storage.set_meta_value(ot.META_SOURCE, "2026-10-03T21:00:32.494+00:00")
         metadata_payload = {
             "data": [{
                 "type": "oracle_tags",

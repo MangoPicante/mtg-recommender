@@ -48,9 +48,25 @@ Usage (after `pip install -e .`):
     mtg-embed fuse --alpha 0.7      # weight text more heavily (default 0.6)
     mtg-embed fuse --refresh        # re-fuse every card
 
-Freshness of `card_vector` is still user-driven: a `text_embedding` or
-`tags` change requires `mtg-embed fuse --refresh` to pick it up.
-Auto-invalidation lands in a later slice.
+Auto-invalidation (closes Phase 2 freshness): each `mtg-embed` run
+stamps its active config into the `meta` collection and clears any
+field whose config scalar has drifted since the last run.
+
+    meta.text_embedding_model : env var MTG_EMBEDDING_MODEL at last
+                                `mtg-embed cards` run; on drift,
+                                `$unset` text_embedding + card_vector
+                                on every card.
+    meta.tag_embedding_model  : same env var at last `mtg-embed tags`
+                                run; on drift, `$unset` tag embedding
+                                + every card's card_vector (fused
+                                vectors depend on tag embeddings).
+    meta.fuse_alpha           : --alpha at last `mtg-embed fuse` run;
+                                on drift, `$unset` every card_vector.
+
+`--refresh` remains as a nuclear override, but the common cases
+(model swap, alpha sweep) now Just Work via the signatures above.
+Upstream oracle_text / tag-list changes are already auto-invalidated
+by `scryfall-fetch` / `scryfall-fetch-tags` at the source.
 
 Progress is reported every `log_every` cards/tags so a long run shows signs
 of life. The default is 500.
@@ -89,6 +105,14 @@ DEFAULT_LOG_EVERY = 500
 # aggregate pull similar cards together. Tunable per invocation via
 # `mtg-embed fuse --alpha`; a sweep over an evaluation set is a Phase 3 task.
 DEFAULT_ALPHA = 0.6
+
+# `meta` collection keys used by the auto-invalidation logic. Each run
+# stamps the active config here so a later run detects a drift and
+# $unsets the now-stale embeddings before the normal "skip if field
+# exists" path kicks in. See `_maybe_invalidate_*` helpers below.
+META_TEXT_MODEL = "text_embedding_model"
+META_TAG_MODEL = "tag_embedding_model"
+META_FUSE_ALPHA = "fuse_alpha"
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +192,94 @@ def reset_encoder(encoder=None):
     """Replace the cached encoder (tests inject a fake; pass None to clear)."""
     global _encoder
     _encoder = encoder
+
+
+# ---------------------------------------------------------------------------
+# Auto-invalidation: detect model / alpha drift and clear stale state
+# ---------------------------------------------------------------------------
+#
+# The pattern is the same for all three checks: compare the stored config
+# scalar in `meta` against what the current process would use. On a drift,
+# $unset the now-stale fields and record the new config IMMEDIATELY — a
+# crash mid-encode then leaves meta pointing at the new config, so the
+# resumption just embeds the still-missing cards instead of re-invalidating.
+
+def _current_model_name() -> str:
+    """Resolve the model the encoder would load on first use."""
+    return os.environ.get(MODEL_ENV, DEFAULT_MODEL)
+
+
+def _maybe_invalidate_for_text_model(cards_coll: Collection) -> bool:
+    """Clear text_embedding + card_vector if MTG_EMBEDDING_MODEL changed.
+
+    Also clears `card_vector` because the fused output depends on
+    `text_embedding`. Returns True iff an invalidation ran.
+    """
+    current = _current_model_name()
+    stored = storage.get_meta_value(META_TEXT_MODEL)
+    if stored == current:
+        return False
+    if stored is not None:
+        print(
+            f"model changed ({stored!r} → {current!r}); "
+            "clearing stale text_embedding + card_vector on all cards"
+        )
+        cards_coll.update_many(
+            {"text_embedding": {"$exists": True}},
+            {"$unset": {"text_embedding": "", "card_vector": ""}},
+        )
+    # Record immediately: on a crash mid-embed the next run resumes
+    # without re-invalidating already-missing fields.
+    storage.set_meta_value(META_TEXT_MODEL, current)
+    return stored is not None
+
+
+def _maybe_invalidate_for_tag_model(
+    cards_coll: Collection, tags_coll: Collection
+) -> bool:
+    """Clear tag.embedding + card.card_vector if MTG_EMBEDDING_MODEL changed.
+
+    Tag embeddings land in the tags collection but a change there also
+    makes every card_vector stale (the fuse averages tag embeddings
+    into each card_vector), so we invalidate both sides.
+    """
+    current = _current_model_name()
+    stored = storage.get_meta_value(META_TAG_MODEL)
+    if stored == current:
+        return False
+    if stored is not None:
+        print(
+            f"model changed ({stored!r} → {current!r}); "
+            "clearing stale tag embeddings + card_vector on all cards"
+        )
+        tags_coll.update_many(
+            {"embedding": {"$exists": True}},
+            {"$unset": {"embedding": ""}},
+        )
+        cards_coll.update_many(
+            {"card_vector": {"$exists": True}},
+            {"$unset": {"card_vector": ""}},
+        )
+    storage.set_meta_value(META_TAG_MODEL, current)
+    return stored is not None
+
+
+def _maybe_invalidate_for_alpha(cards_coll: Collection, current_alpha: float) -> bool:
+    """Clear card_vector if the fuse alpha changed since the last run."""
+    stored = storage.get_meta_value(META_FUSE_ALPHA)
+    if stored == current_alpha:
+        return False
+    if stored is not None:
+        print(
+            f"alpha changed ({stored} → {current_alpha}); "
+            "clearing stale card_vector on all cards"
+        )
+        cards_coll.update_many(
+            {"card_vector": {"$exists": True}},
+            {"$unset": {"card_vector": ""}},
+        )
+    storage.set_meta_value(META_FUSE_ALPHA, current_alpha)
+    return stored is not None
 
 
 # ---------------------------------------------------------------------------
@@ -495,8 +607,13 @@ def fuse_card_vectors(
 
 def _cmd_cards(args: argparse.Namespace) -> int:
     storage.ensure_indexes()
+    cards_coll = storage.cards_collection()
+    # Auto-invalidate stale embeddings if MTG_EMBEDDING_MODEL has changed
+    # since the last run — the re-embed loop then naturally picks them up
+    # via the normal "skip if field exists" path.
+    _maybe_invalidate_for_text_model(cards_coll)
     written = embed_cards(
-        storage.cards_collection(),
+        cards_coll,
         refresh=args.refresh,
         batch_size=args.batch_size,
         limit=args.limit,
@@ -506,8 +623,11 @@ def _cmd_cards(args: argparse.Namespace) -> int:
 
 
 def _cmd_tags(args: argparse.Namespace) -> int:
+    cards_coll = storage.cards_collection()
+    tags_coll = storage.tags_collection()
+    _maybe_invalidate_for_tag_model(cards_coll, tags_coll)
     written = embed_tags(
-        storage.tags_collection(),
+        tags_coll,
         refresh=args.refresh,
         batch_size=args.batch_size,
         limit=args.limit,
@@ -519,9 +639,12 @@ def _cmd_tags(args: argparse.Namespace) -> int:
 def _cmd_fuse(args: argparse.Namespace) -> int:
     # Fuse touches only `card_vector`, which already-covered indexes don't
     # care about — no `ensure_indexes` call needed here.
+    cards_coll = storage.cards_collection()
+    tags_coll = storage.tags_collection()
+    _maybe_invalidate_for_alpha(cards_coll, args.alpha)
     written = fuse_card_vectors(
-        storage.cards_collection(),
-        storage.tags_collection(),
+        cards_coll,
+        tags_coll,
         refresh=args.refresh,
         batch_size=args.batch_size,
         limit=args.limit,

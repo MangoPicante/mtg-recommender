@@ -31,12 +31,16 @@ Tests: offline unittest + mongomock suite only — no integration suite. `mtg-ch
 - Oracletag acquisition from Scryfall's `/bulk-data` endpoint (`oracle_tags` type), slug-keyed catalog, hierarchy preserved.
 - MongoDB persistence — `cards` + `tags` + `meta` collections, indexes created idempotently, snapshot timestamps tracked in `meta`.
 
-### Phase 2 — card representation (in progress)
+### Phase 2 — card representation _(done)_
 
-- **Oracle-text embeddings.** _(done)_ Each card's `oracle_text` is encoded via `sentence-transformers/all-mpnet-base-v2` (768-dim) and persisted as `text_embedding` on the card doc. Encoder is overridable through the `MTG_EMBEDDING_MODEL` env var. The CLI (`mtg-embed cards`) skips docs that already carry a vector; `--refresh` re-embeds.
-- **Oracletag embeddings.** _(done)_ Each tag's `label + description` is encoded with the same model and persisted as `embedding` on the tag doc. `mtg-embed tags` runs the same skip / `--refresh` pattern. Clustering of these embeddings — "treat a tag as this + its neighbours" — is the next sub-step.
-- **Combined card vector.** _(done)_ `mtg-embed fuse` reads `text_embedding` + the card's tag embeddings, L2-normalizes each side, blends them via `alpha * text + (1 - alpha) * tag` (default `alpha=0.6`, overridable via `--alpha`), renormalizes, and writes the result as `card_vector` on the card doc. Cards with no (resolvable) tags collapse to the normalized text vector — tags-only would fail silently otherwise. A dim mismatch between the two spaces raises instead of producing a vector in neither space.
-- **Freshness.** _(mostly done)_ `scryfall-fetch` stores an `oracle_text_sha` per card; a bulk merge diffs incoming cards against the stored sha, writes only new/changed entries, and `$unset`s `text_embedding` + `card_vector` on changed cards so `mtg-embed cards` / `mtg-embed fuse` re-encode exactly those. `scryfall-fetch-tags` does the same per oracle_id, `$unset`ing `card_vector` on cards whose tag list changed. `--refresh` is gone from both fetchers. Still TODO: `mtg-embed * --refresh` is kept for `MTG_EMBEDDING_MODEL` / `--alpha` changes, which the system can't cheaply self-detect. A model-signature + alpha-signature follow-up would subsume those too.
+- **Oracle-text embeddings.** Each card's `oracle_text` is encoded via `sentence-transformers/all-mpnet-base-v2` (768-dim) and persisted as `text_embedding` on the card doc, stored as BSON Binary of packed little-endian float32 (4 bytes/dim). Encoder is overridable through the `MTG_EMBEDDING_MODEL` env var.
+- **Oracletag embeddings.** Each tag's `label + description` is encoded with the same model and persisted as `embedding` on the tag doc, same packed-float32 shape. (A possible follow-up: smooth each tag's representation with its k-NN neighbours — "treat a tag as this + its neighbours" — but no evaluation harness exists to measure the impact, so deferred until Phase 3's recommender gives us one.)
+- **Combined card vector.** `mtg-embed fuse` reads `text_embedding` + the card's tag embeddings, L2-normalizes each side, blends them via `alpha * text + (1 - alpha) * tag` (default `alpha=0.6`, overridable via `--alpha`), renormalizes, and writes the result as `card_vector` on the card doc. Cards with no (resolvable) tags collapse to the normalized text vector — tags-only would fail silently otherwise. A dim mismatch between the two spaces raises instead of producing a vector in neither space.
+- **Freshness.** Fully automatic across every input:
+    - `scryfall-fetch` stores an `oracle_text_sha` per card; a bulk merge diffs incoming cards against the stored sha, writes only new/changed entries, and `$unset`s `text_embedding` + `card_vector` on changed cards.
+    - `scryfall-fetch-tags` does the same per `oracle_id`, `$unset`ing `card_vector` on cards whose tag list changed.
+    - `mtg-embed cards` / `tags` / `fuse` compare the active `MTG_EMBEDDING_MODEL` / `--alpha` against the previous run's values stored in `meta`, and `$unset` the stale fields on drift. The subsequent "skip if field exists" loop then re-encodes exactly what was invalidated.
+  `--refresh` remains on `mtg-embed *` as a nuclear override but no normal workflow needs it.
 
 ### Phase 3 — recommendation
 

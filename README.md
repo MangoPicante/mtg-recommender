@@ -183,12 +183,13 @@ mtg-embed cards
 # Same for tags. The text fed to the encoder is "<label>. <description>".
 mtg-embed tags
 
-# Re-embed everything (expensive — all-mpnet-base-v2 ~runs minutes on CPU
-# across the full ~40k-card snapshot).
-mtg-embed cards --refresh
-
 # Smoke-test with a cap before committing to the full encode:
 mtg-embed cards --limit 50
+
+# Nuclear override — re-embed everything (expensive). You rarely need
+# this: a MTG_EMBEDDING_MODEL change auto-invalidates the stale vectors
+# via the `meta` signature so a plain `mtg-embed cards` picks them up.
+mtg-embed cards --refresh
 ```
 
 Vectors land as BSON Binary (packed little-endian float32) on the card doc
@@ -207,12 +208,11 @@ Once both sides are populated, fuse them into a single per-card vector:
 mtg-embed fuse
 
 # Tweak the text/tag blend (default alpha=0.6, i.e. 60% text / 40% tags).
+# Changing --alpha auto-invalidates stale card_vectors via the `meta`
+# signature, so the fuse loop recomputes them without --refresh.
 mtg-embed fuse --alpha 0.7
 mtg-embed fuse --alpha 1.0        # ignore tags entirely
 mtg-embed fuse --alpha 0.0        # ignore text entirely
-
-# Re-fuse everything (needed when alpha changes or an input was re-embedded).
-mtg-embed fuse --refresh
 ```
 
 The result lands as a unit-length `card_vector` on each card doc. Fuse logic
@@ -220,8 +220,11 @@ L2-normalizes `text_embedding` and the mean of the card's tag embeddings
 before combining them, then renormalizes — so cosine similarity on
 `card_vector` is well-behaved and `alpha` only steers direction, never
 magnitude. Cards with no tags fall back to the normalized text vector
-(effectively `alpha=1.0` for those cards). Freshness is still manual: when
-you change `alpha` or re-embed either input, rerun with `--refresh`.
+(effectively `alpha=1.0` for those cards). Freshness is fully automatic
+across the pipeline: `scryfall-fetch` / `scryfall-fetch-tags` invalidate
+downstream fields on content change, and `mtg-embed *` compares the active
+model/alpha against the previous run's values in `meta` and clears stale
+vectors before re-encoding. `--refresh` remains as a nuclear override.
 
 ### Extract a decklist subset
 

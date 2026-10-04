@@ -177,28 +177,28 @@ class TestEnsureIndexes(StorageTestCase):
 class TestMetaHelpers(StorageTestCase):
 
     def test_get_returns_none_before_any_set(self):
-        self.assertIsNone(storage.get_snapshot_timestamp("oracle_tags"))
+        self.assertIsNone(storage.get_meta_value("oracle_tags"))
 
     def test_set_then_get_roundtrips(self):
-        storage.set_snapshot_timestamp("oracle_tags", "2026-10-03T21:00:32.494+00:00")
+        storage.set_meta_value("oracle_tags", "2026-10-03T21:00:32.494+00:00")
         self.assertEqual(
-            storage.get_snapshot_timestamp("oracle_tags"),
+            storage.get_meta_value("oracle_tags"),
             "2026-10-03T21:00:32.494+00:00",
         )
 
     def test_set_overwrites_previous_value(self):
-        storage.set_snapshot_timestamp("oracle_tags", "2020-01-01T00:00:00+00:00")
-        storage.set_snapshot_timestamp("oracle_tags", "2026-10-03T21:00:32.494+00:00")
+        storage.set_meta_value("oracle_tags", "2020-01-01T00:00:00+00:00")
+        storage.set_meta_value("oracle_tags", "2026-10-03T21:00:32.494+00:00")
         self.assertEqual(
-            storage.get_snapshot_timestamp("oracle_tags"),
+            storage.get_meta_value("oracle_tags"),
             "2026-10-03T21:00:32.494+00:00",
         )
 
     def test_sources_are_isolated(self):
-        storage.set_snapshot_timestamp("oracle_tags", "ts-tags")
-        storage.set_snapshot_timestamp("oracle_cards", "ts-cards")
-        self.assertEqual(storage.get_snapshot_timestamp("oracle_tags"), "ts-tags")
-        self.assertEqual(storage.get_snapshot_timestamp("oracle_cards"), "ts-cards")
+        storage.set_meta_value("oracle_tags", "ts-tags")
+        storage.set_meta_value("oracle_cards", "ts-cards")
+        self.assertEqual(storage.get_meta_value("oracle_tags"), "ts-tags")
+        self.assertEqual(storage.get_meta_value("oracle_cards"), "ts-cards")
 
 
 if __name__ == "__main__":
