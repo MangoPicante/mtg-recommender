@@ -5,9 +5,9 @@ under a second. No network access, no writes outside `TemporaryDirectory`.
 
 Run with:
 
-    python -m unittest test_scryfall_fetch
-    # or, more verbose:
-    python test_scryfall_fetch.py
+    python -m unittest discover tests
+    # or, more targeted:
+    python -m unittest tests.test_scryfall_fetch
 
 Test classes are grouped by concern so a failure narrows the search:
 
@@ -36,7 +36,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 
-import scryfall_fetch as sf
+from mtg_recommender import scryfall_fetch as sf
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +613,7 @@ class TestDownloadBulkOracleCards(unittest.TestCase):
             + json.dumps(SOL_RING_RAW).encode()
         )
         with patch(
-            "scryfall_fetch.urllib.request.urlopen",
+            "mtg_recommender.scryfall_fetch.urllib.request.urlopen",
             return_value=self._make_response(payload),
         ):
             cards = call_silent(sf.download_bulk_oracle_cards, self.FAKE_META)
@@ -626,7 +626,7 @@ class TestDownloadBulkOracleCards(unittest.TestCase):
         payload = json.dumps(LIGHTNING_BOLT_RAW).encode()
         gz = gzip.compress(payload)
         with patch(
-            "scryfall_fetch.urllib.request.urlopen",
+            "mtg_recommender.scryfall_fetch.urllib.request.urlopen",
             return_value=self._make_response(gz),
         ):
             cards = call_silent(sf.download_bulk_oracle_cards, self.FAKE_META)
@@ -642,7 +642,7 @@ class TestDownloadBulkOracleCards(unittest.TestCase):
             + b"\n"
         )
         with patch(
-            "scryfall_fetch.urllib.request.urlopen",
+            "mtg_recommender.scryfall_fetch.urllib.request.urlopen",
             return_value=self._make_response(payload),
         ):
             cards = call_silent(sf.download_bulk_oracle_cards, self.FAKE_META)
