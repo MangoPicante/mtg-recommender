@@ -19,8 +19,12 @@ Collections:
 
     cards : one document per card, _id = scryfall_id. Shape:
         {
-          "_id":        "<scryfall_id>",       # Mongo primary key
-          "scryfall_id":"<same as _id>",       # kept for lookup convenience
+          "_id":        "<scryfall_id>",       # Mongo primary key AND the
+                                               # scryfall id (no duplicate
+                                               # field — extract_oracle
+                                               # renames at export when a
+                                               # consumer wants the
+                                               # semantic name).
           "oracle_id":  "<Scryfall oracle id>",# join key to the tags bulk
           "name":       "...",
           "names":      ["lightning bolt", "lightning bolt // lightning bolt"],

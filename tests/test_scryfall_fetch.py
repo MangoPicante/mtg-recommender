@@ -164,7 +164,7 @@ class TestCardProjection(unittest.TestCase):
         self.assertEqual(result["name"], "Lightning Bolt")
         self.assertEqual(result["mana_cost"], "{R}")
         self.assertEqual(result["oracle_text"], LIGHTNING_BOLT_RAW["oracle_text"])
-        self.assertEqual(result["scryfall_id"], "id-lb")
+        self.assertEqual(result["_id"], "id-lb")
         self.assertEqual(result["_id"], "id-lb")
         self.assertEqual(result["updated_at"], LATER)
         # sha of the (post-projection) oracle_text is populated and
@@ -279,7 +279,7 @@ class TestCardProjection(unittest.TestCase):
 
 class TestUpsertCard(_MongoBackedTestCase):
 
-    def test_single_upsert_stores_under_scryfall_id(self):
+    def test_single_upsert_stores_under_id(self):
         ok = sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=LATER)
         self.assertTrue(ok)
         doc = self.coll.find_one({"_id": "id-lb"})
@@ -300,7 +300,6 @@ class TestUpsertCard(_MongoBackedTestCase):
         # tag-import run wrote.
         self.coll.insert_one({
             "_id": "id-lb",
-            "scryfall_id": "id-lb",
             "name": "Lightning Bolt (old)",
             "updated_at": EARLIER,
             "tags": ["spot-removal", "burn-any"],
@@ -336,7 +335,7 @@ class TestUpsertCard(_MongoBackedTestCase):
         # instead — a hypothetical we exercise separately).
         bolt_sha = sf.oracle_text_sha(sf.extract_card_fields(LIGHTNING_BOLT_RAW, LATER)["oracle_text"])
         self.coll.insert_one({
-            "_id": "id-lb", "scryfall_id": "id-lb", "name": "Old",
+            "_id": "id-lb", "name": "Old",
             "updated_at": EARLIER,
             "oracle_text_sha": bolt_sha,
             "tags": ["spot-removal"],
@@ -357,7 +356,7 @@ class TestUpsertCard(_MongoBackedTestCase):
         # this as unchanged and leave the doc intact.
         sha = sf.oracle_text_sha(sf.extract_card_fields(LIGHTNING_BOLT_RAW, LATER)["oracle_text"])
         self.coll.insert_one({
-            "_id": "id-lb", "scryfall_id": "id-lb", "name": "Lightning Bolt",
+            "_id": "id-lb", "name": "Lightning Bolt",
             "oracle_text_sha": sha, "updated_at": EARLIER,
             "text_embedding": [0.0] * 4, "card_vector": [0.0] * 4,
         })
@@ -377,7 +376,7 @@ class TestUpsertCard(_MongoBackedTestCase):
         # new text, so the diff detects a change and $unsets both
         # embedding fields.
         self.coll.insert_one({
-            "_id": "id-lb", "scryfall_id": "id-lb", "name": "Old",
+            "_id": "id-lb", "name": "Old",
             "oracle_text_sha": "deadbeefdeadbeef", "updated_at": EARLIER,
             "text_embedding": [0.0] * 4, "card_vector": [0.0] * 4,
             "tags": ["spot-removal"],
@@ -401,7 +400,7 @@ class TestUpsertCard(_MongoBackedTestCase):
         # Downstream fields get cleared too — safest default when we
         # can't prove the text is unchanged.
         self.coll.insert_one({
-            "_id": "id-lb", "scryfall_id": "id-lb", "name": "Lightning Bolt",
+            "_id": "id-lb", "name": "Lightning Bolt",
             "updated_at": EARLIER, "text_embedding": [0.0] * 4,
         })
         new, changed, unchanged = sf.bulk_upsert_cards(
@@ -426,12 +425,12 @@ class TestFindCardsByName(_MongoBackedTestCase):
         self._seed(LIGHTNING_BOLT_RAW)
         matches = sf.find_cards_by_name(self.coll, "Lightning Bolt")
         self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0]["scryfall_id"], "id-lb")
+        self.assertEqual(matches[0]["_id"], "id-lb")
 
     def test_lookup_is_case_insensitive(self):
         self._seed(LIGHTNING_BOLT_RAW)
         self.assertEqual(
-            sf.find_cards_by_name(self.coll, "LIGHTNING BOLT")[0]["scryfall_id"],
+            sf.find_cards_by_name(self.coll, "LIGHTNING BOLT")[0]["_id"],
             "id-lb",
         )
 
@@ -446,13 +445,13 @@ class TestFindCardsByName(_MongoBackedTestCase):
             with self.subTest(q=q):
                 matches = sf.find_cards_by_name(self.coll, q)
                 self.assertEqual(len(matches), 1)
-                self.assertEqual(matches[0]["scryfall_id"], "id-delver")
+                self.assertEqual(matches[0]["_id"], "id-delver")
 
     def test_ambiguous_name_returns_all_matching_cards(self):
         self._seed(DELVER_RAW, DELVER_ART_RAW)
         matches = sf.find_cards_by_name(self.coll, "Delver of Secrets")
         self.assertEqual(
-            {m["scryfall_id"] for m in matches},
+            {m["_id"] for m in matches},
             {"id-delver", "id-delver-art"},
         )
 
@@ -744,7 +743,7 @@ class TestBulkMode(_MongoBackedTestCase):
             call_silent(sf.run_bulk_mode, self.coll)
         matches = sf.find_cards_by_name(self.coll, "Delver of Secrets")
         self.assertEqual(
-            {m["scryfall_id"] for m in matches},
+            {m["_id"] for m in matches},
             {"id-delver", "id-delver-art"},
         )
 

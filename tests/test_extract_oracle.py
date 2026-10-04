@@ -32,7 +32,7 @@ def _run_with_argv(argv: list[str]) -> tuple[int, str, str]:
 
 
 BOLT = {
-    "_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt",
+    "_id": "id-bolt", "oracle_id": "oracle-bolt",
     "name": "Lightning Bolt", "names": ["lightning bolt"],
     "mana_cost": "{R}", "type_line": "Instant",
     "oracle_text": "Lightning Bolt deals 3 damage to any target.",
@@ -40,7 +40,7 @@ BOLT = {
 }
 
 WRATH = {
-    "_id": "id-wrath", "scryfall_id": "id-wrath", "oracle_id": "oracle-wrath",
+    "_id": "id-wrath", "oracle_id": "oracle-wrath",
     "name": "Wrath of God", "names": ["wrath of god"],
     "mana_cost": "{2}{W}{W}", "type_line": "Sorcery",
     "oracle_text": "Destroy all creatures. They can't be regenerated.",
@@ -50,7 +50,7 @@ WRATH = {
 # An art-card variant whose names array collides with the normal Bolt
 # printing — used to exercise the ambiguity branch.
 BOLT_ART = {
-    "_id": "id-bolt-art", "scryfall_id": "id-bolt-art", "oracle_id": "oracle-bolt-art",
+    "_id": "id-bolt-art", "oracle_id": "oracle-bolt-art",
     "name": "Lightning Bolt // Lightning Bolt",
     "names": ["lightning bolt // lightning bolt", "lightning bolt"],
     "mana_cost": None, "type_line": None, "oracle_text": None,

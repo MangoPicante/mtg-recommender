@@ -35,9 +35,12 @@ Output shape (JSON):
     more than one cached card. Downstream consumers can pick with
     whatever criterion suits them (canonical-name shape, type line, etc.).
 
-`updated_at`, `_id`, `names`, `oracle_id`, and `tags` are intentionally
-dropped — the subset is meant for text consumers that just want "what
-does this card say?", not full-fat records.
+The `scryfall_id` field in the output is renamed from Mongo's `_id` at
+export time; storage keeps a single id field (`_id`) rather than
+duplicating it. `updated_at`, `names`, `oracle_id`, `oracle_text_sha`,
+and `tags` are intentionally dropped — the subset is meant for text
+consumers that just want "what does this card say?", not full-fat
+records.
 
 Usage (after `pip install -e .`, with MONGODB_URI set in .env):
     extract-oracle "Lightning Bolt" "Counterspell" -o subset.json
@@ -64,16 +67,26 @@ from . import storage
 # rather than inside the installed package tree. Override with -o.
 DEFAULT_OUTPUT = Path.cwd() / "oracle_subset.json"
 
-# Fields to copy per card into the output. Chosen to be everything a
-# downstream text-based recommender would want, minus Mongo bookkeeping
-# (_id, names, updated_at) and fields owned by other modules (tags,
-# oracle_id — handy inside Mongo but noise to a text consumer).
-FIELDS = ("name", "mana_cost", "type_line", "oracle_text", "scryfall_id")
+# Fields to copy per card into the output, read verbatim from the card
+# doc. Chosen to be everything a downstream text-based recommender would
+# want, minus Mongo bookkeeping (names, updated_at, oracle_text_sha) and
+# fields owned by other modules (tags, oracle_id — handy inside Mongo
+# but noise to a text consumer).
+_PASSTHROUGH_FIELDS = ("name", "mana_cost", "type_line", "oracle_text")
 
 
 def project_for_output(card: dict) -> dict:
-    """Copy just the downstream-facing fields from a cached card entry."""
-    return {k: card.get(k) for k in FIELDS}
+    """Copy the downstream-facing fields from a cached card entry.
+
+    `_id` is renamed to `scryfall_id` in the output: Mongo's primary-key
+    name is an implementation detail, and consumers of this JSON have
+    always seen `scryfall_id` as the semantic field. The storage layer
+    no longer duplicates the id into a `scryfall_id` field, so we do the
+    one-line rename here instead.
+    """
+    out = {k: card.get(k) for k in _PASSTHROUGH_FIELDS}
+    out["scryfall_id"] = card.get("_id")
+    return out
 
 
 def main() -> int:
