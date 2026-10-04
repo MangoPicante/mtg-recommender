@@ -93,6 +93,9 @@ Env vars (read on first client access, from `.env` if present):
     MONGODB_CARDS_COLLECTION   : (default: `cards`).
     MONGODB_TAGS_COLLECTION    : (default: `tags`).
     MONGODB_META_COLLECTION    : (default: `meta`).
+    MONGODB_EDHREC_COLLECTION  : (default: `edhrec`). Per-commander cache
+                                 of the EDHREC JSON payload, keyed by
+                                 commander slug.
 
 Testability:
 
@@ -140,11 +143,13 @@ MONGODB_DB_ENV = "MONGODB_DB"
 MONGODB_CARDS_COLLECTION_ENV = "MONGODB_CARDS_COLLECTION"
 MONGODB_TAGS_COLLECTION_ENV = "MONGODB_TAGS_COLLECTION"
 MONGODB_META_COLLECTION_ENV = "MONGODB_META_COLLECTION"
+MONGODB_EDHREC_COLLECTION_ENV = "MONGODB_EDHREC_COLLECTION"
 
 DEFAULT_DB = "mtg_recommender"
 DEFAULT_CARDS_COLLECTION = "cards"
 DEFAULT_TAGS_COLLECTION = "tags"
 DEFAULT_META_COLLECTION = "meta"
+DEFAULT_EDHREC_COLLECTION = "edhrec"
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +237,26 @@ def meta_collection(db: Optional[Database] = None) -> Collection:
     """
     db = db if db is not None else get_database()
     name = os.environ.get(MONGODB_META_COLLECTION_ENV, DEFAULT_META_COLLECTION)
+    return db[name]
+
+
+def edhrec_collection(db: Optional[Database] = None) -> Collection:
+    """Return the `edhrec` collection handle.
+
+    Per-commander cache of EDHREC's public JSON payload. Shape:
+
+        {
+          "_id":        "<commander-slug>",     # e.g. "atraxa-praetors-voice"
+          "fetched_at": "<UTC ISO 8601>",       # when the cache entry was written
+          "payload":    { ... raw json.edhrec.com response ... }
+        }
+
+    7-day TTL enforced in Python by `edhrec_fetch` — Mongo's native TTL
+    index wants a BSON Date; we're using an ISO string so the client
+    comparison stays simple and provider-agnostic.
+    """
+    db = db if db is not None else get_database()
+    name = os.environ.get(MONGODB_EDHREC_COLLECTION_ENV, DEFAULT_EDHREC_COLLECTION)
     return db[name]
 
 

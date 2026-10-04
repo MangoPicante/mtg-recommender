@@ -1,0 +1,81 @@
+{
+  "container": {
+    "json_dict": {
+      "cardlists": [
+        {
+          "header": "New Cards",
+          "tag": "newcards",
+          "cardviews": [
+            {
+              "id": "11111111-1111-1111-1111-111111111111",
+              "name": "Sanctum Lurker",
+              "sanitized": "sanctum-lurker",
+              "slug": "sanctum-lurker",
+              "url": "/cards/sanctum-lurker",
+              "synergy": 0.035,
+              "lift": 1.64,
+              "num_decks": 236,
+              "potential_decks": 2633,
+              "trend_zscore": 2.1
+            },
+            {
+              "id": "22222222-2222-2222-2222-222222222222",
+              "name": "Tekuthal, Inquiry Dominus",
+              "sanitized": "tekuthal-inquiry-dominus",
+              "slug": "tekuthal-inquiry-dominus",
+              "url": "/cards/tekuthal-inquiry-dominus",
+              "synergy": 0.271,
+              "lift": 1.68,
+              "num_decks": 30263,
+              "potential_decks": 45284,
+              "trend_zscore": 0.4
+            }
+          ]
+        },
+        {
+          "header": "Top Cards",
+          "tag": "topcards",
+          "cardviews": [
+            {
+              "id": "22222222-2222-2222-2222-222222222222",
+              "name": "Tekuthal, Inquiry Dominus",
+              "slug": "tekuthal-inquiry-dominus",
+              "url": "/cards/tekuthal-inquiry-dominus",
+              "synergy": 0.271,
+              "lift": 1.72,
+              "num_decks": 30263,
+              "potential_decks": 45284,
+              "trend_zscore": 0.4
+            },
+            {
+              "id": "33333333-3333-3333-3333-333333333333",
+              "name": "Rhystic Study",
+              "slug": "rhystic-study",
+              "url": "/cards/rhystic-study",
+              "synergy": -0.102,
+              "lift": 0.74,
+              "num_decks": 12857,
+              "potential_decks": 45284,
+              "trend_zscore": -0.1
+            }
+          ]
+        },
+        {
+          "header": "Partial Entry",
+          "tag": "weird",
+          "cardviews": [
+            {
+              "id": "44444444-4444-4444-4444-444444444444",
+              "name": "Not Enough Data Card",
+              "slug": "not-enough-data"
+            }
+          ]
+        }
+      ],
+      "card": {
+        "name": "Atraxa, Praetors' Voice"
+      }
+    }
+  },
+  "similar": ["atraxa-praetors-paragon", "the-ur-dragon"]
+}

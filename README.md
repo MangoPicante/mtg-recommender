@@ -25,6 +25,7 @@ Under `src/mtg_recommender/`:
 | `explore` | Read-only ad-hoc inspection CLI (installed as `mtg-inspect`). Subcommands: `card`, `tag`, `list`, `stats`. Human-readable output for one-off exploration and debugging. |
 | `check` | Read-only health check. Pings the Mongo server, verifies the configured database + indexes, and reports a doc count per collection. Exit 0 on success, 1 if any check fails. |
 | `embeddings` | Phase 2. Encodes each card's `oracle_text` into `text_embedding` on the card doc and each tag's label+description into `embedding` on the tag doc; also fuses the two into a single unit `card_vector` per card via a weighted average (`alpha * text + (1 - alpha) * tag`, defaults to `alpha=0.6`). Uses `sentence-transformers/all-mpnet-base-v2` (768-dim) by default; `MTG_EMBEDDING_MODEL` env var overrides. |
+| `edhrec_fetch` | Phase 3. Thin client over EDHREC's public keyless JSON API at `json.edhrec.com`. Fetches per-commander card signals (lift, synergy, inclusion rate, trend) and caches the payload in the `edhrec` Mongo collection with a 7-day TTL. Each signal carries a Scryfall UUID so joining back to our `cards` collection is a direct `_id` lookup. |
 
 Tests live under `tests/` and are offline — every HTTP call is mocked, every
 Mongo op goes through `mongomock`.
