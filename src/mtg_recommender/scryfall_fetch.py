@@ -55,10 +55,23 @@ Bulk-download triggers (any one is enough):
 
     1. --refresh flag set.
     2. Empty cards collection.
-    3. Any cached card's `updated_at` is older than the current bulk
-       snapshot's `updated_at` — merging refreshes that entry.
+    3. The `meta` collection records no previous merge, AND any cached
+       card's `updated_at` is older than the current bulk snapshot's
+       `updated_at` — merging refreshes that entry.
 
     If none apply, skip the ~24 MB download.
+
+Rerun fast-path:
+
+    After a successful merge (or when the slow-path staleness scan
+    determines the cache is already current), the current snapshot's
+    `updated_at` is stored in the `meta` collection under
+    `_id = "oracle_cards"`. On a subsequent run, if the stored timestamp
+    matches the current `/bulk-data` metadata and the cache is non-empty,
+    the module skips without reading any card docs — O(1) Mongo work
+    (one `meta` read) instead of an O(n) scan of every card's
+    `updated_at`. The slow-path staleness scan remains as the correctness
+    fallback for pre-meta clusters and the first run after upgrading.
 
 Usage (after `pip install -e .`, with MONGODB_URI set in .env):
 
@@ -91,6 +104,10 @@ from . import storage
 # Base URL for every Scryfall API request. HTTPS is required; Python's default
 # SSL context on modern systems negotiates TLS 1.2 or 1.3 automatically.
 SCRYFALL_BASE = "https://api.scryfall.com"
+
+# Key the oracle_cards snapshot timestamp lives under in the `meta` collection.
+# Namespaced parallel to oracle_tags' entry so one meta collection serves both.
+META_SOURCE = "oracle_cards"
 
 # Scryfall requires every request to include a User-Agent (identifying the
 # caller) and an Accept header (declaring the media type we want back). If
@@ -473,12 +490,16 @@ def read_names(args: argparse.Namespace) -> list[str]:
 def run_bulk_mode(coll: Collection, refresh: bool) -> bool:
     """Ensure Mongo holds the current Scryfall oracle_cards snapshot.
 
-    Downloads the bulk file when any of these apply:
-      - --refresh forces it,
-      - the cards collection is empty,
-      - any card is older than the current snapshot (stale).
-    Otherwise skips the ~24 MB download and reports the snapshot is
-    already covered.
+    Fast-path (common case on a rerun): if the `meta` collection records
+    that we've already merged this exact snapshot and the cache is
+    non-empty, skip without reading any card docs — one meta read is
+    enough. This is what makes `just populate` cheap to rerun.
+
+    Slow-path (correctness fallback): on a pre-meta cluster, --refresh,
+    an empty cache, or a stored timestamp that doesn't match the current
+    `/bulk-data` metadata, fall through to the staleness scan. If every
+    card is at least as fresh as the snapshot, skip the download anyway
+    and record the snapshot timestamp so the next run hits the fast path.
 
     Returns True iff the collection changed, so `main` can print the
     final doc count only when it's actually useful.
@@ -486,9 +507,15 @@ def run_bulk_mode(coll: Collection, refresh: bool) -> bool:
     meta = get_bulk_oracle_metadata()
     snapshot_updated_at = meta["updated_at"]
 
-    # Cheap checks first (metadata-only reads) so we can short-circuit
-    # before the O(n) staleness scan.
     cards_present = coll.estimated_document_count() > 0
+    stored_snapshot = storage.get_snapshot_timestamp(META_SOURCE)
+
+    # Fast path: meta says we're already covering this snapshot. No card
+    # reads at all, so even a 40k-card collection reruns in milliseconds.
+    if not refresh and cards_present and stored_snapshot == snapshot_updated_at:
+        print(f"bulk  : already fresh (snapshot {snapshot_updated_at}); pass --refresh to force")
+        return False
+
     needs_download = (
         refresh
         or not cards_present
@@ -496,6 +523,9 @@ def run_bulk_mode(coll: Collection, refresh: bool) -> bool:
     )
 
     if not needs_download:
+        # Slow-path concluded nothing's stale. Record the snapshot so the
+        # next run upgrades to the fast path.
+        storage.set_snapshot_timestamp(META_SOURCE, snapshot_updated_at)
         print(f"bulk  : collection already covers snapshot {snapshot_updated_at}")
         return False
 
@@ -503,6 +533,9 @@ def run_bulk_mode(coll: Collection, refresh: bool) -> bool:
     before = coll.estimated_document_count()
     bulk_upsert_cards(coll, bulk, snapshot_updated_at)
     after = coll.estimated_document_count()
+    # Record the snapshot last so a crash mid-merge leaves meta un-set and
+    # the next run retries rather than falsely claiming freshness.
+    storage.set_snapshot_timestamp(META_SOURCE, snapshot_updated_at)
     print(f"bulk  : collection now holds {after} unique cards (was {before})")
     return True
 
