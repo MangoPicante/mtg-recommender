@@ -7,10 +7,10 @@ for the full roadmap.
 
 ## Current state
 
-Phase 1 is mostly in place: Scryfall oracle text and oracle tags can both be
-fetched locally, with the two cross-referenced by `oracle_id`. The persistence
-layer (MongoDB Atlas) and everything downstream (embeddings, recommendation,
-UI) are still TODO.
+Phase 1 is done: Scryfall oracle text and oracle tags both land in MongoDB
+Atlas (two collections, `cards` and `tags`, with a `meta` collection for
+snapshot timestamps). Everything downstream — embeddings, recommendation,
+UI — is still TODO.
 
 ### Modules
 
@@ -18,19 +18,18 @@ Under `src/mtg_recommender/`:
 
 | Module | What it does |
 | --- | --- |
-| `scryfall_fetch` | Fetches Scryfall oracle text for one card or a decklist, caching to `./cache/oracle_texts.json`. Switches between `/cards/named` (single card) and the oracle-cards bulk download (2+ cards) automatically. Cache is id-keyed with a list-valued name alias index so ambiguous names (art variants, meld pieces, shared face names) surface rather than silently resolve. Each entry carries `oracle_id` as the join key for tag attachment. |
-| `oracle_tags` | Downloads the Scryfall oracle-tags bulk file, writes a slug-keyed tag catalog to `./cache/oracle_tags.json` (with hierarchy, aliases, descriptions), and attaches a `tags: [slug, ...]` array to each card in the oracle-texts cache by joining on `oracle_id`. |
-| `extract_oracle` | Writes a trimmed per-decklist subset of the oracle-texts cache for downstream consumers. |
+| `storage` | Thin wrapper around pymongo. Reads `MONGODB_URI` (and optional overrides) from `.env`, caches a single `MongoClient` per process, exposes handles to the `cards` / `tags` / `meta` collections, and declares the indexes the rest of the package relies on (`cards.names` for alias lookup, `cards.oracle_id` for the tag join). |
+| `scryfall_fetch` | Fetches Scryfall oracle text for one card or a decklist into the `cards` collection. Switches between `/cards/named` (single card) and the oracle-cards bulk download (2+ cards) automatically. Each card document is keyed by `scryfall_id` with a `names: [lowered, ...]` array for alias lookup. The `tags` field is left for `oracle_tags` to populate. |
+| `oracle_tags` | Downloads the Scryfall oracle-tags bulk, writes a slug-keyed catalog to the `tags` collection (hierarchy + aliases + descriptions preserved), and attaches `tags: [slug, ...]` arrays to each card by joining on `oracle_id`. |
+| `extract_oracle` | Writes a trimmed per-decklist JSON subset of the cards collection for downstream consumers that don't speak Mongo. |
 
-Tests live under `tests/` and are offline — every HTTP call is mocked.
+Tests live under `tests/` and are offline — every HTTP call is mocked, every
+Mongo op goes through `mongomock`.
 
 ## Setup
 
-Python 3.10+ is required (modules use `from __future__ import annotations` plus
-3.10-style union syntax in a few spots). The package is pure stdlib for now —
-no runtime dependencies — but is set up as an installable PEP 621 package so
-`pip install -e .` registers the two CLI commands and keeps the layout honest
-when real deps start arriving in Phase 1.
+Python 3.10+ is required. The package has two runtime dependencies today
+(`pymongo`, `python-dotenv`); heavier libraries arrive with Phase 2 embeddings.
 
 ```bash
 # recommended: isolated venv
@@ -41,22 +40,33 @@ python -m venv .venv
 # bash/zsh:
 source .venv/bin/activate
 
-# installs the package in editable mode and registers the console scripts
-pip install -e .
+# installs the package in editable mode and registers the console scripts.
+# Append [dev] to pull mongomock for the offline test suite.
+pip install -e ".[dev]"
 ```
 
-A `.env.example` is provided for future configuration (e.g. the Mongo Atlas
-connection string that lands in Phase 1). Copy it to `.env` when wiring that
-up — `.env` itself is gitignored.
+### MongoDB
+
+The three CLIs read and write via MongoDB — set up Atlas (or any
+pymongo-compatible Mongo) and plug the connection string into `.env`:
 
 ```bash
 cp .env.example .env
+# edit .env, set MONGODB_URI=mongodb+srv://... (plus MONGODB_DB if you want
+# to override the default "mtg_recommender")
 ```
+
+`.env` is gitignored; `.env.example` is the checked-in template.
+
+Collections (`cards`, `tags`, `meta`) and their indexes are created on first
+run — no separate migration step. See the docstring of `storage.py` for the
+full document schemas.
 
 ## Usage
 
-Both CLIs are installed as console scripts by `pip install -e .`. Equivalent
-`python -m mtg_recommender.<module>` forms also work from a source checkout.
+All three CLIs are installed as console scripts by `pip install -e .`.
+Equivalent `python -m mtg_recommender.<module>` forms also work from a source
+checkout.
 
 ### Fetch oracle text
 
@@ -64,45 +74,39 @@ Both CLIs are installed as console scripts by `pip install -e .`. Equivalent
 # single card -> /cards/named (fast, one request)
 scryfall-fetch "Lightning Bolt"
 
-# multiple cards -> oracle-cards bulk download, merged into the shared cache
+# multiple cards -> oracle-cards bulk download, upserted into the cards collection
 scryfall-fetch "Lightning Bolt" "Counterspell"
 
 # from a decklist file (one card per line, '#' for comments; Moxfield / Arena /
 # MTGGoldfish export formats are tolerated)
 scryfall-fetch --file deck.txt
 
-# force refetch / redownload even if the cache looks fresh
+# force refetch / redownload even if the collection looks fresh
 scryfall-fetch --file deck.txt --refresh
 ```
 
-The cache is written to `./cache/oracle_texts.json` (relative to the current
-working directory) and is gitignored. Override the location with `--cache
-/some/other/path.json`. Shape and semantics are documented in the top-of-file
-docstring of `src/mtg_recommender/scryfall_fetch.py`.
+Upserts touch only the fields `scryfall_fetch` owns, so a card's `tags` array
+(written by `oracle_tags`) survives a refetch. Full document shape and
+semantics are in the top-of-file docstring of `scryfall_fetch.py`.
 
 ### Attach oracle tags
 
 Scryfall's Tagger project classifies cards by what they *do* ("spot-removal",
-"mana-rock", "sweeper", …). Pull the tag catalog and attach per-card tag lists
-to the existing cards cache:
+"mana-rock", "sweeper", …). Pull the tag catalog into the `tags` collection
+and attach per-card tag lists to the `cards` collection:
 
 ```bash
-# downloads oracle_tags bulk (~6 MB), writes catalog, attaches tags on each card
+# downloads oracle_tags bulk (~6 MB), writes catalog, attaches tags to each card
 scryfall-fetch-tags
 
-# force redownload even if the on-disk snapshot timestamp matches
+# force redownload even if the stored snapshot timestamp matches
 scryfall-fetch-tags --refresh
 ```
 
-Writes `./cache/oracle_tags.json` (slug-keyed catalog with hierarchy, aliases,
-descriptions) and adds `tags: ["spot-removal", "mana-rock", ...]` to each entry
-in `./cache/oracle_texts.json`. Join is by `oracle_id`; cards that haven't been
-tagged by the Tagger project get an empty list. If `tags` is `[]` for every
-card, the cards cache predates the `oracle_id` field — `scryfall-fetch
---refresh` repopulates it.
-
-Note: `scryfall-fetch-tags` requires the cards cache to exist first — run
-`scryfall-fetch` on your decklist(s) before this.
+Join is by `oracle_id`; cards the Tagger project doesn't cover get `tags: []`.
+The snapshot timestamp lives in the `meta` collection so repeat runs skip the
+download when nothing has moved. The command requires the `cards` collection
+to be populated first — run `scryfall-fetch` on your decklists before this.
 
 ### Extract a decklist subset
 
@@ -114,8 +118,9 @@ extract-oracle --file deck.txt
 extract-oracle --file deck.txt -o deck_oracle.json
 ```
 
-The subset drops cache-only fields (`updated_at`) and keeps the downstream-
-facing ones (`name`, `mana_cost`, `type_line`, `oracle_text`, `scryfall_id`).
+The subset drops Mongo bookkeeping (`_id`, `names`, `updated_at`, `oracle_id`,
+`tags`) and keeps the downstream-facing fields (`name`, `mana_cost`,
+`type_line`, `oracle_text`, `scryfall_id`).
 
 ## Testing
 
@@ -123,8 +128,8 @@ facing ones (`name`, `mana_cost`, `type_line`, `oracle_text`, `scryfall_id`).
 python -m unittest discover tests
 ```
 
-Every HTTP call in the test suite is mocked — the tests do not touch the
-network and will run offline. 96 tests, well under a second total.
+Every HTTP call is mocked; every Mongo op routes through `mongomock`. 107
+tests, well under a second total — no network, no real Mongo required.
 
 ## Project layout
 
@@ -133,20 +138,19 @@ mtg-recommender/
 ├── src/
 │   └── mtg_recommender/         # installable package
 │       ├── __init__.py
-│       ├── scryfall_fetch.py    # oracle-text fetcher + unified cache
-│       ├── oracle_tags.py       # oracle-tags bulk importer + card attachment
-│       └── extract_oracle.py    # per-decklist subset exporter
+│       ├── storage.py           # Mongo client/config/indexes
+│       ├── scryfall_fetch.py    # oracle-text fetcher -> cards collection
+│       ├── oracle_tags.py       # oracle-tags importer -> tags collection + attach
+│       └── extract_oracle.py    # per-decklist JSON subset exporter
 ├── tests/
-│   ├── test_scryfall_fetch.py   # offline unit tests
+│   ├── test_storage.py          # offline, mongomock-backed
+│   ├── test_scryfall_fetch.py
 │   └── test_oracle_tags.py
-├── cache/                       # gitignored; created at runtime
-│   ├── oracle_texts.json        # cards cache (scryfall_fetch)
-│   └── oracle_tags.json         # tag catalog (oracle_tags)
-├── pyproject.toml              # PEP 621 metadata, build config, entry points
-├── .env.example                # placeholder for Phase 1 Mongo URI etc.
-├── CLAUDE.md                   # workflow + style conventions
-├── PLAN.md                     # scope, roadmap, open questions
-└── README.md                   # you are here
+├── pyproject.toml               # PEP 621 metadata, build config, entry points
+├── .env.example                 # template; copy to .env + fill in MONGODB_URI
+├── CLAUDE.md                    # workflow + style conventions
+├── PLAN.md                      # scope, roadmap, open questions
+└── README.md                    # you are here
 ```
 
 The `src/` layout (PyPA-recommended) prevents accidental imports from the repo
