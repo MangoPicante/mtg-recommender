@@ -55,6 +55,7 @@ LATER = "2026-07-31T09:03:40.749+00:00"
 
 LIGHTNING_BOLT_RAW = {
     "id": "id-lb",
+    "oracle_id": "oracle-lb",
     "name": "Lightning Bolt",
     "mana_cost": "{R}",
     "type_line": "Instant",
@@ -63,6 +64,7 @@ LIGHTNING_BOLT_RAW = {
 
 SOL_RING_RAW = {
     "id": "id-sol-ring",
+    "oracle_id": "oracle-sol-ring",
     "name": "Sol Ring",
     "mana_cost": "{1}",
     "type_line": "Artifact",
@@ -73,6 +75,7 @@ SOL_RING_RAW = {
 # names live under card_faces.
 DELVER_RAW = {
     "id": "id-delver",
+    "oracle_id": "oracle-delver",
     "name": "Delver of Secrets // Insectile Aberration",
     "mana_cost": "{U}",
     "type_line": "Creature — Human Wizard // Creature — Human Insect",
@@ -88,6 +91,7 @@ DELVER_RAW = {
 # extract_card_fields.
 BALA_GED_MDFC_RAW = {
     "id": "id-bala-ged",
+    "oracle_id": "oracle-bala-ged",
     "name": "Bala Ged Recovery // Bala Ged Sanctuary",
     "mana_cost": None,
     "type_line": "Sorcery // Land",
@@ -113,6 +117,7 @@ BALA_GED_MDFC_RAW = {
 # alias-collision cases that motivated list-valued aliases.
 DELVER_ART_RAW = {
     "id": "id-delver-art",
+    "oracle_id": "oracle-delver-art",
     "name": "Delver of Secrets // Delver of Secrets",
     "mana_cost": None,
     "type_line": None,
@@ -218,6 +223,20 @@ class TestCardProjection(unittest.TestCase):
         result = sf.extract_card_fields(LIGHTNING_BOLT_RAW, updated_at=LATER)
         self.assertEqual(result["mana_cost"], "{R}")
         self.assertEqual(result["type_line"], "Instant")
+
+    def test_oracle_id_is_copied_when_present(self):
+        # oracle_id is the join key for the oracle_tags bulk, so the
+        # projection must carry it through verbatim from the raw object.
+        result = sf.extract_card_fields(LIGHTNING_BOLT_RAW, updated_at=LATER)
+        self.assertEqual(result["oracle_id"], "oracle-lb")
+
+    def test_oracle_id_is_none_when_missing(self):
+        # Guard against schema drift: if Scryfall ever omits oracle_id,
+        # we store None rather than raising. The downstream tag import
+        # can log and skip these entries.
+        raw_without_oracle_id = {"id": "x", "name": "X"}
+        result = sf.extract_card_fields(raw_without_oracle_id, updated_at=LATER)
+        self.assertIsNone(result["oracle_id"])
 
 
 # ---------------------------------------------------------------------------

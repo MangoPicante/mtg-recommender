@@ -22,6 +22,7 @@ Cache shape (cache/oracle_texts.json):
           "type_line": "...",
           "oracle_text": "...",
           "scryfall_id": "<same as key>",
+          "oracle_id": "<Scryfall oracle id — the join key for tags>",
           "updated_at": "<UTC ISO 8601>"
         },
         ...
@@ -209,6 +210,13 @@ def extract_card_fields(data: dict, updated_at: str) -> dict:
     Note: `scryfall_id` is kept inside the value even though it's the key
     in the cache, so downstream code that reads a card value can identify
     it without needing to know which key it came from.
+
+    `oracle_id` is also copied in — distinct from `scryfall_id`, it names
+    the ORACLE entity (the gameplay card) rather than a specific printing.
+    A single oracle_id can map to many scryfall_ids across reprints, and
+    the oracle_tags bulk joins to cards via oracle_id. Keeping it on each
+    card entry means a downstream tag import doesn't need to go back to
+    the raw Scryfall objects to figure out which card is which.
     """
     faces = data.get("card_faces") or []
 
@@ -241,6 +249,12 @@ def extract_card_fields(data: dict, updated_at: str) -> dict:
         "type_line": pick("type_line"),
         "oracle_text": oracle_text,
         "scryfall_id": data.get("id"),
+        # oracle_id is the join key used by the oracle_tags bulk; see the
+        # docstring. Falls back to None if the raw object omits it (which
+        # shouldn't happen for real Scryfall responses but is defended
+        # against so an odd test fixture or a schema drift doesn't crash
+        # the fetcher).
+        "oracle_id": data.get("oracle_id"),
         "updated_at": updated_at,
     }
 
