@@ -20,7 +20,9 @@ Test classes are grouped by concern so a failure narrows the search:
                                  used by extract_oracle)
     TestGetBulkOracleMetadata   /bulk-data response filtering
     TestDownloadBulkOracleCards gzip detection + JSONL parsing
-    TestBulkMode                run_bulk_mode + every download trigger
+    TestBulkMode                run_bulk_mode: every download trigger plus the
+                                 meta-based fast-path skip and the pre-meta
+                                 cluster upgrade path
 """
 from __future__ import annotations
 
@@ -690,6 +692,80 @@ class TestBulkMode(_MongoBackedTestCase):
             {m["scryfall_id"] for m in matches},
             {"id-delver", "id-delver-art"},
         )
+
+    def test_meta_timestamp_persisted_after_successful_merge(self):
+        # The fast-path skip only works if the merge records the snapshot
+        # it just loaded. Verify meta carries the right value after a
+        # fresh download.
+        with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
+             patch.object(
+                 sf, "download_bulk_oracle_cards",
+                 return_value=[LIGHTNING_BOLT_RAW],
+             ):
+            call_silent(sf.run_bulk_mode, self.coll, False)
+        self.assertEqual(
+            storage.get_snapshot_timestamp(sf.META_SOURCE), LATER
+        )
+
+    def test_fast_path_skips_staleness_scan_when_meta_matches(self):
+        # After a prior merge recorded the snapshot in meta, a rerun with
+        # the same snapshot must NOT scan every card doc. We assert that
+        # by patching has_stale_cards and refusing to let it be called.
+        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], LATER)
+        storage.set_snapshot_timestamp(sf.META_SOURCE, LATER)
+        with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
+             patch.object(sf, "download_bulk_oracle_cards") as dl, \
+             patch.object(sf, "has_stale_cards") as stale:
+            changed = call_silent(sf.run_bulk_mode, self.coll, False)
+        self.assertFalse(changed)
+        dl.assert_not_called()
+        stale.assert_not_called()
+
+    def test_fast_path_bypassed_when_meta_timestamp_stale(self):
+        # Meta recorded an older snapshot than the current /bulk-data —
+        # the fast-path check must fail and we must fall through to the
+        # staleness scan + download.
+        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], EARLIER)
+        storage.set_snapshot_timestamp(sf.META_SOURCE, EARLIER)
+        with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
+             patch.object(
+                 sf, "download_bulk_oracle_cards",
+                 return_value=[LIGHTNING_BOLT_RAW],
+             ) as dl:
+            call_silent(sf.run_bulk_mode, self.coll, False)
+        dl.assert_called_once()
+        self.assertEqual(
+            storage.get_snapshot_timestamp(sf.META_SOURCE), LATER
+        )
+
+    def test_pre_meta_cluster_upgrades_to_fast_path_after_clean_scan(self):
+        # Simulates a cluster populated before meta tracking existed:
+        # cards are present and already fresh, but no meta entry exists.
+        # The slow path should determine nothing is stale, skip the
+        # download, AND write the meta entry so the next run is fast.
+        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], LATER)
+        self.assertIsNone(storage.get_snapshot_timestamp(sf.META_SOURCE))
+        with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
+             patch.object(sf, "download_bulk_oracle_cards") as dl:
+            changed = call_silent(sf.run_bulk_mode, self.coll, False)
+        dl.assert_not_called()
+        self.assertFalse(changed)
+        self.assertEqual(
+            storage.get_snapshot_timestamp(sf.META_SOURCE), LATER
+        )
+
+    def test_refresh_bypasses_fast_path_even_when_meta_matches(self):
+        # --refresh must always force the download, no matter how fresh
+        # meta claims the cache is.
+        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], LATER)
+        storage.set_snapshot_timestamp(sf.META_SOURCE, LATER)
+        with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
+             patch.object(
+                 sf, "download_bulk_oracle_cards",
+                 return_value=[LIGHTNING_BOLT_RAW],
+             ) as dl:
+            call_silent(sf.run_bulk_mode, self.coll, True)
+        dl.assert_called_once()
 
 
 if __name__ == "__main__":

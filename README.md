@@ -103,12 +103,18 @@ subset is `extract-oracle`'s job once the cache is populated.
 
 ```bash
 # Idempotent: downloads only if the collection is empty, has stale entries,
-# or --refresh is passed. Otherwise reports "snapshot already covered".
+# or --refresh is passed. Otherwise reports "already fresh".
 scryfall-fetch
 
 # Force redownload + merge even if the local cache looks current.
 scryfall-fetch --refresh
 ```
+
+Reruns are cheap: the current snapshot timestamp is persisted in the `meta`
+collection under `_id = "oracle_cards"`, so a rerun on an unchanged snapshot
+needs one `/bulk-data` metadata call and one `meta` read — no per-card
+staleness scan. The scan remains as a correctness fallback for pre-meta
+clusters.
 
 Upserts touch only the fields `scryfall_fetch` owns, so a card's `tags`
 array (written by `oracle_tags`) survives a refetch. Full document shape
