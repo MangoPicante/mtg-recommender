@@ -47,6 +47,7 @@ Update `README.md` in the same commit whenever you add or change anything user-v
 Tests are written in the same commit as the feature.
 
 **Always write tests for:**
+
 - New function with branching logic → unit test covering key branches
 - Bug fix → regression test
 - Anything touching the cache schema or alias resolution
