@@ -55,7 +55,7 @@ test-verbose:
 check *ARGS:
     mtg-check {{ARGS}}
 
-# Fetch oracle text into Mongo (`scryfall-fetch` wrapper; pass cards or --file).
+# Fetch oracle text into Mongo (`scryfall-fetch` wrapper; add --refresh to force).
 fetch *ARGS:
     scryfall-fetch {{ARGS}}
 

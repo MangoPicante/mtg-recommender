@@ -14,7 +14,7 @@ Phase 1 is done. All reads and writes go through MongoDB; the on-disk JSON cache
 Modules under `src/mtg_recommender/`:
 
 - `storage.py` — Mongo client/config/indexes; owns `cards` + `tags` + `meta` collection handles and the two multikey indexes the fetchers depend on.
-- `scryfall_fetch.py` — Scryfall oracle-text fetcher (single + bulk modes) → `cards` collection. Carries `oracle_id` on every doc so tag import can join.
+- `scryfall_fetch.py` — Scryfall oracle-text fetcher: downloads the `oracle_cards` bulk and merges every card into the `cards` collection. Carries `oracle_id` on every doc so tag import can join.
 - `oracle_tags.py` — oracle-tags bulk importer. Writes the slug-keyed catalog to `tags` and attaches `tags: [slug, ...]` arrays to every card.
 - `extract_oracle.py` — per-decklist JSON subset exporter for downstream consumers.
 - `explore.py` — read-only inspection CLI, invoked as `mtg-inspect` (`card` / `tag` / `list` / `stats` subcommands).
