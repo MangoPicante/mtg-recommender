@@ -400,7 +400,7 @@ def main() -> int:
     # before committing to the 6 MB download.
     meta = get_bulk_oracle_tags_metadata()
     snapshot_updated_at = meta["updated_at"]
-    stored_snapshot = storage.get_snapshot_timestamp(META_SOURCE)
+    stored_snapshot = storage.get_meta_value(META_SOURCE)
 
     # The raw taggings aren't retained after import, so an attach can't
     # be rerun from state alone. If any card is missing the `tags` field
@@ -444,7 +444,7 @@ def main() -> int:
     # Step 5: record the snapshot timestamp so a future run can skip
     # the download when nothing has moved. Done last so a failure
     # anywhere above forces a retry on the next invocation.
-    storage.set_snapshot_timestamp(META_SOURCE, snapshot_updated_at)
+    storage.set_meta_value(META_SOURCE, snapshot_updated_at)
 
     if total_cards and matched == 0:
         # Loud failure mode worth calling out: the cards collection has

@@ -269,7 +269,7 @@ class TestCmdStats(_MongoBackedTestCase):
         self.assertIn("burn-any", out)
 
     def test_snapshot_timestamp_reported(self):
-        storage.set_snapshot_timestamp("oracle_tags", "2026-10-03T21:00:32.494+00:00")
+        storage.set_meta_value("oracle_tags", "2026-10-03T21:00:32.494+00:00")
         rc, out, _ = _run(["stats"])
         self.assertEqual(rc, 0)
         self.assertIn("2026-10-03T21:00:32.494+00:00", out)

@@ -11,12 +11,15 @@ Test classes:
     TestEmbedCards          — batching, refresh semantics, skip-no-text, limit
     TestEmbedTags           — mirror coverage for the tags collection
     TestEncoderCache        — reset_encoder; missing dep raises cleanly
+    TestInvalidationHelpers — model-drift / alpha-drift detection + the
+                               $unset sweeps they trigger
     TestPackUnpackEmbedding — pack/unpack helpers: Binary roundtrip,
                                float64 downcast, legacy list[float] read
     TestFuseHelpers         — _l2_normalize / _aggregate_tag_vector / _fuse_vectors
     TestFuseCardVectors     — fuse loop: happy path, no-tags, dim mismatch,
                                skip-already-fused, --refresh, --limit, alpha extremes
-    TestMainCLI             — argparse dispatch (cards / tags / fuse / flags)
+    TestMainCLI             — argparse dispatch (cards / tags / fuse / flags),
+                               plus end-to-end auto-invalidation triggers
 """
 from __future__ import annotations
 
@@ -246,6 +249,96 @@ class TestEncoderCache(unittest.TestCase):
         fake = FakeEncoder()
         emb.reset_encoder(fake)
         self.assertIs(emb.get_encoder(), fake)
+
+
+# ---------------------------------------------------------------------------
+# Auto-invalidation (meta signatures)
+# ---------------------------------------------------------------------------
+
+class TestInvalidationHelpers(_MongoBackedTestCase):
+    """Direct tests on the `_maybe_invalidate_*` helpers.
+
+    These exercise the model- / alpha-drift detection in isolation from
+    the embedding loops, so a regression in one doesn't mask a bug in
+    the other.
+    """
+
+    def test_first_run_records_model_but_does_not_invalidate(self):
+        # No meta stored → no previous model to compare against → nothing
+        # to invalidate. The current model is recorded so the NEXT run
+        # has something to compare against.
+        self.cards.insert_one({"_id": "a", "text_embedding": b"abc", "card_vector": b"def"})
+        with redirect_stdout(io.StringIO()):
+            ran = emb._maybe_invalidate_for_text_model(self.cards)
+        self.assertFalse(ran)
+        doc = self.cards.find_one({"_id": "a"})
+        self.assertEqual(doc["text_embedding"], b"abc")
+        self.assertEqual(doc["card_vector"], b"def")
+        self.assertEqual(
+            storage.get_meta_value(emb.META_TEXT_MODEL), emb._current_model_name()
+        )
+
+    def test_matching_model_is_a_no_op(self):
+        storage.set_meta_value(emb.META_TEXT_MODEL, emb._current_model_name())
+        self.cards.insert_one({"_id": "a", "text_embedding": b"abc", "card_vector": b"def"})
+        with redirect_stdout(io.StringIO()):
+            ran = emb._maybe_invalidate_for_text_model(self.cards)
+        self.assertFalse(ran)
+        doc = self.cards.find_one({"_id": "a"})
+        self.assertIn("text_embedding", doc)
+        self.assertIn("card_vector", doc)
+
+    def test_text_model_change_clears_text_embedding_and_card_vector(self):
+        storage.set_meta_value(emb.META_TEXT_MODEL, "old-model")
+        self.cards.insert_many([
+            {"_id": "a", "text_embedding": b"abc", "card_vector": b"def"},
+            {"_id": "b", "text_embedding": b"xyz", "card_vector": b"uvw"},
+        ])
+        with redirect_stdout(io.StringIO()):
+            ran = emb._maybe_invalidate_for_text_model(self.cards)
+        self.assertTrue(ran)
+        for sid in ("a", "b"):
+            doc = self.cards.find_one({"_id": sid})
+            self.assertNotIn("text_embedding", doc)
+            self.assertNotIn("card_vector", doc)
+        self.assertEqual(
+            storage.get_meta_value(emb.META_TEXT_MODEL), emb._current_model_name()
+        )
+
+    def test_tag_model_change_clears_tag_embedding_and_card_vector(self):
+        storage.set_meta_value(emb.META_TAG_MODEL, "old-model")
+        self.tags.insert_one({"_id": "spot-removal", "embedding": b"abc"})
+        self.cards.insert_one({"_id": "a", "card_vector": b"def"})
+        with redirect_stdout(io.StringIO()):
+            ran = emb._maybe_invalidate_for_tag_model(self.cards, self.tags)
+        self.assertTrue(ran)
+        self.assertNotIn("embedding", self.tags.find_one({"_id": "spot-removal"}))
+        self.assertNotIn("card_vector", self.cards.find_one({"_id": "a"}))
+        self.assertEqual(
+            storage.get_meta_value(emb.META_TAG_MODEL), emb._current_model_name()
+        )
+
+    def test_alpha_change_clears_card_vector_only(self):
+        storage.set_meta_value(emb.META_FUSE_ALPHA, 0.6)
+        self.cards.insert_one(
+            {"_id": "a", "text_embedding": b"keep-me", "card_vector": b"def"}
+        )
+        with redirect_stdout(io.StringIO()):
+            ran = emb._maybe_invalidate_for_alpha(self.cards, 0.7)
+        self.assertTrue(ran)
+        doc = self.cards.find_one({"_id": "a"})
+        # text_embedding is independent of alpha — must survive.
+        self.assertEqual(doc["text_embedding"], b"keep-me")
+        self.assertNotIn("card_vector", doc)
+        self.assertEqual(storage.get_meta_value(emb.META_FUSE_ALPHA), 0.7)
+
+    def test_matching_alpha_is_a_no_op(self):
+        storage.set_meta_value(emb.META_FUSE_ALPHA, 0.6)
+        self.cards.insert_one({"_id": "a", "card_vector": b"def"})
+        with redirect_stdout(io.StringIO()):
+            ran = emb._maybe_invalidate_for_alpha(self.cards, 0.6)
+        self.assertFalse(ran)
+        self.assertEqual(self.cards.find_one({"_id": "a"})["card_vector"], b"def")
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +637,46 @@ class TestMainCLI(_MongoBackedTestCase):
         rc, _, _ = _run(["cards", "--limit", "2"])
         self.assertEqual(rc, 0)
         self.assertEqual(self.cards.count_documents({"text_embedding": {"$exists": True}}), 2)
+
+    def test_cards_subcommand_auto_invalidates_on_model_change(self):
+        # Record an old model in meta, seed a card with a stale embedding
+        # under that model. Running `mtg-embed cards` under the current
+        # (different) model must clear it before re-encoding.
+        storage.set_meta_value(emb.META_TEXT_MODEL, "old-model")
+        self.cards.insert_one({
+            "_id": "a", "name": "A", "oracle_text": "deals 3 damage",
+            "text_embedding": emb._pack_embedding(np.zeros(self.encoder.dim)),
+            "card_vector": emb._pack_embedding(np.zeros(self.encoder.dim)),
+        })
+        rc, _, _ = _run(["cards"])
+        self.assertEqual(rc, 0)
+        doc = self.cards.find_one({"_id": "a"})
+        # A fresh text_embedding exists but it's NOT the all-zeros one.
+        vec = emb._unpack_embedding(doc["text_embedding"])
+        self.assertFalse(np.allclose(vec, 0.0))
+        # card_vector was invalidated; nobody re-fused it in this flow.
+        self.assertNotIn("card_vector", doc)
+        self.assertEqual(
+            storage.get_meta_value(emb.META_TEXT_MODEL), emb._current_model_name()
+        )
+
+    def test_fuse_subcommand_auto_invalidates_on_alpha_change(self):
+        storage.set_meta_value(emb.META_FUSE_ALPHA, 0.6)
+        self.tags.insert_one(
+            {"_id": "a", "embedding": emb._pack_embedding(np.array([0.0, 1.0, 0.0, 0.0]))}
+        )
+        self.cards.insert_one({
+            "_id": "c1", "name": "C1", "oracle_text": "x",
+            "text_embedding": emb._pack_embedding(np.array([1.0, 0.0, 0.0, 0.0])),
+            "card_vector": emb._pack_embedding(np.array([9.0, 9.0, 9.0, 9.0])),
+            "tags": ["a"],
+        })
+        rc, _, _ = _run(["fuse", "--alpha", "0.8"])
+        self.assertEqual(rc, 0)
+        got = emb._unpack_embedding(self.cards.find_one({"_id": "c1"})["card_vector"])
+        # Fresh fuse with alpha=0.8 → text-leaning blend, not the sentinel.
+        self.assertFalse(np.allclose(got, 9.0))
+        self.assertEqual(storage.get_meta_value(emb.META_FUSE_ALPHA), 0.8)
 
     def test_missing_subcommand_errors(self):
         with self.assertRaises(SystemExit):

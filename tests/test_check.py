@@ -102,7 +102,7 @@ class TestCheckCounts(_MongoBackedTestCase):
     def test_reports_counts_for_each_collection(self):
         storage.cards_collection().insert_many([{"_id": "a"}, {"_id": "b"}])
         storage.tags_collection().insert_one({"_id": "t"})
-        storage.set_snapshot_timestamp("oracle_tags", "2026-10-04T00:00:00+00:00")
+        storage.set_meta_value("oracle_tags", "2026-10-04T00:00:00+00:00")
         ok, rows = hc.check_counts()
         self.assertTrue(ok)
         by_name = dict(rows)

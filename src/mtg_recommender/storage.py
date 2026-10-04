@@ -55,11 +55,18 @@ Collections:
         The raw Scryfall tag UUID isn't stored — nothing in the project
         cross-refs it against the API, so persisting it was overhead.
 
-    meta  : one document per bulk source, _id = source name. Shape:
+    meta  : one document per persisted scalar, _id = key. Shape:
         {
-          "_id":                "oracle_tags",   # or "oracle_cards", etc.
-          "snapshot_updated_at":"<ISO 8601 string from Scryfall>"
+          "_id":    "<key>",      # "oracle_cards", "oracle_tags",
+                                  # "text_embedding_model",
+                                  # "tag_embedding_model", "fuse_alpha", …
+          "value":  "<any scalar>"
         }
+      Used for two purposes: bulk-snapshot timestamps (so repeat
+      `scryfall-fetch` / `scryfall-fetch-tags` runs skip the download
+      when nothing moved) and embedding-config signatures (so
+      `mtg-embed` auto-invalidates when the active model or alpha
+      changes). `get_meta_value` / `set_meta_value` are the only API.
 
 Indexes created by `ensure_indexes`:
 
@@ -252,19 +259,33 @@ def ensure_indexes(db: Optional[Database] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Meta helpers (snapshot timestamps)
+# Meta helpers (persisted scalar key/value: snapshot timestamps and embedding
+# config signatures)
 # ---------------------------------------------------------------------------
 
-def get_snapshot_timestamp(source: str, db: Optional[Database] = None) -> Optional[str]:
-    """Return the stored snapshot_updated_at for `source` (e.g. "oracle_tags")."""
-    doc = meta_collection(db).find_one({"_id": source})
-    return doc.get("snapshot_updated_at") if doc else None
+def get_meta_value(key: str, db: Optional[Database] = None):
+    """Return the stored value for `key`, or None if not set.
+
+    Serves two kinds of callers:
+      - freshness-skip: `scryfall-fetch` / `scryfall-fetch-tags` store a
+        snapshot `updated_at` under `oracle_cards` / `oracle_tags`.
+      - auto-invalidation: `mtg-embed` stores the active model name
+        under `text_embedding_model` / `tag_embedding_model` and the
+        active alpha under `fuse_alpha`, so a config change wipes the
+        now-stale embeddings on the next run.
+
+    The stored value's type is whatever the setter wrote — Mongo
+    serialises strings and floats transparently, so the helper is
+    untyped on purpose.
+    """
+    doc = meta_collection(db).find_one({"_id": key})
+    return doc.get("value") if doc else None
 
 
-def set_snapshot_timestamp(source: str, updated_at: str, db: Optional[Database] = None) -> None:
-    """Upsert the snapshot_updated_at for `source`."""
+def set_meta_value(key: str, value, db: Optional[Database] = None) -> None:
+    """Upsert the stored value for `key`."""
     meta_collection(db).update_one(
-        {"_id": source},
-        {"$set": {"snapshot_updated_at": updated_at}},
+        {"_id": key},
+        {"$set": {"value": value}},
         upsert=True,
     )

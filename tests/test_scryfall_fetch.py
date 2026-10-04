@@ -662,7 +662,7 @@ class TestBulkMode(_MongoBackedTestCase):
     def test_fast_path_skips_when_meta_matches_snapshot(self):
         # Pre-populate + record meta — the common rerun case.
         sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW, SOL_RING_RAW])
-        storage.set_snapshot_timestamp(sf.META_SOURCE, LATER)
+        storage.set_meta_value(sf.META_SOURCE, LATER)
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(sf, "download_bulk_oracle_cards") as dl:
             changed = call_silent(sf.run_bulk_mode, self.coll)
@@ -676,7 +676,7 @@ class TestBulkMode(_MongoBackedTestCase):
         # then classifies every card as unchanged, so no writes) and
         # sets meta so the next run hits the fast path.
         sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW])
-        self.assertIsNone(storage.get_snapshot_timestamp(sf.META_SOURCE))
+        self.assertIsNone(storage.get_meta_value(sf.META_SOURCE))
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(
                  sf, "download_bulk_oracle_cards",
@@ -687,14 +687,14 @@ class TestBulkMode(_MongoBackedTestCase):
         # No real content delta → report False to the caller.
         self.assertFalse(changed)
         self.assertEqual(
-            storage.get_snapshot_timestamp(sf.META_SOURCE), LATER
+            storage.get_meta_value(sf.META_SOURCE), LATER
         )
 
     def test_snapshot_mismatch_triggers_download(self):
         # Meta recorded an older snapshot than the current /bulk-data —
         # fast-path check fails, download fires.
         sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW])
-        storage.set_snapshot_timestamp(sf.META_SOURCE, EARLIER)
+        storage.set_meta_value(sf.META_SOURCE, EARLIER)
         # Flip the sha so the incoming card is "changed", not "unchanged".
         changed_raw = {**LIGHTNING_BOLT_RAW, "oracle_text": "Deals 4 damage to any target."}
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
@@ -706,7 +706,7 @@ class TestBulkMode(_MongoBackedTestCase):
         dl.assert_called_once()
         self.assertTrue(changed)
         self.assertEqual(
-            storage.get_snapshot_timestamp(sf.META_SOURCE), LATER
+            storage.get_meta_value(sf.META_SOURCE), LATER
         )
         # The new oracle_text landed.
         self.assertIn(
@@ -738,7 +738,7 @@ class TestBulkMode(_MongoBackedTestCase):
              ):
             call_silent(sf.run_bulk_mode, self.coll)
         self.assertEqual(
-            storage.get_snapshot_timestamp(sf.META_SOURCE), LATER
+            storage.get_meta_value(sf.META_SOURCE), LATER
         )
 
 

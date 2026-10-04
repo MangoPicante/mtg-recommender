@@ -547,7 +547,7 @@ def run_bulk_mode(coll: Collection) -> bool:
     snapshot_updated_at = meta["updated_at"]
 
     cards_present = coll.estimated_document_count() > 0
-    stored_snapshot = storage.get_snapshot_timestamp(META_SOURCE)
+    stored_snapshot = storage.get_meta_value(META_SOURCE)
 
     # Fast path: meta says we're already covering this snapshot.
     if cards_present and stored_snapshot == snapshot_updated_at:
@@ -563,7 +563,7 @@ def run_bulk_mode(coll: Collection) -> bool:
     )
     # Record the snapshot last so a crash mid-merge leaves meta un-set and
     # the next run retries rather than falsely claiming freshness.
-    storage.set_snapshot_timestamp(META_SOURCE, snapshot_updated_at)
+    storage.set_meta_value(META_SOURCE, snapshot_updated_at)
     return new_count > 0 or changed_count > 0
 
 
