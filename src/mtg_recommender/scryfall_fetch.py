@@ -37,8 +37,12 @@ Storage (MongoDB — see `storage.py` for connection details):
           "type_line":        "...",
           "oracle_text":      "...",
           "oracle_text_sha":  "<16-hex sha256 prefix>", # the diff key
-          "updated_at":       "<snapshot ISO 8601>"
         }
+
+    Per-card `updated_at` is not stored — the snapshot timestamp lives
+    once in the `meta` collection under `_id = "oracle_cards"` (every
+    card in a given merge shares the same value, so repeating it on
+    40 k docs was pure overhead).
 
     `tags`, `text_embedding`, and `card_vector` are owned by other
     modules; the fetcher uses $set on only its own fields and `$unset`
@@ -153,14 +157,13 @@ def build_names(raw: dict) -> list[str]:
     return list(seen.keys())
 
 
-def extract_card_fields(data: dict, updated_at: str) -> dict:
+def extract_card_fields(data: dict) -> dict:
     """Reduce a full Scryfall card object into the Mongo document shape.
 
-    `updated_at` is passed in explicitly so the caller decides what "last
-    updated" means for this entry — the snapshot timestamp for bulk merges,
-    the current wall-clock for single fetches. This keeps the projection
-    function pure (no hidden time dependency) and lets both fetch paths
-    produce identical-shaped documents.
+    Pure projection — no hidden time dependency, no I/O. The snapshot
+    timestamp lives once in the `meta` collection; stamping it on
+    every card doc was pure overhead (identical value across ~40 k
+    rows) and no longer written.
 
     Multi-faced card handling (transform DFC, MDFC, split, adventure,
     meld) — Scryfall doesn't populate the same top-level fields for every
@@ -238,7 +241,6 @@ def extract_card_fields(data: dict, updated_at: str) -> dict:
         # decide which docs actually need re-writing and which embedding
         # fields to invalidate.
         "oracle_text_sha": oracle_text_sha(oracle_text),
-        "updated_at": updated_at,
     }
 
 
@@ -262,7 +264,7 @@ def http_get_json(url: str, timeout: int = 30) -> dict:
 # oracle_tags module — survives a bulk merge. The fields owned here are:
 #
 #     _id, oracle_id, name, names, mana_cost, type_line, oracle_text,
-#     oracle_text_sha, updated_at
+#     oracle_text_sha
 #
 # A content-change merge also $unsets `text_embedding` and `card_vector`
 # — not owned here, but conceptually downstream of oracle_text, so a
@@ -273,7 +275,7 @@ def http_get_json(url: str, timeout: int = 30) -> dict:
 # from this list even though it's an owned field.
 _OWNED_FIELDS = (
     "oracle_id", "name", "names",
-    "mana_cost", "type_line", "oracle_text", "oracle_text_sha", "updated_at",
+    "mana_cost", "type_line", "oracle_text", "oracle_text_sha",
 )
 
 # Downstream fields the fetcher $unsets when a card's oracle_text changes.
@@ -293,14 +295,14 @@ def _set_payload(doc: dict) -> dict:
     return {k: doc[k] for k in _OWNED_FIELDS if k in doc}
 
 
-def upsert_card(coll: Collection, raw: dict, updated_at: str) -> bool:
+def upsert_card(coll: Collection, raw: dict) -> bool:
     """Upsert a single card into Mongo. Returns True on success, False on no-id.
 
     "Success" here just means the raw object had an `id` field to key the
     document under — a missing `id` would silently vanish without a
     place to go, so we skip and tell the caller.
     """
-    doc = extract_card_fields(raw, updated_at=updated_at)
+    doc = extract_card_fields(raw)
     sid = doc["_id"]
     if not sid:
         return False
@@ -308,9 +310,7 @@ def upsert_card(coll: Collection, raw: dict, updated_at: str) -> bool:
     return True
 
 
-def bulk_upsert_cards(
-    coll: Collection, bulk: list[dict], snapshot_updated_at: str
-) -> tuple[int, int, int]:
+def bulk_upsert_cards(coll: Collection, bulk: list[dict]) -> tuple[int, int, int]:
     """Diff-aware upsert of a bulk list. Returns (new, changed, unchanged).
 
     Loads every stored `oracle_text_sha` into memory first (one Mongo
@@ -342,16 +342,15 @@ def bulk_upsert_cards(
     new_count = changed_count = unchanged_count = 0
     ops: list[UpdateOne] = []
     for raw in bulk:
-        doc = extract_card_fields(raw, updated_at=snapshot_updated_at)
+        doc = extract_card_fields(raw)
         sid = doc["_id"]
         if not sid:
             continue
         new_sha = doc["oracle_text_sha"]
         stored_sha = existing_shas.get(sid)
         if stored_sha == new_sha and sid in existing_shas:
-            # Content unchanged; owned-field churn (updated_at bump,
-            # name case-fix, etc.) isn't worth a write. Downstream
-            # embeddings stay valid.
+            # Content unchanged; owned-field churn (name case-fix, etc.)
+            # isn't worth a write. Downstream embeddings stay valid.
             unchanged_count += 1
             continue
         if sid not in existing_shas:
@@ -556,9 +555,7 @@ def run_bulk_mode(coll: Collection) -> bool:
         return False
 
     bulk = download_bulk_oracle_cards(meta)
-    new_count, changed_count, unchanged_count = bulk_upsert_cards(
-        coll, bulk, snapshot_updated_at
-    )
+    new_count, changed_count, unchanged_count = bulk_upsert_cards(coll, bulk)
     total = new_count + changed_count + unchanged_count
     print(
         f"bulk  : {new_count} new, {changed_count} changed, "

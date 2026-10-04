@@ -160,13 +160,11 @@ class _MongoBackedTestCase(unittest.TestCase):
 class TestCardProjection(unittest.TestCase):
 
     def test_single_face_card(self):
-        result = sf.extract_card_fields(LIGHTNING_BOLT_RAW, updated_at=LATER)
+        result = sf.extract_card_fields(LIGHTNING_BOLT_RAW)
         self.assertEqual(result["name"], "Lightning Bolt")
         self.assertEqual(result["mana_cost"], "{R}")
         self.assertEqual(result["oracle_text"], LIGHTNING_BOLT_RAW["oracle_text"])
         self.assertEqual(result["_id"], "id-lb")
-        self.assertEqual(result["_id"], "id-lb")
-        self.assertEqual(result["updated_at"], LATER)
         # sha of the (post-projection) oracle_text is populated and
         # matches a direct call to the helper on the same string.
         self.assertEqual(
@@ -188,11 +186,11 @@ class TestCardProjection(unittest.TestCase):
         self.assertEqual(sf.oracle_text_sha(None), sf.oracle_text_sha(""))
 
     def test_names_contains_lowered_main_name(self):
-        result = sf.extract_card_fields(LIGHTNING_BOLT_RAW, updated_at=LATER)
+        result = sf.extract_card_fields(LIGHTNING_BOLT_RAW)
         self.assertEqual(result["names"], ["lightning bolt"])
 
     def test_names_contains_combined_and_face_names_for_dfc(self):
-        result = sf.extract_card_fields(DELVER_RAW, updated_at=LATER)
+        result = sf.extract_card_fields(DELVER_RAW)
         # Order: combined name first, then face names left-to-right.
         self.assertEqual(
             result["names"],
@@ -206,7 +204,7 @@ class TestCardProjection(unittest.TestCase):
     def test_names_dedupes_when_faces_share_name(self):
         # Art-card variant whose two faces are both "Delver of Secrets"
         # must contribute a single "delver of secrets" to the names array.
-        result = sf.extract_card_fields(DELVER_ART_RAW, updated_at=LATER)
+        result = sf.extract_card_fields(DELVER_ART_RAW)
         self.assertEqual(
             result["names"],
             [
@@ -217,26 +215,19 @@ class TestCardProjection(unittest.TestCase):
 
     def test_multifaced_card_missing_top_level_oracle_joins_faces(self):
         # No top-level oracle_text; must join face texts with the separator.
-        result = sf.extract_card_fields(DELVER_RAW, updated_at=MIDDLE)
+        result = sf.extract_card_fields(DELVER_RAW)
         self.assertIn("Front text", result["oracle_text"])
         self.assertIn("Flying", result["oracle_text"])
         self.assertIn("\n---\n", result["oracle_text"])
 
-    def test_uses_passed_updated_at_verbatim(self):
-        # The projection is deliberately time-agnostic — whatever the
-        # caller passes ends up in the entry unchanged.
-        for ts in (EARLIER, MIDDLE, LATER):
-            result = sf.extract_card_fields(LIGHTNING_BOLT_RAW, updated_at=ts)
-            self.assertEqual(result["updated_at"], ts)
-
     def test_missing_fields_yield_none(self):
-        result = sf.extract_card_fields({"id": "x", "name": "X"}, updated_at=LATER)
+        result = sf.extract_card_fields({"id": "x", "name": "X"})
         self.assertIsNone(result["mana_cost"])
         self.assertIsNone(result["type_line"])
         self.assertIsNone(result["oracle_text"])
 
     def test_mdfc_null_toplevel_falls_back_to_joined_string(self):
-        result = sf.extract_card_fields(BALA_GED_MDFC_RAW, updated_at=LATER)
+        result = sf.extract_card_fields(BALA_GED_MDFC_RAW)
         self.assertEqual(result["mana_cost"], "{2}{G} // ")
         self.assertEqual(result["type_line"], "Sorcery // Land")
         self.assertIn("Return target card", result["oracle_text"])
@@ -254,22 +245,22 @@ class TestCardProjection(unittest.TestCase):
                 {"name": "Back", "mana_cost": "{1}{R}", "type_line": "Enchantment"},
             ],
         }
-        result = sf.extract_card_fields(raw, updated_at=LATER)
+        result = sf.extract_card_fields(raw)
         self.assertEqual(result["mana_cost"], "{2}{U} // {1}{R}")
         self.assertEqual(result["type_line"], "Creature // Enchantment")
 
     def test_transform_dfc_prefers_populated_toplevel_fields(self):
-        result = sf.extract_card_fields(DELVER_RAW, updated_at=LATER)
+        result = sf.extract_card_fields(DELVER_RAW)
         self.assertEqual(result["mana_cost"], "{U}")
         self.assertEqual(result["type_line"], DELVER_RAW["type_line"])
 
     def test_oracle_id_is_copied_when_present(self):
-        result = sf.extract_card_fields(LIGHTNING_BOLT_RAW, updated_at=LATER)
+        result = sf.extract_card_fields(LIGHTNING_BOLT_RAW)
         self.assertEqual(result["oracle_id"], "oracle-lb")
 
     def test_oracle_id_is_none_when_missing(self):
         raw_without_oracle_id = {"id": "x", "name": "X"}
-        result = sf.extract_card_fields(raw_without_oracle_id, updated_at=LATER)
+        result = sf.extract_card_fields(raw_without_oracle_id)
         self.assertIsNone(result["oracle_id"])
 
 
@@ -280,17 +271,16 @@ class TestCardProjection(unittest.TestCase):
 class TestUpsertCard(_MongoBackedTestCase):
 
     def test_single_upsert_stores_under_id(self):
-        ok = sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=LATER)
+        ok = sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW)
         self.assertTrue(ok)
         doc = self.coll.find_one({"_id": "id-lb"})
         self.assertIsNotNone(doc)
         self.assertEqual(doc["name"], "Lightning Bolt")
-        self.assertEqual(doc["updated_at"], LATER)
         self.assertEqual(doc["names"], ["lightning bolt"])
         self.assertEqual(doc["oracle_id"], "oracle-lb")
 
     def test_returns_false_and_stores_nothing_without_id(self):
-        ok = sf.upsert_card(self.coll, {"name": "No id"}, updated_at=LATER)
+        ok = sf.upsert_card(self.coll, {"name": "No id"})
         self.assertFalse(ok)
         self.assertEqual(self.coll.count_documents({}), 0)
 
@@ -301,20 +291,18 @@ class TestUpsertCard(_MongoBackedTestCase):
         self.coll.insert_one({
             "_id": "id-lb",
             "name": "Lightning Bolt (old)",
-            "updated_at": EARLIER,
             "tags": ["spot-removal", "burn-any"],
         })
-        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=LATER)
+        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW)
         doc = self.coll.find_one({"_id": "id-lb"})
         # Fetcher-owned fields updated:
         self.assertEqual(doc["name"], "Lightning Bolt")
-        self.assertEqual(doc["updated_at"], LATER)
         # Fetcher-foreign field intact:
         self.assertEqual(doc["tags"], ["spot-removal", "burn-any"])
 
     def test_bulk_upsert_stores_everything(self):
         new, changed, unchanged = sf.bulk_upsert_cards(
-            self.coll, [LIGHTNING_BOLT_RAW, SOL_RING_RAW, DELVER_RAW], LATER
+            self.coll, [LIGHTNING_BOLT_RAW, SOL_RING_RAW, DELVER_RAW]
         )
         self.assertEqual((new, changed, unchanged), (3, 0, 0))
         self.assertEqual(self.coll.count_documents({}), 3)
@@ -323,7 +311,7 @@ class TestUpsertCard(_MongoBackedTestCase):
 
     def test_bulk_upsert_skips_entries_missing_id(self):
         new, changed, unchanged = sf.bulk_upsert_cards(
-            self.coll, [LIGHTNING_BOLT_RAW, {"name": "no id"}], LATER
+            self.coll, [LIGHTNING_BOLT_RAW, {"name": "no id"}]
         )
         self.assertEqual((new, changed, unchanged), (1, 0, 0))
         self.assertEqual(self.coll.count_documents({}), 1)
@@ -333,41 +321,37 @@ class TestUpsertCard(_MongoBackedTestCase):
         # Insert with the current sha so this counts as unchanged (if we
         # inserted with no sha, the diff would write and $unset tags
         # instead — a hypothetical we exercise separately).
-        bolt_sha = sf.oracle_text_sha(sf.extract_card_fields(LIGHTNING_BOLT_RAW, LATER)["oracle_text"])
+        bolt_sha = sf.oracle_text_sha(sf.extract_card_fields(LIGHTNING_BOLT_RAW)["oracle_text"])
         self.coll.insert_one({
             "_id": "id-lb", "name": "Old",
-            "updated_at": EARLIER,
             "oracle_text_sha": bolt_sha,
             "tags": ["spot-removal"],
         })
-        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], LATER)
+        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW])
         doc = self.coll.find_one({"_id": "id-lb"})
-        # Unchanged content → no write at all; stale updated_at stays.
+        # Unchanged content → no write at all; tags survive untouched.
         self.assertEqual(doc["tags"], ["spot-removal"])
-        self.assertEqual(doc["updated_at"], EARLIER)
 
     def test_empty_bulk_is_a_noop(self):
-        new, changed, unchanged = sf.bulk_upsert_cards(self.coll, [], LATER)
+        new, changed, unchanged = sf.bulk_upsert_cards(self.coll, [])
         self.assertEqual((new, changed, unchanged), (0, 0, 0))
 
     def test_unchanged_card_produces_no_write(self):
         # Pre-seed at a stored sha matching what extract_card_fields will
         # produce for the incoming raw. The bulk pass should classify
         # this as unchanged and leave the doc intact.
-        sha = sf.oracle_text_sha(sf.extract_card_fields(LIGHTNING_BOLT_RAW, LATER)["oracle_text"])
+        sha = sf.oracle_text_sha(sf.extract_card_fields(LIGHTNING_BOLT_RAW)["oracle_text"])
         self.coll.insert_one({
             "_id": "id-lb", "name": "Lightning Bolt",
-            "oracle_text_sha": sha, "updated_at": EARLIER,
+            "oracle_text_sha": sha,
             "text_embedding": [0.0] * 4, "card_vector": [0.0] * 4,
         })
         new, changed, unchanged = sf.bulk_upsert_cards(
-            self.coll, [LIGHTNING_BOLT_RAW], LATER
+            self.coll, [LIGHTNING_BOLT_RAW]
         )
         self.assertEqual((new, changed, unchanged), (0, 0, 1))
         doc = self.coll.find_one({"_id": "id-lb"})
-        # No write means both downstream fields and the stale updated_at
-        # stay as they were.
-        self.assertEqual(doc["updated_at"], EARLIER)
+        # No write means downstream fields stay as they were.
         self.assertEqual(doc["text_embedding"], [0.0] * 4)
         self.assertEqual(doc["card_vector"], [0.0] * 4)
 
@@ -377,17 +361,16 @@ class TestUpsertCard(_MongoBackedTestCase):
         # embedding fields.
         self.coll.insert_one({
             "_id": "id-lb", "name": "Old",
-            "oracle_text_sha": "deadbeefdeadbeef", "updated_at": EARLIER,
+            "oracle_text_sha": "deadbeefdeadbeef",
             "text_embedding": [0.0] * 4, "card_vector": [0.0] * 4,
             "tags": ["spot-removal"],
         })
         new, changed, unchanged = sf.bulk_upsert_cards(
-            self.coll, [LIGHTNING_BOLT_RAW], LATER
+            self.coll, [LIGHTNING_BOLT_RAW]
         )
         self.assertEqual((new, changed, unchanged), (0, 1, 0))
         doc = self.coll.find_one({"_id": "id-lb"})
         self.assertEqual(doc["name"], "Lightning Bolt")
-        self.assertEqual(doc["updated_at"], LATER)
         # Owned-by-oracle_tags field intact across the content change.
         self.assertEqual(doc["tags"], ["spot-removal"])
         # Downstream fields invalidated so mtg-embed re-encodes.
@@ -401,10 +384,10 @@ class TestUpsertCard(_MongoBackedTestCase):
         # can't prove the text is unchanged.
         self.coll.insert_one({
             "_id": "id-lb", "name": "Lightning Bolt",
-            "updated_at": EARLIER, "text_embedding": [0.0] * 4,
+            "text_embedding": [0.0] * 4,
         })
         new, changed, unchanged = sf.bulk_upsert_cards(
-            self.coll, [LIGHTNING_BOLT_RAW], LATER
+            self.coll, [LIGHTNING_BOLT_RAW]
         )
         self.assertEqual((new, changed, unchanged), (0, 1, 0))
         doc = self.coll.find_one({"_id": "id-lb"})
@@ -418,8 +401,8 @@ class TestUpsertCard(_MongoBackedTestCase):
 
 class TestFindCardsByName(_MongoBackedTestCase):
 
-    def _seed(self, *raws, updated_at=LATER):
-        sf.bulk_upsert_cards(self.coll, list(raws), updated_at)
+    def _seed(self, *raws):
+        sf.bulk_upsert_cards(self.coll, list(raws))
 
     def test_hit_returns_single_element_list(self):
         self._seed(LIGHTNING_BOLT_RAW)
@@ -678,7 +661,7 @@ class TestBulkMode(_MongoBackedTestCase):
 
     def test_fast_path_skips_when_meta_matches_snapshot(self):
         # Pre-populate + record meta — the common rerun case.
-        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW, SOL_RING_RAW], LATER)
+        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW, SOL_RING_RAW])
         storage.set_snapshot_timestamp(sf.META_SOURCE, LATER)
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(sf, "download_bulk_oracle_cards") as dl:
@@ -692,7 +675,7 @@ class TestBulkMode(_MongoBackedTestCase):
         # the meta entry is missing. The module downloads once (the diff
         # then classifies every card as unchanged, so no writes) and
         # sets meta so the next run hits the fast path.
-        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], LATER)
+        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW])
         self.assertIsNone(storage.get_snapshot_timestamp(sf.META_SOURCE))
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(
@@ -710,7 +693,7 @@ class TestBulkMode(_MongoBackedTestCase):
     def test_snapshot_mismatch_triggers_download(self):
         # Meta recorded an older snapshot than the current /bulk-data —
         # fast-path check fails, download fires.
-        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], EARLIER)
+        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW])
         storage.set_snapshot_timestamp(sf.META_SOURCE, EARLIER)
         # Flip the sha so the incoming card is "changed", not "unchanged".
         changed_raw = {**LIGHTNING_BOLT_RAW, "oracle_text": "Deals 4 damage to any target."}

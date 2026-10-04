@@ -162,18 +162,18 @@ class TestExtractTagFields(unittest.TestCase):
 
     def test_projects_core_fields(self):
         out = ot.extract_tag_fields(TAG_SPOT, self.id_to_slug)
-        self.assertEqual(out["scryfall_tag_id"], "u-spot")
         self.assertEqual(out["label"], "Spot removal")
         self.assertEqual(out["description"], "Removes a single permanent.")
         self.assertEqual(out["aliases"], ["targeted-removal"])
 
-    def test_renames_raw_id_to_scryfall_tag_id(self):
-        # Raw Scryfall uses `id` for the tag UUID; the projection renames
-        # it so it doesn't look like an attempt to set Mongo's reserved
-        # _id field once the doc lands in a collection.
+    def test_raw_scryfall_tag_uuid_is_dropped(self):
+        # The raw Scryfall `id` is the tag's UUID; nothing in the project
+        # cross-refs it against the API, so persisting it was pure
+        # overhead. The projection drops it instead of carrying it under
+        # a new name.
         out = ot.extract_tag_fields(TAG_SPOT, self.id_to_slug)
         self.assertNotIn("id", out)
-        self.assertIn("scryfall_tag_id", out)
+        self.assertNotIn("scryfall_tag_id", out)
 
     def test_resolves_parent_uuids_to_slugs(self):
         out = ot.extract_tag_fields(TAG_SPOT, self.id_to_slug)
@@ -219,7 +219,7 @@ class TestBuildTagCatalog(unittest.TestCase):
         entry = catalog["spot-removal"]
         self.assertEqual(
             set(entry.keys()),
-            {"scryfall_tag_id", "label", "description", "parent_slugs", "child_slugs", "aliases"},
+            {"label", "description", "parent_slugs", "child_slugs", "aliases"},
         )
 
     def test_entry_without_slug_is_skipped(self):

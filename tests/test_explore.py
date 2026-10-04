@@ -74,7 +74,7 @@ BOLT_ART = {
 }
 
 TAG_SPOT = {
-    "_id": "spot-removal", "scryfall_tag_id": "u-spot",
+    "_id": "spot-removal",
     "label": "Spot removal", "description": "Removes a single permanent.",
     "parent_slugs": ["removal"], "child_slugs": ["doom-blade"],
     "aliases": ["targeted-removal"],
