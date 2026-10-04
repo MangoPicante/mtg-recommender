@@ -23,6 +23,7 @@ Under `src/mtg_recommender/`:
 | `oracle_tags` | Downloads the Scryfall oracle-tags bulk, writes a slug-keyed catalog to the `tags` collection (hierarchy + aliases + descriptions preserved), and attaches `tags: [slug, ...]` arrays to each card by joining on `oracle_id`. |
 | `extract_oracle` | Writes a trimmed per-decklist JSON subset of the cards collection for downstream consumers that don't speak Mongo. |
 | `inspect` | Read-only ad-hoc inspection CLI. Subcommands: `card`, `tag`, `list`, `stats`. Human-readable output for one-off exploration and debugging. |
+| `check` | Read-only health check. Pings the Mongo server, verifies the configured database + indexes, and reports a doc count per collection. Exit 0 on success, 1 if any check fails. |
 
 Tests live under `tests/` and are offline — every HTTP call is mocked, every
 Mongo op goes through `mongomock`.
@@ -62,6 +63,19 @@ cp .env.example .env
 Collections (`cards`, `tags`, `meta`) and their indexes are created on first
 run — no separate migration step. See the docstring of `storage.py` for the
 full document schemas.
+
+### Verifying your cluster
+
+After editing `.env`, confirm Mongo is reachable with the health check:
+
+```bash
+mtg-check            # one row per check: connectivity, database, indexes, counts
+mtg-check -v         # also prints server + pymongo versions
+```
+
+Exit code is 0 on success and 1 if any check fails, so the command is
+scriptable. A failed connectivity row short-circuits the rest to `SKIP` so
+the error you care about shows up first.
 
 ## Usage
 
@@ -145,8 +159,29 @@ The subset drops Mongo bookkeeping (`_id`, `names`, `updated_at`, `oracle_id`,
 python -m unittest discover tests
 ```
 
-Every HTTP call is mocked; every Mongo op routes through `mongomock`. 132
-tests, well under a second total — no network, no real Mongo required.
+Every HTTP call is mocked; every Mongo op routes through `mongomock`. 145
+offline tests, well under a second total — no network, no real Mongo required.
+
+#### Integration tests (opt-in)
+
+A small suite under `tests/integration/` exercises the real pymongo driver
+against a real Mongo cluster. These tests silently skip unless
+`MONGODB_INTEGRATION_URI` is set — pointing them at your Atlas cluster is
+safe because each test class creates a disposable uuid-suffixed database and
+drops it on teardown:
+
+```bash
+# bash/zsh:
+MONGODB_INTEGRATION_URI="mongodb+srv://..." python -m unittest discover tests
+
+# PowerShell:
+$env:MONGODB_INTEGRATION_URI = "mongodb+srv://..."
+python -m unittest discover tests
+```
+
+Nine integration tests cover connectivity, `ensure_indexes`, card
+round-tripping, tag attachment, and the meta timestamp — see
+`tests/integration/test_mongo_integration.py` for the full list.
 
 ## Project layout
 
@@ -159,12 +194,16 @@ mtg-recommender/
 │       ├── scryfall_fetch.py    # oracle-text fetcher -> cards collection
 │       ├── oracle_tags.py       # oracle-tags importer -> tags collection + attach
 │       ├── extract_oracle.py    # per-decklist JSON subset exporter
-│       └── inspect.py           # read-only ad-hoc inspection CLI
+│       ├── inspect.py           # read-only ad-hoc inspection CLI
+│       └── check.py             # read-only Mongo health check
 ├── tests/
 │   ├── test_storage.py          # offline, mongomock-backed
 │   ├── test_scryfall_fetch.py
 │   ├── test_oracle_tags.py
-│   └── test_inspect.py
+│   ├── test_inspect.py
+│   ├── test_check.py
+│   └── integration/             # opt-in; needs MONGODB_INTEGRATION_URI
+│       └── test_mongo_integration.py
 ├── pyproject.toml               # PEP 621 metadata, build config, entry points
 ├── .env.example                 # template; copy to .env + fill in MONGODB_URI
 ├── CLAUDE.md                    # workflow + style conventions
