@@ -162,7 +162,7 @@ python -m unittest discover tests
 Every HTTP call is mocked; every Mongo op routes through `mongomock`. 145
 offline tests, well under a second total — no network, no real Mongo required.
 
-#### Integration tests (opt-in)
+### Integration tests (opt-in)
 
 A small suite under `tests/integration/` exercises the real pymongo driver
 against a real Mongo cluster. These tests silently skip unless
