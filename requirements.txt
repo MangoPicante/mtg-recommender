@@ -1,0 +1,18 @@
+# Runtime dependencies.
+#
+# Intentionally empty for now: the current modules (scryfall_fetch,
+# extract_oracle) are stdlib-only. External packages will be added as later
+# phases land — see PLAN.md.
+#
+# Expected additions:
+#   Phase 1 — MongoDB persistence
+#     pymongo             # Atlas driver
+#     python-dotenv       # read MONGODB_URI from .env for local dev
+#
+#   Phase 2 — embeddings
+#     sentence-transformers  # off-the-shelf text encoder (plus torch)
+#     numpy                  # vector math + persistence shape
+#     scikit-learn           # tag clustering
+#
+# When adding a dep, pin a minimum version (>=X.Y) rather than an exact
+# version so transitive resolution stays flexible.
