@@ -10,11 +10,11 @@ Default model is `sentence-transformers/all-mpnet-base-v2` (768-dim,
 env var when a different model is wanted; the module doesn't bake the
 dimensionality in anywhere, so swapping is a one-line change.
 
-Dependency: `sentence-transformers` (which pulls in `torch`). It's an
-optional extra — `pip install -e ".[embeddings]"` — because the Phase 1
-fetchers don't need it and we don't want to force every user to pay the
-~1 GB torch download. A clear error points at that install if the import
-fails.
+`sentence-transformers` (and transitively `torch`, ~1 GB) is a runtime
+dependency declared in `pyproject.toml`. The import inside
+`_load_encoder` stays lazy so the Phase 1 CLIs and the test suite don't
+pay torch's multi-second import cost when nothing in them touches the
+encoder.
 
 Mongo storage:
 
@@ -26,7 +26,7 @@ Vectors are stored as plain BSON double arrays (what pymongo serialises
 ~6 KB per doc; 38k cards is ~230 MB total. Compact enough that we don't
 need to reach for BSON Binary with float32 yet.
 
-Usage (after `pip install -e ".[embeddings]"`):
+Usage (after `pip install -e .`):
 
     mtg-embed cards                 # embed cards that don't yet have text_embedding
     mtg-embed cards --refresh       # re-embed every card (expensive)
@@ -77,17 +77,12 @@ _encoder = None
 def _load_encoder(model_name: str):
     """Import sentence-transformers lazily and construct the encoder.
 
-    The import is deferred so running `mtg-check` or the fetchers doesn't
-    pay the torch import cost (which can take seconds). A missing dep
-    raises a clear RuntimeError pointing at the `[embeddings]` extra.
+    The import is deferred so running `mtg-check` or the Phase 1 fetchers
+    doesn't pay torch's multi-second import cost just by living in the
+    same package. `sentence-transformers` is a declared runtime dep, so
+    a missing import here is a broken install — let it raise naturally.
     """
-    try:
-        from sentence_transformers import SentenceTransformer
-    except ImportError as e:
-        raise RuntimeError(
-            "sentence-transformers is not installed. "
-            "Run `pip install -e \".[embeddings]\"` to add it."
-        ) from e
+    from sentence_transformers import SentenceTransformer
     return SentenceTransformer(model_name)
 
 

@@ -63,7 +63,6 @@ inspect *ARGS:
 
 # Encode oracle text + tags into dense vectors on their Mongo docs
 # (`mtg-embed` wrapper: cards / tags, --refresh, --limit, --batch-size).
-# Requires `pip install -e ".[embeddings]"`.
 embed *ARGS:
     mtg-embed {{ARGS}}
 
