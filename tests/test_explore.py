@@ -1,4 +1,4 @@
-"""Offline tests for mtg_recommender.inspect.
+"""Offline tests for mtg_recommender.explore.
 
 mongomock backs every DB call; stdout is captured so we can assert on
 the human-readable output.
@@ -19,12 +19,12 @@ from contextlib import redirect_stderr, redirect_stdout
 
 import mongomock
 
-from mtg_recommender import inspect as mi
+from mtg_recommender import explore as mi
 from mtg_recommender import storage
 
 
 def _run(argv: list[str]) -> tuple[int, str, str]:
-    """Invoke inspect.main with argv, returning (rc, stdout, stderr)."""
+    """Invoke explore.main with argv, returning (rc, stdout, stderr)."""
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
         rc = mi.main(argv)

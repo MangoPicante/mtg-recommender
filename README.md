@@ -202,13 +202,13 @@ mtg-recommender/
 │       ├── scryfall_fetch.py    # oracle-text fetcher -> cards collection
 │       ├── oracle_tags.py       # oracle-tags importer -> tags collection + attach
 │       ├── extract_oracle.py    # per-decklist JSON subset exporter
-│       ├── inspect.py           # read-only ad-hoc inspection CLI
+│       ├── explore.py           # read-only ad-hoc inspection CLI (mtg-inspect)
 │       └── check.py             # read-only Mongo health check
 ├── tests/
 │   ├── test_storage.py          # offline, mongomock-backed
 │   ├── test_scryfall_fetch.py
 │   ├── test_oracle_tags.py
-│   ├── test_inspect.py
+│   ├── test_explore.py
 │   ├── test_check.py
 │   └── integration/             # opt-in; needs MONGODB_INTEGRATION_URI
 │       └── test_mongo_integration.py
