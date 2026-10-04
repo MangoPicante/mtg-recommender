@@ -61,6 +61,12 @@ tags *ARGS:
 inspect *ARGS:
     mtg-inspect {{ARGS}}
 
+# Encode oracle text + tags into dense vectors on their Mongo docs
+# (`mtg-embed` wrapper: cards / tags, --refresh, --limit, --batch-size).
+# Requires `pip install -e ".[embeddings]"`.
+embed *ARGS:
+    mtg-embed {{ARGS}}
+
 # Export a trimmed JSON subset for a decklist file (`extract-oracle` wrapper).
 extract FILE *ARGS:
     extract-oracle --file {{FILE}} {{ARGS}}
