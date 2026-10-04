@@ -81,6 +81,7 @@ extract-oracle = "mtg_recommender.extract_oracle:main"
 mtg-inspect = "mtg_recommender.explore:main"
 mtg-check = "mtg_recommender.check:main"
 mtg-embed = "mtg_recommender.embeddings:main"
+mtg-deck-profile = "mtg_recommender.deck_profile:main"
 
 # -----------------------------------------------------------------------------
 # Hatchling-specific configuration

@@ -32,6 +32,8 @@ if the deck's too thin for themes to emerge.
 """
 from __future__ import annotations
 
+import argparse
+import sys
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -40,6 +42,7 @@ from pymongo.collection import Collection
 from sklearn.cluster import HDBSCAN
 
 from . import embeddings as emb
+from . import scryfall_fetch as sf
 from . import storage
 
 # ---------------------------------------------------------------------------
@@ -314,3 +317,132 @@ def build_deck_profile(
         clusters=tuple(clusters),
         noise_tags=tuple(sorted(noise_tags)),
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI (mtg-deck-profile)
+# ---------------------------------------------------------------------------
+#
+# Human-readable render of a deck profile. Not the recommender yet —
+# that's Phase 3 step 4 (a separate CLI). This one is here so you can
+# eyeball the clustering output on a real deck without opening Python.
+
+DEFAULT_RENDER_LIMIT = 10
+
+
+def _render_profile(profile: DeckProfile, *, name_lookup: dict[str, str], limit: int) -> str:
+    """Format a `DeckProfile` as a block of printable text.
+
+    `name_lookup` maps scryfall id → display name so cluster output
+    shows "Lightning Bolt" rather than a 36-char UUID. `limit` caps
+    the per-cluster tag + card lists so a 100-card commander deck's
+    output stays scannable; a trailing "(+N more)" marker makes the
+    truncation obvious.
+    """
+    lines: list[str] = []
+    lines.append(
+        f"resolved {len(profile.deck_card_ids)} unique cards "
+        f"({len(profile.missing_names)} missing)"
+    )
+    if profile.missing_names:
+        for name in profile.missing_names:
+            lines.append(f"  missing: {name}")
+    lines.append(f"tag universe: {len(profile.tag_universe)} unique tags")
+    lines.append(
+        f"{len(profile.clusters)} theme(s) clustered, "
+        f"{len(profile.noise_tags)} tag(s) in noise"
+    )
+    lines.append("")
+
+    if not profile.clusters:
+        lines.append("(no themes — deck too thin for clustering, or no "
+                     "tag embeddings available)")
+    for cluster in profile.clusters:
+        lines.append(
+            f"theme '{cluster.label}'  "
+            f"({len(cluster.tags)} tags, {len(cluster.deck_card_ids)} cards)"
+        )
+        lines.append(f"  tags : {_truncate(list(cluster.tags), limit)}")
+        card_names = [name_lookup.get(sid, sid) for sid in cluster.deck_card_ids]
+        card_names.sort()
+        lines.append(f"  cards: {_truncate(card_names, limit)}")
+        lines.append("")
+
+    if profile.noise_tags:
+        lines.append(
+            f"noise: {_truncate(list(profile.noise_tags), limit)}"
+        )
+    return "\n".join(lines)
+
+
+def _truncate(items: list[str], limit: int) -> str:
+    """Join `items` with ', ', trimming to `limit` with a "(+N more)" tail."""
+    if len(items) <= limit:
+        return ", ".join(items)
+    shown = ", ".join(items[:limit])
+    return f"{shown}, (+{len(items) - limit} more)"
+
+
+def _name_lookup_for(deck_card_ids: Iterable[str], cards_coll: Collection) -> dict[str, str]:
+    """One Mongo round trip to fetch display names for the rendered cards."""
+    ids = list(deck_card_ids)
+    if not ids:
+        return {}
+    return {
+        doc["_id"]: doc.get("name") or doc["_id"]
+        for doc in cards_coll.find({"_id": {"$in": ids}}, {"_id": 1, "name": 1})
+    }
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    """`mtg-deck-profile` — build and print a decklist's theme clusters."""
+    parser = argparse.ArgumentParser(
+        prog="mtg-deck-profile",
+        description=(
+            "Cluster a decklist's tags into themes and print the result. "
+            "Reads cards from the local Mongo cache populated by `mtg-embed`."
+        ),
+    )
+    parser.add_argument(
+        "cards", nargs="*",
+        help="Card names (quote multi-word names). Combine with --file.",
+    )
+    parser.add_argument(
+        "-f", "--file",
+        help="Path to a decklist file (one card per line; '#' for comments).",
+    )
+    parser.add_argument(
+        "--min-cluster-size", type=int, default=DEFAULT_MIN_CLUSTER_SIZE,
+        help=(
+            f"HDBSCAN min_cluster_size (default: {DEFAULT_MIN_CLUSTER_SIZE}). "
+            "Lower for small decks; raise to keep only strong themes."
+        ),
+    )
+    parser.add_argument(
+        "--limit", type=int, default=DEFAULT_RENDER_LIMIT,
+        help=(
+            f"Per-cluster display cap for tags + cards (default: {DEFAULT_RENDER_LIMIT}). "
+            "Everything beyond collapses to a '(+N more)' marker."
+        ),
+    )
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    names = sf.read_names(args)
+    if not names:
+        parser.error("no card names provided (pass names as args or via --file)")
+
+    cards_coll = storage.cards_collection()
+    tags_coll = storage.tags_collection()
+    profile = build_deck_profile(
+        names,
+        cards_coll=cards_coll,
+        tags_coll=tags_coll,
+        min_cluster_size=args.min_cluster_size,
+    )
+    name_lookup = _name_lookup_for(profile.deck_card_ids, cards_coll)
+    print(_render_profile(profile, name_lookup=name_lookup, limit=args.limit))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
