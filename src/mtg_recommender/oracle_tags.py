@@ -1,4 +1,4 @@
-"""Download, cache, and attach Scryfall oracle tags.
+"""Download Scryfall oracle tags into MongoDB and attach them to cards.
 
 Oracle tags are a community-sourced classification of cards by what they
 DO ("spot removal", "evasion", "tutor-creature-giant", ...) rather than
@@ -25,51 +25,58 @@ Shape of the raw oracle_tags JSONL (one line per tag):
       ]
     }
 
-The join to cached cards is by `oracle_id` (NOT scryfall_id). The oracle
-id names the GAMEPLAY card — a single oracle_id can map to many
-scryfall_ids across reprints. `scryfall_fetch.extract_card_fields` now
-carries oracle_id on every cached card, so the join is a direct dict
-lookup.
+The join to cards is by `oracle_id` (NOT scryfall_id). The oracle id
+names the GAMEPLAY card — a single oracle_id can map to many
+scryfall_ids across reprints. `scryfall_fetch.extract_card_fields`
+carries oracle_id on every card document and `storage.ensure_indexes`
+creates a Mongo index on it, so the join is an indexed query.
 
 What this module writes:
 
-1. cache/oracle_tags.json — the tag catalog, slug-keyed:
+1. tags collection — one document per oracle tag, _id = slug. Shape:
 
     {
-      "snapshot_updated_at": "<Scryfall snapshot UTC ISO 8601>",
-      "tags": {
-        "<slug>": {
-          "id": "<uuid>",            # the Scryfall tag id, kept for cross-ref
-          "label": "...",            # human-readable form of the slug
-          "description": "..." | null,
-          "parent_slugs": ["..."],   # parent uuids resolved to slugs for readability
-          "child_slugs":  ["..."],
-          "aliases":      ["..."]
-        },
-        ...
-      }
+      "_id":            "<slug>",
+      "scryfall_tag_id":"<uuid>",         # kept for cross-ref with the API
+      "label":          "...",            # human-readable form of the slug
+      "description":    "..." | null,
+      "parent_slugs":   ["..."],          # parent uuids resolved to slugs
+      "child_slugs":    ["..."],
+      "aliases":        ["..."]
     }
 
-   Slugs are used as keys (rather than uuids) because they're stable,
+   Slugs are used as _id (rather than uuids) because they're stable,
    URL-safe, and human-readable — far more useful at the REPL than
    32-char hex ids. Parent/child references are translated from uuids
    to slugs during catalog construction via a one-pass index.
 
-2. cache/oracle_texts.json — the existing cards cache gains a
-   `tags: ["<slug>", ...]` field on every card entry. Weight and
-   annotation are dropped: 99.7 % of weights are "median" (and the
-   remaining categories are rare enough to ignore for similarity
-   scoring in v1), and annotations are tagger notes rather than
-   scoring signal. Cards whose oracle_id was never tagged get
-   `tags: []` so downstream code can rely on the field existing.
+2. cards collection — every card document gains a `tags: ["<slug>", ...]`
+   field. Weight and annotation are dropped: 99.7 % of weights are
+   "median" (and the remaining categories are rare enough to ignore
+   for similarity scoring in v1), and annotations are tagger notes
+   rather than scoring signal. Cards whose oracle_id was never tagged
+   get `tags: []` so downstream code can rely on the field existing.
 
-Taggings whose oracle_id doesn't match any cached card are counted and
-reported — users with a partial cache (e.g. a single decklist's worth of
-cards) will see a large unmatched count, which is expected. A near-100 %
-unmatched rate usually means the cards cache was built before oracle_id
-was added to the projection; `scryfall-fetch --refresh` repopulates.
+3. meta collection — a single doc with `_id = "oracle_tags"` records
+   the snapshot timestamp so a future run can skip the download when
+   the Scryfall snapshot hasn't moved.
 
-Usage (after `pip install -e .`, which registers `scryfall-fetch-tags`):
+Taggings whose oracle_id doesn't match any card are counted and
+reported — users with a partial collection (e.g. a single decklist's
+worth of cards) will see a large unmatched count, which is expected. A
+near-100 % unmatched rate usually means the cards cache was built
+before oracle_id was added to the projection; `scryfall-fetch
+--refresh` repopulates.
+
+Note on the --refresh / fresh-snapshot interaction: when the stored
+snapshot timestamp matches the current /bulk-data snapshot, the
+module skips the download AND the re-attach step. That's because the
+raw taggings aren't retained after import — only the catalog and the
+per-card tags array. A user who added new cards to the collection
+since the last tag import and wants them tagged should pass
+--refresh to force a redownload.
+
+Usage (after `pip install -e .`, with MONGODB_URI set in .env):
 
     scryfall-fetch-tags              # downloads if snapshot is new; attaches
     scryfall-fetch-tags --refresh    # redownload even if snapshot matches
@@ -85,24 +92,22 @@ import gzip
 import json
 import sys
 import urllib.request
-from pathlib import Path
 
-# Pull HEADERS / SCRYFALL_BASE / http_get_json / cache I/O from the sibling
-# module. Keeping the Scryfall request details in one place means a change
-# to the User-Agent, timeout policy, or JSON shape only has one home.
+from pymongo import UpdateMany
+from pymongo.collection import Collection
+
 from . import scryfall_fetch as sf
+from . import storage
 
 
 # ---------------------------------------------------------------------------
-# Paths
+# Constants
 # ---------------------------------------------------------------------------
 
-# Tag catalog lives next to the cards cache under ./cache/. CWD-relative for
-# the same reason scryfall_fetch's CACHE_DIR is: the modules live inside an
-# installable package tree, so a module-relative path would either bury the
-# cache inside src/ during development or vanish into site-packages when
-# installed as a wheel.
-TAGS_CACHE_PATH = Path.cwd() / "cache" / "oracle_tags.json"
+# Key used in the meta collection to record the oracle_tags snapshot
+# timestamp. Namespaced so a future "oracle_cards" meta entry doesn't
+# collide.
+META_SOURCE = "oracle_tags"
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +168,7 @@ def download_bulk_oracle_tags(meta: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Catalog + inverted index construction
+# Catalog + inverted index construction (pure, no DB access)
 # ---------------------------------------------------------------------------
 
 def _build_id_to_slug(tags: list[dict]) -> dict[str, str]:
@@ -177,11 +182,21 @@ def _build_id_to_slug(tags: list[dict]) -> dict[str, str]:
 
 
 def extract_tag_fields(raw: dict, id_to_slug: dict[str, str]) -> dict:
-    """Project a raw tag object down to the catalog-level fields we keep.
+    """Project a raw tag object into the Mongo document shape (minus _id).
 
-    Taggings are intentionally stripped — they're inverted into the cards
-    cache by `build_oracle_id_to_slugs` and have no reason to live in the
-    tag catalog, which is meant for human lookup and Phase 2 embedding.
+    _id is set by the inserter from the slug, so it's intentionally
+    absent here — this function is reused by tests that only care
+    about field projection.
+
+    `id` on the raw object is Scryfall's internal tag UUID; the
+    projection renames it to `scryfall_tag_id` so it doesn't look like
+    an attempt to set Mongo's reserved `_id` and so readers of the
+    stored doc know what they're looking at.
+
+    Taggings are intentionally stripped — they're inverted into the
+    per-card tags array by `build_oracle_id_to_slugs` and have no
+    reason to live in the tag catalog, which is meant for human lookup
+    and Phase 2 embedding.
     """
     # Translate parent/child uuids to slugs via the pre-built index. An
     # unknown uuid (shouldn't happen, but data drift is a thing) is
@@ -189,7 +204,7 @@ def extract_tag_fields(raw: dict, id_to_slug: dict[str, str]) -> dict:
     parent_slugs = [id_to_slug[pid] for pid in raw.get("parent_ids", []) if pid in id_to_slug]
     child_slugs = [id_to_slug[cid] for cid in raw.get("child_ids", []) if cid in id_to_slug]
     return {
-        "id": raw.get("id"),
+        "scryfall_tag_id": raw.get("id"),
         "label": raw.get("label"),
         "description": raw.get("description"),
         "parent_slugs": parent_slugs,
@@ -199,7 +214,13 @@ def extract_tag_fields(raw: dict, id_to_slug: dict[str, str]) -> dict:
 
 
 def build_tag_catalog(tags: list[dict]) -> dict[str, dict]:
-    """Produce the slug-keyed catalog dict from the raw bulk list."""
+    """Produce the slug-keyed catalog dict from the raw bulk list.
+
+    Returned as a dict (slug -> projected fields) rather than a list of
+    docs so callers can look tags up by slug without a second pass.
+    `upsert_tag_catalog` serialises to {_id: slug, ...} docs at insert
+    time.
+    """
     id_to_slug = _build_id_to_slug(tags)
     catalog: dict[str, dict] = {}
     for raw in tags:
@@ -217,7 +238,7 @@ def build_oracle_id_to_slugs(tags: list[dict]) -> dict[str, list[str]]:
 
     This is the per-card view of the tagging data: for each oracle entity,
     what are all the tags that apply to it? Slugs are sorted so the output
-    is deterministic (stable diffs when the cards cache is re-saved).
+    is deterministic (stable updates when the collection is re-tagged).
 
     Dedup via a set per card: a tag should never apply twice to the same
     card in a well-formed bulk, but we don't want to assume that.
@@ -236,104 +257,76 @@ def build_oracle_id_to_slugs(tags: list[dict]) -> dict[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Attach tags to the cards cache
+# Mongo write helpers
 # ---------------------------------------------------------------------------
+
+def upsert_tag_catalog(coll: Collection, catalog: dict[str, dict]) -> None:
+    """Replace the tags collection contents with `catalog`.
+
+    Delete-then-insert rather than per-doc upsert because the catalog
+    is authoritative: a tag removed from the Scryfall tagger project
+    should disappear from Mongo too. Insert-many sends everything in a
+    single command (4,560 small docs is comfortably under Mongo's
+    16 MB cmd size limit), so this is one round trip per side.
+    """
+    coll.delete_many({})
+    if not catalog:
+        return
+    docs = [{"_id": slug, **fields} for slug, fields in catalog.items()]
+    coll.insert_many(docs)
+
 
 def attach_tags_to_cards(
-    cards_cache: dict,
+    coll: Collection,
     oracle_id_to_slugs: dict[str, list[str]],
 ) -> tuple[int, int, int]:
-    """Set `tags: [slug, ...]` on every card in the cache.
-
-    Returns a tuple:
-
-        (cards_matched, cards_without_tags, taggings_unmatched)
+    """Set `tags` on every card doc. Returns (matched, empty, unmatched).
 
     Semantics:
-      - cards_matched         : card had an oracle_id that appeared in the
-                                tagger data, and tags were attached.
-      - cards_without_tags    : card had an oracle_id but no tags apply
-                                to it (empty list attached), OR the card
-                                had no oracle_id at all (also empty list).
-                                The important invariant is that every
-                                card ends up with a `tags` field so
-                                downstream code can rely on it existing.
-      - taggings_unmatched    : oracle_ids in the tagger data that didn't
-                                correspond to any cached card. Expected
-                                to be large when the cards cache is a
-                                partial subset (e.g. a single decklist).
+      - matched  : card had an oracle_id that appeared in the tagger
+                   data, and tags were attached.
+      - empty    : card had an oracle_id but no tags apply to it (empty
+                   list set), OR the card had no oracle_id at all. The
+                   important invariant is that every card ends up with
+                   a `tags` field so downstream code can rely on it
+                   existing.
+      - unmatched: oracle_ids in the tagger data that didn't correspond
+                   to any card. Expected to be large when the cards
+                   collection is a partial subset (e.g. one decklist).
 
-    `tags` is always overwritten, never merged. A fresh bulk snapshot is
-    authoritative: if a tag was removed from the tagger project, the
-    card should lose it on the next import.
+    Implementation: clear every card's `tags` first (so a tag removed
+    upstream disappears from affected cards), then bulk-apply the new
+    tags one UpdateMany per oracle_id. The index on `oracle_id` keeps
+    this efficient; the full ~36k-op bulk_write fits well under
+    Mongo's single-command 16 MB limit.
     """
-    matched = 0
-    empty = 0
-    cards = cards_cache.get("cards", {})
-    # Track which oracle_ids we successfully attached so we can compute
-    # the unmatched set without a second pass over the cards cache.
-    attached_oracle_ids: set[str] = set()
-    for card in cards.values():
-        oid = card.get("oracle_id")
-        if oid and oid in oracle_id_to_slugs:
-            card["tags"] = list(oracle_id_to_slugs[oid])
-            attached_oracle_ids.add(oid)
-            matched += 1
-        else:
-            # Either no oracle_id (stale cache from before the field was
-            # added) or no tags for this card. Either way, give it an
-            # empty list so consumers don't need to .get("tags", []).
-            card["tags"] = []
-            empty += 1
-    taggings_unmatched = len(oracle_id_to_slugs) - len(attached_oracle_ids)
-    return matched, empty, taggings_unmatched
+    # Step 1: clear every card's tags so previously-tagged cards whose
+    # oracle_id has lost all its tags get an empty list rather than
+    # keeping stale data from a prior import.
+    coll.update_many({}, {"$set": {"tags": []}})
 
+    # Step 2: bulk-apply new tags. UpdateMany per oracle_id uses the
+    # multikey-safe equality query against the indexed field.
+    ops = [
+        UpdateMany({"oracle_id": oid}, {"$set": {"tags": slugs}})
+        for oid, slugs in oracle_id_to_slugs.items()
+    ]
+    if ops:
+        coll.bulk_write(ops, ordered=False)
 
-# ---------------------------------------------------------------------------
-# Tag-cache I/O
-# ---------------------------------------------------------------------------
+    # Step 3: tally up the three stats for the user-facing summary.
+    total = coll.estimated_document_count()
+    matched = coll.count_documents({"tags": {"$ne": []}})
+    empty = total - matched
 
-def load_tag_cache(path: Path) -> dict:
-    """Load the tag catalog from disk, or return a fresh shell on first run.
+    # distinct() reads only the index metadata (not full docs); for
+    # ~40k cards this is a single tiny request. Filter out None in case
+    # some stale card lacks oracle_id.
+    cards_oracle_ids = {oid for oid in coll.distinct("oracle_id") if oid}
+    tagger_oracle_ids = set(oracle_id_to_slugs.keys())
+    unmatched = len(tagger_oracle_ids - cards_oracle_ids)
 
-    Shell shape ({"snapshot_updated_at": None, "tags": {}}) mirrors
-    scryfall_fetch.load_cache so callers can always assume the keys
-    exist.
-    """
-    if not path.exists():
-        return {"snapshot_updated_at": None, "tags": {}}
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    # Defensive: a cache saved under a future schema with missing keys
-    # should still look like a valid shell.
-    data.setdefault("snapshot_updated_at", None)
-    data.setdefault("tags", {})
-    return data
-
-
-def save_tag_cache(path: Path, catalog: dict) -> None:
-    """Write the tag catalog to disk, pretty-printed and UTF-8."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        # sort_keys for stable diffs; ensure_ascii=False to keep Unicode
-        # readable rather than \uXXXX-escaped.
-        json.dump(catalog, f, indent=2, ensure_ascii=False, sort_keys=True)
-
-
-# ---------------------------------------------------------------------------
-# Freshness check
-# ---------------------------------------------------------------------------
-
-def is_fresh(tag_cache: dict, snapshot_updated_at: str) -> bool:
-    """True if the on-disk tag cache already matches the current snapshot.
-
-    oracle_tags is small enough that we always redownload when stale —
-    there is no per-tag timestamp like the cards cache has. Exact string
-    match on the snapshot timestamp is sufficient because Scryfall writes
-    its own ISO 8601 values with microsecond precision and no reformatting.
-    """
-    stored = tag_cache.get("snapshot_updated_at")
-    return bool(stored) and stored == snapshot_updated_at
+    return matched, empty, unmatched
 
 
 # ---------------------------------------------------------------------------
@@ -342,45 +335,40 @@ def is_fresh(tag_cache: dict, snapshot_updated_at: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Download the Scryfall oracle_tags bulk and attach tags to the cards cache.",
+        description="Download the Scryfall oracle_tags bulk and attach tags to the cards collection.",
     )
     parser.add_argument(
         "--refresh", action="store_true",
-        help="Redownload even if the on-disk tag cache already matches the current snapshot.",
-    )
-    parser.add_argument(
-        "--cards", type=Path, default=sf.CACHE_PATH,
-        help="Path to the cards cache written by scryfall-fetch (default: cache/oracle_texts.json).",
-    )
-    parser.add_argument(
-        "--tags", type=Path, default=TAGS_CACHE_PATH,
-        help="Path to the tag catalog file (default: cache/oracle_tags.json).",
+        help="Redownload even if the stored snapshot already matches the current one.",
     )
     args = parser.parse_args()
 
-    # Cards cache is required: tag attachment can't do its job without it.
-    # Keep the error message pointing to the obvious next step.
-    if not args.cards.exists():
+    # Make sure the indexes we rely on exist. ensure_indexes is idempotent,
+    # so a brand-new deployment and a long-running cluster hit the same
+    # fast path.
+    storage.ensure_indexes()
+    cards_coll = storage.cards_collection()
+    tags_coll = storage.tags_collection()
+
+    # Cards collection is required: tag attachment can't do its job
+    # without cards to attach to.
+    if cards_coll.estimated_document_count() == 0:
         parser.error(
-            f"cards cache not found: {args.cards}\n"
+            f"cards collection '{cards_coll.database.name}.{cards_coll.name}' is empty\n"
             "run scryfall-fetch first to populate it"
         )
-
-    tag_cache = load_tag_cache(args.tags)
 
     # Step 1: metadata. One tiny JSON request so we can compare timestamps
     # before committing to the 6 MB download.
     meta = get_bulk_oracle_tags_metadata()
     snapshot_updated_at = meta["updated_at"]
-    if is_fresh(tag_cache, snapshot_updated_at) and not args.refresh:
+    stored_snapshot = storage.get_snapshot_timestamp(META_SOURCE)
+    if stored_snapshot == snapshot_updated_at and not args.refresh:
         print(f"tags  : already fresh (snapshot {snapshot_updated_at}); pass --refresh to force")
-        # Still (re-)attach to the cards cache in case cards have been
-        # added since the last tag import. Reload the catalog from disk
-        # as the inverted-index source so we don't rebuild it here.
-        # Actually — we only have the catalog on disk, not the taggings
-        # (we stripped those during the first import). So attach is a
-        # no-op in this branch; a user who added new cards and wants
-        # them tagged should pass --refresh. Make that explicit:
+        # The raw taggings aren't retained after import, so the attach
+        # step can't be rerun from state alone. If the user added new
+        # cards since the last tag import, --refresh is the way to pick
+        # them up.
         print(
             "        new cards added since last import? pass --refresh to re-attach.",
             file=sys.stderr,
@@ -395,29 +383,30 @@ def main() -> int:
     print(f"catalog: {len(catalog)} tags")
     print(f"index  : {len(oracle_id_to_slugs)} oracle_ids with at least one tag")
 
-    # Step 3: save the catalog with the snapshot timestamp so a future
-    # run can tell whether this snapshot has already been processed.
-    new_cache = {"snapshot_updated_at": snapshot_updated_at, "tags": catalog}
-    save_tag_cache(args.tags, new_cache)
-    print(f"saved  : {args.tags}")
+    # Step 3: push the catalog to Mongo.
+    upsert_tag_catalog(tags_coll, catalog)
+    print(f"saved  : {tags_coll.database.name}.{tags_coll.name}")
 
-    # Step 4: attach to the cards cache. Load / mutate / save using the
-    # cards module's helpers so the shell shape stays consistent.
-    cards_cache = sf.load_cache(args.cards)
-    matched, empty, unmatched = attach_tags_to_cards(cards_cache, oracle_id_to_slugs)
-    sf.save_cache(args.cards, cards_cache)
+    # Step 4: attach tags to cards.
+    matched, empty, unmatched = attach_tags_to_cards(cards_coll, oracle_id_to_slugs)
     total_cards = matched + empty
     print(
         f"cards  : {matched}/{total_cards} tagged, {empty} without tags, "
         f"{unmatched} tagger oracle_ids didn't match any cached card"
     )
+
+    # Step 5: record the snapshot timestamp so a future run can skip
+    # the download when nothing has moved. Done last so a failure
+    # anywhere above forces a retry on the next invocation.
+    storage.set_snapshot_timestamp(META_SOURCE, snapshot_updated_at)
+
     if total_cards and matched == 0:
-        # Loud failure mode worth calling out: the user's cards cache
-        # has no oracle_ids at all, which usually means it was written
+        # Loud failure mode worth calling out: the cards collection has
+        # no oracle_ids at all, which usually means it was populated
         # before oracle_id was added to the projection. Point at the
-        # obvious remediation rather than leave them puzzled.
+        # obvious remediation.
         print(
-            "warning: no cards were tagged. The cards cache may predate the "
+            "warning: no cards were tagged. The cards collection may predate the "
             "oracle_id field — run `scryfall-fetch --refresh ...` to repopulate it.",
             file=sys.stderr,
         )
