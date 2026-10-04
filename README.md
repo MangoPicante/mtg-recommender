@@ -22,6 +22,7 @@ Under `src/mtg_recommender/`:
 | `scryfall_fetch` | Fetches Scryfall oracle text for one card or a decklist into the `cards` collection. Switches between `/cards/named` (single card) and the oracle-cards bulk download (2+ cards) automatically. Each card document is keyed by `scryfall_id` with a `names: [lowered, ...]` array for alias lookup. The `tags` field is left for `oracle_tags` to populate. |
 | `oracle_tags` | Downloads the Scryfall oracle-tags bulk, writes a slug-keyed catalog to the `tags` collection (hierarchy + aliases + descriptions preserved), and attaches `tags: [slug, ...]` arrays to each card by joining on `oracle_id`. |
 | `extract_oracle` | Writes a trimmed per-decklist JSON subset of the cards collection for downstream consumers that don't speak Mongo. |
+| `inspect` | Read-only ad-hoc inspection CLI. Subcommands: `card`, `tag`, `list`, `stats`. Human-readable output for one-off exploration and debugging. |
 
 Tests live under `tests/` and are offline — every HTTP call is mocked, every
 Mongo op goes through `mongomock`.
@@ -108,6 +109,22 @@ The snapshot timestamp lives in the `meta` collection so repeat runs skip the
 download when nothing has moved. The command requires the `cards` collection
 to be populated first — run `scryfall-fetch` on your decklists before this.
 
+### Inspect what's in Mongo
+
+Read-only subcommand CLI for ad-hoc exploration of the collections:
+
+```bash
+mtg-inspect card "Wrath of God"             # full doc(s); multiple matches surface ambiguity
+mtg-inspect tag spot-removal                # catalog entry (hierarchy, aliases, card count)
+mtg-inspect list --tag spot-removal         # list cards carrying a tag
+mtg-inspect list --tag spot-removal --limit 50
+mtg-inspect stats                           # collection sizes, tagged %, top tags, snapshot ts
+mtg-inspect stats --top 20                  # top-N tag aggregation
+```
+
+Output is human-readable text — use `extract-oracle` for a machine-readable
+JSON subset. Nothing in this CLI writes to Mongo.
+
 ### Extract a decklist subset
 
 ```bash
@@ -128,7 +145,7 @@ The subset drops Mongo bookkeeping (`_id`, `names`, `updated_at`, `oracle_id`,
 python -m unittest discover tests
 ```
 
-Every HTTP call is mocked; every Mongo op routes through `mongomock`. 107
+Every HTTP call is mocked; every Mongo op routes through `mongomock`. 132
 tests, well under a second total — no network, no real Mongo required.
 
 ## Project layout
@@ -141,11 +158,13 @@ mtg-recommender/
 │       ├── storage.py           # Mongo client/config/indexes
 │       ├── scryfall_fetch.py    # oracle-text fetcher -> cards collection
 │       ├── oracle_tags.py       # oracle-tags importer -> tags collection + attach
-│       └── extract_oracle.py    # per-decklist JSON subset exporter
+│       ├── extract_oracle.py    # per-decklist JSON subset exporter
+│       └── inspect.py           # read-only ad-hoc inspection CLI
 ├── tests/
 │   ├── test_storage.py          # offline, mongomock-backed
 │   ├── test_scryfall_fetch.py
-│   └── test_oracle_tags.py
+│   ├── test_oracle_tags.py
+│   └── test_inspect.py
 ├── pyproject.toml               # PEP 621 metadata, build config, entry points
 ├── .env.example                 # template; copy to .env + fill in MONGODB_URI
 ├── CLAUDE.md                    # workflow + style conventions
