@@ -307,8 +307,8 @@ class TestAttachTagsToCards(_MongoBackedTestCase):
 
     def test_matches_by_oracle_id_and_attaches_slugs(self):
         self._seed_cards(
-            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt", "name": "Bolt"},
-            {"_id": "id-doom", "scryfall_id": "id-doom", "oracle_id": "oracle-doom", "name": "Doom"},
+            {"_id": "id-bolt", "oracle_id": "oracle-bolt", "name": "Bolt"},
+            {"_id": "id-doom", "oracle_id": "oracle-doom", "name": "Doom"},
         )
         index = {"oracle-bolt": ["evasion", "spot-removal"], "oracle-doom": ["spot-removal"]}
         changed, matched, empty, unmatched = ot.attach_tags_to_cards(self.cards, index)
@@ -327,7 +327,7 @@ class TestAttachTagsToCards(_MongoBackedTestCase):
 
     def test_card_without_oracle_id_gets_empty_tags(self):
         self._seed_cards(
-            {"_id": "id-x", "scryfall_id": "id-x", "name": "X"},  # no oracle_id
+            {"_id": "id-x", "name": "X"},  # no oracle_id
         )
         _, matched, empty, _ = ot.attach_tags_to_cards(self.cards, {"oracle-y": ["foo"]})
         self.assertEqual(matched, 0)
@@ -336,7 +336,7 @@ class TestAttachTagsToCards(_MongoBackedTestCase):
 
     def test_card_with_untagged_oracle_id_gets_empty_tags(self):
         self._seed_cards(
-            {"_id": "id-untagged", "scryfall_id": "id-untagged",
+            {"_id": "id-untagged",
              "oracle_id": "oracle-untagged", "name": "U"},
         )
         _, matched, empty, _ = ot.attach_tags_to_cards(
@@ -350,7 +350,7 @@ class TestAttachTagsToCards(_MongoBackedTestCase):
         # A tag removed upstream must disappear from the card on the
         # next import. If we merged, stale tags would linger forever.
         self._seed_cards(
-            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt",
+            {"_id": "id-bolt", "oracle_id": "oracle-bolt",
              "tags": ["old-tag", "another-stale-tag"]},
         )
         ot.attach_tags_to_cards(self.cards, {"oracle-bolt": ["evasion"]})
@@ -358,7 +358,7 @@ class TestAttachTagsToCards(_MongoBackedTestCase):
 
     def test_unmatched_count_reflects_oracle_ids_not_in_collection(self):
         self._seed_cards(
-            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt"},
+            {"_id": "id-bolt", "oracle_id": "oracle-bolt"},
         )
         index = {"oracle-bolt": ["evasion"], "oracle-doom": ["spot-removal"],
                  "oracle-wrath": ["mass-removal"]}
@@ -370,7 +370,7 @@ class TestAttachTagsToCards(_MongoBackedTestCase):
         # the diff should classify as unchanged (changed_oids = 0) and
         # leave `card_vector` intact.
         self._seed_cards(
-            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt",
+            {"_id": "id-bolt", "oracle_id": "oracle-bolt",
              "tags": ["evasion"], "card_vector": [0.0] * 4},
         )
         changed, _, _, _ = ot.attach_tags_to_cards(
@@ -386,7 +386,7 @@ class TestAttachTagsToCards(_MongoBackedTestCase):
         # Card has existing card_vector; the new tags differ, so the
         # fused vector is stale and gets cleared.
         self._seed_cards(
-            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt",
+            {"_id": "id-bolt", "oracle_id": "oracle-bolt",
              "tags": ["old-tag"], "card_vector": [0.0] * 4},
         )
         changed, _, _, _ = ot.attach_tags_to_cards(
@@ -403,7 +403,7 @@ class TestAttachTagsToCards(_MongoBackedTestCase):
         # ensure every card ends up with `tags` set so downstream code
         # can rely on it.
         self.cards.insert_one(
-            {"_id": "id-new", "scryfall_id": "id-new", "oracle_id": "oracle-new"}
+            {"_id": "id-new", "oracle_id": "oracle-new"}
         )
         ot.attach_tags_to_cards(self.cards, {"oracle-other": ["foo"]})
         self.assertEqual(self.cards.find_one({"_id": "id-new"})["tags"], [])
@@ -509,10 +509,10 @@ class TestMainCLI(_MongoBackedTestCase):
         gzipped = gzip.compress(jsonl)
 
         self.cards.insert_many([
-            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt", "name": "Bolt"},
-            {"_id": "id-wrath", "scryfall_id": "id-wrath", "oracle_id": "oracle-wrath", "name": "Wrath"},
+            {"_id": "id-bolt", "oracle_id": "oracle-bolt", "name": "Bolt"},
+            {"_id": "id-wrath", "oracle_id": "oracle-wrath", "name": "Wrath"},
             # No fixture tag applies to this card; should end with [].
-            {"_id": "id-other", "scryfall_id": "id-other", "oracle_id": "oracle-other", "name": "Other"},
+            {"_id": "id-other", "oracle_id": "oracle-other", "name": "Other"},
         ])
 
         with patch(
@@ -553,7 +553,7 @@ class TestMainCLI(_MongoBackedTestCase):
         # has `tags: []` already — if that field were missing, the
         # untagged-cards auto-detect would force a redownload.
         self.cards.insert_one(
-            {"_id": "id-x", "scryfall_id": "id-x", "oracle_id": "oracle-x", "tags": []}
+            {"_id": "id-x", "oracle_id": "oracle-x", "tags": []}
         )
         storage.set_snapshot_timestamp(ot.META_SOURCE, "2026-10-03T21:00:32.494+00:00")
         metadata_payload = {
@@ -579,7 +579,7 @@ class TestMainCLI(_MongoBackedTestCase):
         # to redownload to tag them — even if the oracle_tags snapshot
         # hasn't moved.
         self.cards.insert_one(
-            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt"}
+            {"_id": "id-bolt", "oracle_id": "oracle-bolt"}
         )  # no `tags` field
         storage.set_snapshot_timestamp(ot.META_SOURCE, "2026-10-03T21:00:32.494+00:00")
         metadata_payload = {

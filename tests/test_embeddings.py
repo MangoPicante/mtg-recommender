@@ -102,9 +102,9 @@ class TestTagText(unittest.TestCase):
 class TestEmbedCards(_MongoBackedTestCase):
 
     def _seed(self, *rows):
-        """Each row is (scryfall_id, oracle_text). Minimal fixture shape."""
+        """Each row is (card id, oracle_text). Minimal fixture shape."""
         docs = [
-            {"_id": sid, "scryfall_id": sid, "name": sid, "oracle_text": text}
+            {"_id": sid, "name": sid, "oracle_text": text}
             for sid, text in rows
         ]
         self.cards.insert_many(docs)
@@ -123,10 +123,10 @@ class TestEmbedCards(_MongoBackedTestCase):
 
     def test_skips_cards_without_oracle_text(self):
         self.cards.insert_many([
-            {"_id": "a", "scryfall_id": "a", "name": "A", "oracle_text": "something"},
-            {"_id": "b", "scryfall_id": "b", "name": "B"},  # no oracle_text at all
-            {"_id": "c", "scryfall_id": "c", "name": "C", "oracle_text": None},
-            {"_id": "d", "scryfall_id": "d", "name": "D", "oracle_text": ""},
+            {"_id": "a", "name": "A", "oracle_text": "something"},
+            {"_id": "b", "name": "B"},  # no oracle_text at all
+            {"_id": "c", "name": "C", "oracle_text": None},
+            {"_id": "d", "name": "D", "oracle_text": ""},
         ])
         with redirect_stdout(io.StringIO()):
             written = emb.embed_cards(self.cards)
@@ -318,7 +318,7 @@ class TestFuseCardVectors(_MongoBackedTestCase):
     def _seed_card(self, sid: str, text_vec: list[float], tags: list[str]) -> None:
         self.cards.insert_one(
             {
-                "_id": sid, "scryfall_id": sid, "name": sid,
+                "_id": sid, "name": sid,
                 "oracle_text": f"text for {sid}",
                 "text_embedding": text_vec,
                 "tags": tags,
@@ -406,7 +406,7 @@ class TestFuseCardVectors(_MongoBackedTestCase):
         self._seed_tag("a", [0.0, 1.0, 0.0, 0.0])
         self._seed_card("c1", [1.0, 0.0, 0.0, 0.0], ["a"])
         self.cards.insert_one(
-            {"_id": "c2", "scryfall_id": "c2", "name": "c2", "oracle_text": "x", "tags": ["a"]}
+            {"_id": "c2", "name": "c2", "oracle_text": "x", "tags": ["a"]}
         )
         with redirect_stdout(io.StringIO()):
             written = emb.fuse_card_vectors(self.cards, self.tags)
@@ -435,7 +435,7 @@ class TestMainCLI(_MongoBackedTestCase):
 
     def test_cards_subcommand_embeds_cards(self):
         self.cards.insert_one(
-            {"_id": "a", "scryfall_id": "a", "name": "A", "oracle_text": "text"}
+            {"_id": "a", "name": "A", "oracle_text": "text"}
         )
         rc, out, _ = _run(["cards"])
         self.assertEqual(rc, 0)
@@ -451,7 +451,7 @@ class TestMainCLI(_MongoBackedTestCase):
 
     def test_cards_refresh_flag_passed_through(self):
         self.cards.insert_one(
-            {"_id": "a", "scryfall_id": "a", "name": "A", "oracle_text": "text",
+            {"_id": "a", "name": "A", "oracle_text": "text",
              "text_embedding": [0.0] * 8}
         )
         rc, _, _ = _run(["cards", "--refresh"])
@@ -462,7 +462,7 @@ class TestMainCLI(_MongoBackedTestCase):
     def test_cards_limit_flag_passed_through(self):
         for i in range(5):
             self.cards.insert_one(
-                {"_id": f"c{i}", "scryfall_id": f"c{i}", "name": f"C{i}", "oracle_text": "x"}
+                {"_id": f"c{i}", "name": f"C{i}", "oracle_text": "x"}
             )
         rc, _, _ = _run(["cards", "--limit", "2"])
         self.assertEqual(rc, 0)
@@ -478,7 +478,7 @@ class TestMainCLI(_MongoBackedTestCase):
             {"_id": "a", "label": "A", "embedding": [0.0, 1.0, 0.0, 0.0]}
         )
         self.cards.insert_one(
-            {"_id": "c1", "scryfall_id": "c1", "name": "C1",
+            {"_id": "c1", "name": "C1",
              "oracle_text": "x",
              "text_embedding": [1.0, 0.0, 0.0, 0.0], "tags": ["a"]}
         )
