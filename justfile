@@ -44,6 +44,10 @@ test:
 test-verbose:
     python -m unittest discover tests -v
 
+# Run only the integration suite (needs MONGODB_INTEGRATION_URI, typically in .env).
+test-integration:
+    python -m unittest discover tests/integration -v
+
 
 # Verify the Mongo cluster is reachable and healthy (`mtg-check` wrapper).
 check *ARGS:
@@ -61,10 +65,13 @@ tags *ARGS:
 inspect *ARGS:
     mtg-inspect {{ARGS}}
 
-# Encode oracle text + tags into dense vectors on their Mongo docs
-# (`mtg-embed` wrapper: cards / tags, --refresh, --limit, --batch-size).
+# Encode text + tags into dense vectors (`mtg-embed` wrapper: cards / tags / flags).
 embed *ARGS:
     mtg-embed {{ARGS}}
+
+# Smoke-test the embedding pipeline end-to-end on 20 cards.
+embed-smoke:
+    mtg-embed cards --limit 20
 
 # Export a trimmed JSON subset for a decklist file (`extract-oracle` wrapper).
 extract FILE *ARGS:
