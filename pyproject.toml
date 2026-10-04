@@ -34,9 +34,13 @@ classifiers = [
 # Expected additions:
 #   Phase 2 (embeddings) — sentence-transformers (pulls torch), numpy, scikit-learn
 dependencies = [
-    # pymongo >=4.6 is the current LTS line; aligns with Atlas 7.x and ships
-    # the Stable API v1 bits that make server-version drift painless.
-    "pymongo>=4.6",
+    # pymongo >=4.6,<4.11 — 4.6 is the current LTS line (aligns with
+    # Atlas 7.x and the Stable API v1 bits); the <4.11 upper bound is a
+    # mongomock compatibility pin. pymongo 4.11 added a `sort` kwarg to
+    # UpdateOne/UpdateMany, which mongomock 4.3 (the latest release at
+    # time of writing) does not understand. Loosen the upper bound when
+    # mongomock catches up.
+    "pymongo>=4.6,<4.11",
     # python-dotenv lets `pip install -e .` + a local .env file "just work"
     # for CLI runs. The storage module falls back to os.environ when dotenv
     # isn't installed, so this is optional-but-nice; keeping it in runtime

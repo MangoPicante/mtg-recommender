@@ -1,8 +1,9 @@
 """Offline tests for mtg_recommender.oracle_tags.
 
-Every HTTP call is mocked. Keeps parity with the scryfall_fetch suite in
-style and run time — the full file should finish well under a second and
-touch nothing outside TemporaryDirectory.
+Every HTTP call is mocked and every Mongo op routes through mongomock,
+so the suite is deterministic and offline. Parity with the scryfall_fetch
+test suite in style and run time — the full file finishes well under a
+second.
 
 Run with:
 
@@ -16,12 +17,11 @@ Test classes are grouped by concern:
     TestExtractTagFields      extract_tag_fields — projection + uuid->slug
     TestBuildTagCatalog       build_tag_catalog — end-to-end slug map
     TestBuildOracleIndex      build_oracle_id_to_slugs — inversion + dedup
-    TestAttachTagsToCards     attach_tags_to_cards — join by oracle_id
-    TestIsFresh               is_fresh — snapshot timestamp comparison
-    TestTagCacheIO            load_tag_cache / save_tag_cache
+    TestUpsertTagCatalog      Mongo-write path for the catalog
+    TestAttachTagsToCards     attach_tags_to_cards — Mongo join by oracle_id
     TestGetBulkTagsMetadata   /bulk-data filtering (mocked urlopen)
     TestDownloadBulkTags      gzip detection + JSONL parsing (mocked urlopen)
-    TestMainCLI               main() end-to-end (mocked urlopen)
+    TestMainCLI               main() end-to-end (mongomock + mocked urlopen)
 """
 from __future__ import annotations
 
@@ -34,8 +34,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+import mongomock
+
 from mtg_recommender import oracle_tags as ot
 from mtg_recommender import scryfall_fetch as sf
+from mtg_recommender import storage
 
 
 # ---------------------------------------------------------------------------
@@ -108,9 +111,23 @@ ALL_TAGS = [TAG_REMOVAL, TAG_SPOT, TAG_MASS, TAG_EVASION]
 
 
 def call_silent(fn, *args, **kwargs):
-    """Invoke fn with stdout/stderr swallowed. Mirrors the scryfall_fetch tests."""
+    """Invoke fn with stdout/stderr swallowed."""
     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
         return fn(*args, **kwargs)
+
+
+class _MongoBackedTestCase(unittest.TestCase):
+    """Shared setup: fresh mongomock client per test, indexes pre-created."""
+
+    def setUp(self):
+        storage.reset_client(mongomock.MongoClient())
+        storage.ensure_indexes()
+        self.cards = storage.cards_collection()
+        self.tags = storage.tags_collection()
+        self.meta = storage.meta_collection()
+
+    def tearDown(self):
+        storage.reset_client(None)
 
 
 # ---------------------------------------------------------------------------
@@ -132,13 +149,9 @@ class TestIdToSlug(unittest.TestCase):
         )
 
     def test_skips_entries_missing_id_or_slug(self):
-        # Defensive: a malformed line should be skipped, not crash the
-        # whole import. Real Scryfall data has both fields on every tag,
-        # but a schema drift should surface quietly.
         tags = ALL_TAGS + [{"id": "u-orphan"}, {"slug": "orphan"}]
         index = ot._build_id_to_slug(tags)
         self.assertNotIn("u-orphan", index)
-        # No slug-keyed entries either — this is an id->slug map.
         self.assertEqual(len(index), 4)
 
 
@@ -153,14 +166,21 @@ class TestExtractTagFields(unittest.TestCase):
 
     def test_projects_core_fields(self):
         out = ot.extract_tag_fields(TAG_SPOT, self.id_to_slug)
-        self.assertEqual(out["id"], "u-spot")
+        self.assertEqual(out["scryfall_tag_id"], "u-spot")
         self.assertEqual(out["label"], "Spot removal")
         self.assertEqual(out["description"], "Removes a single permanent.")
         self.assertEqual(out["aliases"], ["targeted-removal"])
 
+    def test_renames_raw_id_to_scryfall_tag_id(self):
+        # Raw Scryfall uses `id` for the tag UUID; the projection renames
+        # it so it doesn't look like an attempt to set Mongo's reserved
+        # _id field once the doc lands in a collection.
+        out = ot.extract_tag_fields(TAG_SPOT, self.id_to_slug)
+        self.assertNotIn("id", out)
+        self.assertIn("scryfall_tag_id", out)
+
     def test_resolves_parent_uuids_to_slugs(self):
         out = ot.extract_tag_fields(TAG_SPOT, self.id_to_slug)
-        # u-removal -> "removal"
         self.assertEqual(out["parent_slugs"], ["removal"])
 
     def test_resolves_child_uuids_to_slugs(self):
@@ -168,9 +188,6 @@ class TestExtractTagFields(unittest.TestCase):
         self.assertEqual(sorted(out["child_slugs"]), ["mass-removal", "spot-removal"])
 
     def test_dangling_uuid_is_dropped(self):
-        # A parent id that isn't in the index (e.g. mid-import schema
-        # drift) should be silently dropped rather than left in the
-        # output as a confusing uuid.
         raw = {
             "id": "u-x", "slug": "x", "label": "X", "description": None,
             "parent_ids": ["u-nonexistent", "u-removal"],
@@ -180,8 +197,6 @@ class TestExtractTagFields(unittest.TestCase):
         self.assertEqual(out["parent_slugs"], ["removal"])
 
     def test_strips_taggings(self):
-        # Taggings are inverted into the cards cache, so they must NOT
-        # appear in the catalog projection.
         out = ot.extract_tag_fields(TAG_SPOT, self.id_to_slug)
         self.assertNotIn("taggings", out)
 
@@ -208,13 +223,10 @@ class TestBuildTagCatalog(unittest.TestCase):
         entry = catalog["spot-removal"]
         self.assertEqual(
             set(entry.keys()),
-            {"id", "label", "description", "parent_slugs", "child_slugs", "aliases"},
+            {"scryfall_tag_id", "label", "description", "parent_slugs", "child_slugs", "aliases"},
         )
 
     def test_entry_without_slug_is_skipped(self):
-        # The catalog is slug-keyed, so a tag without a slug has nowhere
-        # to go. Skip it rather than crash — same resilience as the
-        # cards fetcher's "no id, no store" guard.
         tags = ALL_TAGS + [{"id": "u-noslug", "label": "No slug", "parent_ids": [], "child_ids": [], "taggings": []}]
         catalog = ot.build_tag_catalog(tags)
         self.assertEqual(len(catalog), 4)
@@ -228,23 +240,16 @@ class TestBuildOracleIndex(unittest.TestCase):
 
     def test_inverts_tagging_lists(self):
         index = ot.build_oracle_id_to_slugs(ALL_TAGS)
-        # oracle-bolt is tagged by both spot-removal and evasion.
         self.assertEqual(index["oracle-bolt"], ["evasion", "spot-removal"])
-        # oracle-doom only by spot-removal.
         self.assertEqual(index["oracle-doom"], ["spot-removal"])
-        # oracle-wrath only by mass-removal.
         self.assertEqual(index["oracle-wrath"], ["mass-removal"])
 
     def test_slugs_are_sorted_within_each_card(self):
-        # Stable ordering keeps the saved cards cache diff-friendly.
         index = ot.build_oracle_id_to_slugs(ALL_TAGS)
         for slugs in index.values():
             self.assertEqual(slugs, sorted(slugs))
 
     def test_dedupes_double_taggings(self):
-        # A single tag applied twice to the same oracle_id should not
-        # appear twice in the output. Shouldn't happen in well-formed
-        # bulk data but shouldn't blow up if it does.
         tag_dup = {
             "slug": "dup", "id": "u-dup",
             "taggings": [
@@ -265,120 +270,101 @@ class TestBuildOracleIndex(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# attach_tags_to_cards
+# upsert_tag_catalog (Mongo write)
 # ---------------------------------------------------------------------------
 
-class TestAttachTagsToCards(unittest.TestCase):
+class TestUpsertTagCatalog(_MongoBackedTestCase):
 
-    def _cards_cache(self, *entries):
-        return {"cards": {e["scryfall_id"]: e for e in entries}, "aliases": {}}
+    def test_inserts_slug_keyed_docs(self):
+        catalog = ot.build_tag_catalog(ALL_TAGS)
+        ot.upsert_tag_catalog(self.tags, catalog)
+        self.assertEqual(self.tags.count_documents({}), 4)
+        spot = self.tags.find_one({"_id": "spot-removal"})
+        self.assertIsNotNone(spot)
+        self.assertEqual(spot["label"], "Spot removal")
+        self.assertEqual(spot["parent_slugs"], ["removal"])
+
+    def test_replaces_existing_catalog_contents(self):
+        # Seed with a tag that's no longer in the authoritative catalog;
+        # it must be gone after upsert.
+        self.tags.insert_one({"_id": "stale", "label": "stale"})
+        ot.upsert_tag_catalog(self.tags, ot.build_tag_catalog(ALL_TAGS))
+        self.assertIsNone(self.tags.find_one({"_id": "stale"}))
+        self.assertEqual(self.tags.count_documents({}), 4)
+
+    def test_empty_catalog_clears_collection(self):
+        self.tags.insert_one({"_id": "x"})
+        ot.upsert_tag_catalog(self.tags, {})
+        self.assertEqual(self.tags.count_documents({}), 0)
+
+
+# ---------------------------------------------------------------------------
+# attach_tags_to_cards (Mongo write + stats)
+# ---------------------------------------------------------------------------
+
+class TestAttachTagsToCards(_MongoBackedTestCase):
+
+    def _seed_cards(self, *docs):
+        for d in docs:
+            d.setdefault("tags", [])
+            self.cards.insert_one(d)
 
     def test_matches_by_oracle_id_and_attaches_slugs(self):
-        cache = self._cards_cache(
-            {"scryfall_id": "id-bolt", "oracle_id": "oracle-bolt", "name": "Bolt"},
-            {"scryfall_id": "id-doom", "oracle_id": "oracle-doom", "name": "Doom"},
+        self._seed_cards(
+            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt", "name": "Bolt"},
+            {"_id": "id-doom", "scryfall_id": "id-doom", "oracle_id": "oracle-doom", "name": "Doom"},
         )
         index = {"oracle-bolt": ["evasion", "spot-removal"], "oracle-doom": ["spot-removal"]}
-        matched, empty, unmatched = ot.attach_tags_to_cards(cache, index)
+        matched, empty, unmatched = ot.attach_tags_to_cards(self.cards, index)
         self.assertEqual(matched, 2)
         self.assertEqual(empty, 0)
         self.assertEqual(unmatched, 0)
-        self.assertEqual(cache["cards"]["id-bolt"]["tags"], ["evasion", "spot-removal"])
-        self.assertEqual(cache["cards"]["id-doom"]["tags"], ["spot-removal"])
+        self.assertEqual(
+            self.cards.find_one({"_id": "id-bolt"})["tags"],
+            ["evasion", "spot-removal"],
+        )
+        self.assertEqual(
+            self.cards.find_one({"_id": "id-doom"})["tags"],
+            ["spot-removal"],
+        )
 
     def test_card_without_oracle_id_gets_empty_tags(self):
-        # Stale cache from before oracle_id was added to the projection:
-        # we don't error out, we just give the card an empty tag list so
-        # downstream consumers can rely on the field existing.
-        cache = self._cards_cache(
-            {"scryfall_id": "id-x", "name": "X"},  # no oracle_id
+        self._seed_cards(
+            {"_id": "id-x", "scryfall_id": "id-x", "name": "X"},  # no oracle_id
         )
-        matched, empty, unmatched = ot.attach_tags_to_cards(cache, {"oracle-y": ["foo"]})
+        matched, empty, unmatched = ot.attach_tags_to_cards(self.cards, {"oracle-y": ["foo"]})
         self.assertEqual(matched, 0)
         self.assertEqual(empty, 1)
-        self.assertEqual(cache["cards"]["id-x"]["tags"], [])
+        self.assertEqual(self.cards.find_one({"_id": "id-x"})["tags"], [])
 
     def test_card_with_untagged_oracle_id_gets_empty_tags(self):
-        cache = self._cards_cache(
-            {"scryfall_id": "id-untagged", "oracle_id": "oracle-untagged", "name": "U"},
+        self._seed_cards(
+            {"_id": "id-untagged", "scryfall_id": "id-untagged",
+             "oracle_id": "oracle-untagged", "name": "U"},
         )
-        matched, empty, unmatched = ot.attach_tags_to_cards(cache, {"oracle-bolt": ["evasion"]})
+        matched, empty, unmatched = ot.attach_tags_to_cards(self.cards, {"oracle-bolt": ["evasion"]})
         self.assertEqual(matched, 0)
         self.assertEqual(empty, 1)
-        self.assertEqual(cache["cards"]["id-untagged"]["tags"], [])
+        self.assertEqual(self.cards.find_one({"_id": "id-untagged"})["tags"], [])
 
     def test_overwrites_rather_than_merges(self):
         # A tag removed upstream must disappear from the card on the
         # next import. If we merged, stale tags would linger forever.
-        cache = self._cards_cache(
-            {
-                "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt",
-                "tags": ["old-tag", "another-stale-tag"],
-            },
+        self._seed_cards(
+            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt",
+             "tags": ["old-tag", "another-stale-tag"]},
         )
-        ot.attach_tags_to_cards(cache, {"oracle-bolt": ["evasion"]})
-        self.assertEqual(cache["cards"]["id-bolt"]["tags"], ["evasion"])
+        ot.attach_tags_to_cards(self.cards, {"oracle-bolt": ["evasion"]})
+        self.assertEqual(self.cards.find_one({"_id": "id-bolt"})["tags"], ["evasion"])
 
-    def test_unmatched_count_reflects_oracle_ids_not_in_cache(self):
-        # Tagger has three oracle_ids but the cards cache only contains
-        # one of them — the other two count as unmatched.
-        cache = self._cards_cache(
-            {"scryfall_id": "id-bolt", "oracle_id": "oracle-bolt"},
+    def test_unmatched_count_reflects_oracle_ids_not_in_collection(self):
+        self._seed_cards(
+            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt"},
         )
-        index = {"oracle-bolt": ["evasion"], "oracle-doom": ["spot-removal"], "oracle-wrath": ["mass-removal"]}
-        _, _, unmatched = ot.attach_tags_to_cards(cache, index)
+        index = {"oracle-bolt": ["evasion"], "oracle-doom": ["spot-removal"],
+                 "oracle-wrath": ["mass-removal"]}
+        _, _, unmatched = ot.attach_tags_to_cards(self.cards, index)
         self.assertEqual(unmatched, 2)
-
-
-# ---------------------------------------------------------------------------
-# is_fresh
-# ---------------------------------------------------------------------------
-
-class TestIsFresh(unittest.TestCase):
-
-    def test_match_is_fresh(self):
-        cache = {"snapshot_updated_at": "2026-10-03T21:00:32.494+00:00", "tags": {}}
-        self.assertTrue(ot.is_fresh(cache, "2026-10-03T21:00:32.494+00:00"))
-
-    def test_mismatch_is_stale(self):
-        cache = {"snapshot_updated_at": "2020-01-01T00:00:00+00:00", "tags": {}}
-        self.assertFalse(ot.is_fresh(cache, "2026-10-03T21:00:32.494+00:00"))
-
-    def test_empty_cache_is_stale(self):
-        self.assertFalse(ot.is_fresh({"snapshot_updated_at": None, "tags": {}}, "any"))
-
-
-# ---------------------------------------------------------------------------
-# load_tag_cache / save_tag_cache
-# ---------------------------------------------------------------------------
-
-class TestTagCacheIO(unittest.TestCase):
-
-    def test_missing_file_returns_fresh_shell(self):
-        with TemporaryDirectory() as td:
-            shell = ot.load_tag_cache(Path(td) / "nonexistent.json")
-        self.assertEqual(shell, {"snapshot_updated_at": None, "tags": {}})
-
-    def test_roundtrip_preserves_data(self):
-        payload = {
-            "snapshot_updated_at": "2026-10-03T21:00:32.494+00:00",
-            "tags": {"spot-removal": {"id": "u-spot", "label": "Spot removal"}},
-        }
-        with TemporaryDirectory() as td:
-            path = Path(td) / "cache" / "oracle_tags.json"  # tests parent mkdir
-            ot.save_tag_cache(path, payload)
-            self.assertTrue(path.exists())
-            self.assertEqual(ot.load_tag_cache(path), payload)
-
-    def test_load_fills_in_missing_keys(self):
-        # A cache saved with a missing key (older schema) should load
-        # as a valid shell — not crash the fetcher on the next run.
-        with TemporaryDirectory() as td:
-            path = Path(td) / "oracle_tags.json"
-            path.write_text("{}", encoding="utf-8")
-            loaded = ot.load_tag_cache(path)
-        self.assertIsNone(loaded["snapshot_updated_at"])
-        self.assertEqual(loaded["tags"], {})
 
 
 # ---------------------------------------------------------------------------
@@ -431,8 +417,6 @@ class TestDownloadBulkTags(unittest.TestCase):
         self.assertEqual([t["slug"] for t in tags], ["spot-removal", "evasion"])
 
     def test_plain_jsonl_is_parsed_without_decompression(self):
-        # A proxy may have already decompressed the gzip; our magic-byte
-        # check should pass the bytes through untouched.
         jsonl = (json.dumps(TAG_SPOT) + "\n" + json.dumps(TAG_EVASION) + "\n").encode("utf-8")
         meta = {"jsonl_download_uri": "http://x", "updated_at": "ts"}
         with patch(
@@ -454,26 +438,23 @@ class TestDownloadBulkTags(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# main — end-to-end CLI
+# main — end-to-end CLI (mongomock + mocked urlopen)
 # ---------------------------------------------------------------------------
 
-class TestMainCLI(unittest.TestCase):
+class TestMainCLI(_MongoBackedTestCase):
 
-    def test_missing_cards_cache_errors(self):
-        # No cards cache -> parser.error -> SystemExit(2). Nothing is
-        # downloaded; the user needs to run scryfall-fetch first.
-        with TemporaryDirectory() as td:
-            tags_path = Path(td) / "oracle_tags.json"
-            cards_path = Path(td) / "nonexistent.json"
-            with patch("sys.argv", ["scryfall-fetch-tags", "--cards", str(cards_path), "--tags", str(tags_path)]):
-                with self.assertRaises(SystemExit):
-                    call_silent(ot.main)
+    def test_empty_cards_collection_errors(self):
+        # Cards collection empty -> parser.error -> SystemExit(2). No
+        # download attempted; user needs to run scryfall-fetch first.
+        with patch("sys.argv", ["scryfall-fetch-tags"]):
+            with self.assertRaises(SystemExit):
+                call_silent(ot.main)
 
     def test_happy_path_downloads_and_attaches(self):
-        # Seed a cards cache with cards whose oracle_ids match two of
-        # our fixture tags, then run main() with a mocked urlopen that
+        # Seed a cards collection with cards whose oracle_ids match some
+        # fixture tags, then run main() with a mocked urlopen that
         # serves the /bulk-data metadata first and the gzipped bulk
-        # payload second (urllib.request.urlopen is called twice).
+        # payload second.
         metadata_payload = {
             "data": [{
                 "type": "oracle_tags",
@@ -482,52 +463,97 @@ class TestMainCLI(unittest.TestCase):
                 "compressed_size": 100,
             }],
         }
-        jsonl = "\n".join(json.dumps(t) for t in ALL_TAGS).encode("utf-8")
+        jsonl = "\n".join(json.dumps(t) for t in ALL_TAGS).encode()
         gzipped = gzip.compress(jsonl)
 
-        with TemporaryDirectory() as td:
-            tags_path = Path(td) / "oracle_tags.json"
-            cards_path = Path(td) / "oracle_texts.json"
-            cards_cache = {
-                "cards": {
-                    "id-bolt": {"scryfall_id": "id-bolt", "oracle_id": "oracle-bolt", "name": "Bolt"},
-                    "id-wrath": {"scryfall_id": "id-wrath", "oracle_id": "oracle-wrath", "name": "Wrath"},
-                    # Card not referenced by any fixture tag; should end
-                    # with an empty tags list.
-                    "id-other": {"scryfall_id": "id-other", "oracle_id": "oracle-other", "name": "Other"},
-                },
-                "aliases": {},
-            }
-            cards_path.write_text(json.dumps(cards_cache), encoding="utf-8")
+        self.cards.insert_many([
+            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt", "name": "Bolt"},
+            {"_id": "id-wrath", "scryfall_id": "id-wrath", "oracle_id": "oracle-wrath", "name": "Wrath"},
+            # No fixture tag applies to this card; should end with [].
+            {"_id": "id-other", "scryfall_id": "id-other", "oracle_id": "oracle-other", "name": "Other"},
+        ])
 
-            # Two sequential urlopen calls: metadata (JSON) first, then
-            # bulk (gzipped JSONL). urllib.request is cached as a single
-            # module object across our two source modules, so one patch
-            # with a sequential side_effect covers both call sites.
-            metadata_resp = _json_response(metadata_payload)
-            bulk_resp = _bytes_response(gzipped)
-            argv = ["scryfall-fetch-tags", "--cards", str(cards_path), "--tags", str(tags_path)]
-            with patch(
-                "mtg_recommender.scryfall_fetch.urllib.request.urlopen",
-                side_effect=[metadata_resp, bulk_resp],
-            ), patch("sys.argv", argv):
-                rc = call_silent(ot.main)
-            self.assertEqual(rc, 0)
+        with patch(
+            "mtg_recommender.scryfall_fetch.urllib.request.urlopen",
+            side_effect=[_json_response(metadata_payload), _bytes_response(gzipped)],
+        ), patch("sys.argv", ["scryfall-fetch-tags"]):
+            rc = call_silent(ot.main)
+        self.assertEqual(rc, 0)
 
-            # Reload both caches from disk and assert end state. These
-            # assertions MUST live inside the TemporaryDirectory `with`
-            # block — once it exits, the directory and everything in it
-            # are deleted.
-            saved_tags = json.loads(tags_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved_tags["snapshot_updated_at"], "2026-10-03T21:00:32.494+00:00")
-            self.assertEqual(
-                set(saved_tags["tags"].keys()),
-                {"removal", "spot-removal", "mass-removal", "evasion"},
-            )
-            saved_cards = json.loads(cards_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved_cards["cards"]["id-bolt"]["tags"], ["evasion", "spot-removal"])
-            self.assertEqual(saved_cards["cards"]["id-wrath"]["tags"], ["mass-removal"])
-            self.assertEqual(saved_cards["cards"]["id-other"]["tags"], [])
+        # Catalog landed in Mongo.
+        self.assertEqual(self.tags.count_documents({}), 4)
+        self.assertEqual(
+            {t["_id"] for t in self.tags.find({}, {"_id": 1})},
+            {"removal", "spot-removal", "mass-removal", "evasion"},
+        )
+
+        # Cards got the right tags.
+        self.assertEqual(
+            self.cards.find_one({"_id": "id-bolt"})["tags"],
+            ["evasion", "spot-removal"],
+        )
+        self.assertEqual(
+            self.cards.find_one({"_id": "id-wrath"})["tags"],
+            ["mass-removal"],
+        )
+        self.assertEqual(self.cards.find_one({"_id": "id-other"})["tags"], [])
+
+        # Snapshot timestamp recorded for the freshness check.
+        self.assertEqual(
+            storage.get_snapshot_timestamp(ot.META_SOURCE),
+            "2026-10-03T21:00:32.494+00:00",
+        )
+
+    def test_fresh_snapshot_skips_download(self):
+        # Pre-record the current snapshot timestamp. Running main() with
+        # a bulk-data response claiming the same timestamp should skip
+        # the download (second urlopen call) entirely.
+        self.cards.insert_one({"_id": "id-x", "scryfall_id": "id-x", "oracle_id": "oracle-x"})
+        storage.set_snapshot_timestamp(ot.META_SOURCE, "2026-10-03T21:00:32.494+00:00")
+        metadata_payload = {
+            "data": [{
+                "type": "oracle_tags",
+                "jsonl_download_uri": "http://bulk",
+                "updated_at": "2026-10-03T21:00:32.494+00:00",
+                "compressed_size": 100,
+            }],
+        }
+        with patch(
+            "mtg_recommender.scryfall_fetch.urllib.request.urlopen",
+            side_effect=[_json_response(metadata_payload)],
+        ), patch("sys.argv", ["scryfall-fetch-tags"]):
+            rc = call_silent(ot.main)
+        self.assertEqual(rc, 0)
+        # tags collection untouched because the download was skipped.
+        self.assertEqual(self.tags.count_documents({}), 0)
+
+    def test_refresh_forces_download_even_when_snapshot_matches(self):
+        # Seed with oracle-bolt so TAG_EVASION actually attaches to it;
+        # that keeps matched > 0 and main() happy. The point of this
+        # test is the --refresh flag, not the "no cards tagged" warning.
+        self.cards.insert_one(
+            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt"}
+        )
+        storage.set_snapshot_timestamp(ot.META_SOURCE, "2026-10-03T21:00:32.494+00:00")
+        metadata_payload = {
+            "data": [{
+                "type": "oracle_tags",
+                "jsonl_download_uri": "http://bulk",
+                "updated_at": "2026-10-03T21:00:32.494+00:00",
+                "compressed_size": 100,
+            }],
+        }
+        jsonl = json.dumps(TAG_EVASION).encode()
+        gzipped = gzip.compress(jsonl)
+
+        with patch(
+            "mtg_recommender.scryfall_fetch.urllib.request.urlopen",
+            side_effect=[_json_response(metadata_payload), _bytes_response(gzipped)],
+        ), patch("sys.argv", ["scryfall-fetch-tags", "--refresh"]):
+            rc = call_silent(ot.main)
+        self.assertEqual(rc, 0)
+        # Catalog now populated despite the matching timestamp.
+        self.assertEqual(self.tags.count_documents({}), 1)
 
 
 # ---------------------------------------------------------------------------

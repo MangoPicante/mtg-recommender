@@ -1,19 +1,19 @@
-"""Extract oracle text for a specified set of cards from the local cache.
+"""Extract oracle text for a specified set of cards from MongoDB.
 
-Reads the unified cache written by `scryfall_fetch.py` (default path:
-`cache/oracle_texts.json`) and writes a much smaller JSON file
-containing only the cards the caller asked for. Handy for shipping a
-minimal subset alongside a notebook, a model, or a downstream tool
-without dragging along the full ~40 k-entry snapshot.
+Reads the cards collection populated by `scryfall-fetch` and writes a
+much smaller JSON file containing only the cards the caller asked for.
+Handy for shipping a minimal subset alongside a notebook, a model, or a
+downstream tool without dragging along the full ~40 k-entry collection
+or requiring the consumer to speak Mongo.
 
 Input reuse:
 
     - `read_names` from scryfall_fetch handles --file + positional args,
       with '#' comments and case-insensitive dedup.
-    - `resolve_by_name` from scryfall_fetch does the two-step
-      name -> [scryfall_ids] -> [cards] lookup, honoring the list-valued
-      alias index that keeps ambiguous names (art variants, meld pieces,
-      shared face names) visible.
+    - `find_cards_by_name` from scryfall_fetch does the Mongo lookup via
+      the multikey index on `names`, returning every card that matches
+      the lowered input so ambiguous names (art variants, meld pieces,
+      shared face names) remain visible.
 
 Output shape (JSON):
 
@@ -35,10 +35,11 @@ Output shape (JSON):
     more than one cached card. Downstream consumers can pick with
     whatever criterion suits them (canonical-name shape, type line, etc.).
 
-`updated_at` is intentionally dropped — it's cache metadata about when
-we last refreshed the entry, not information about the card itself.
+`updated_at`, `_id`, `names`, `oracle_id`, and `tags` are intentionally
+dropped — the subset is meant for text consumers that just want "what
+does this card say?", not full-fat records.
 
-Usage (after `pip install -e .`, which registers the `extract-oracle` script):
+Usage (after `pip install -e .`, with MONGODB_URI set in .env):
     extract-oracle "Lightning Bolt" "Counterspell" -o subset.json
     extract-oracle --file cards.txt -o deck_oracle.json
     extract-oracle --file cards.txt        # defaults to ./oracle_subset.json
@@ -53,10 +54,10 @@ import json
 import sys
 from pathlib import Path
 
-# Intra-package relative import — pairs with the `src/mtg_recommender/` layout
-# declared in pyproject.toml so this works both when installed (pip install -e .)
-# and when run as `python -m mtg_recommender.extract_oracle`.
+# Intra-package relative imports — pair with the src/mtg_recommender/
+# layout declared in pyproject.toml.
 from . import scryfall_fetch as sf
+from . import storage
 
 # Default output lives next to wherever the user runs the CLI from. CWD-relative
 # rather than module-relative so the file lands somewhere the user can see,
@@ -64,8 +65,9 @@ from . import scryfall_fetch as sf
 DEFAULT_OUTPUT = Path.cwd() / "oracle_subset.json"
 
 # Fields to copy per card into the output. Chosen to be everything a
-# downstream text-based recommender would want, minus the cache-only
-# `updated_at` field.
+# downstream text-based recommender would want, minus Mongo bookkeeping
+# (_id, names, updated_at) and fields owned by other modules (tags,
+# oracle_id — handy inside Mongo but noise to a text consumer).
 FIELDS = ("name", "mana_cost", "type_line", "oracle_text", "scryfall_id")
 
 
@@ -76,7 +78,7 @@ def project_for_output(card: dict) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Extract oracle text for a specified set of cards from the local cache.",
+        description="Extract oracle text for a specified set of cards from MongoDB.",
     )
     parser.add_argument("cards", nargs="*", help="Card names (quote multi-word names).")
     parser.add_argument(
@@ -87,25 +89,21 @@ def main() -> int:
         "-o", "--output", type=Path, default=DEFAULT_OUTPUT,
         help="Output JSON path (default: ./oracle_subset.json).",
     )
-    parser.add_argument(
-        "--cache", type=Path, default=sf.CACHE_PATH,
-        help="Input cache file path (default: cache/oracle_texts.json).",
-    )
     args = parser.parse_args()
 
     names = sf.read_names(args)
     if not names:
         parser.error("no card names provided (pass names as args or via --file)")
 
-    # A missing cache is a setup error (fetcher hasn't been run yet), not
-    # a bug in this script — surface it clearly.
-    if not args.cache.exists():
+    coll = storage.cards_collection()
+    # An empty collection is a setup error (fetcher hasn't been run
+    # yet), not a bug in this script — surface it clearly rather than
+    # silently producing an empty output file.
+    if coll.estimated_document_count() == 0:
         parser.error(
-            f"cache file not found: {args.cache}\n"
-            "run scryfall_fetch.py first to populate it"
+            f"cards collection '{coll.database.name}.{coll.name}' is empty\n"
+            "run scryfall-fetch first to populate it"
         )
-
-    cache = sf.load_cache(args.cache)
 
     # Build the output dict in one pass, tracking misses and ambiguities
     # so we can report them all at the end instead of interleaving with
@@ -115,7 +113,7 @@ def main() -> int:
     ambiguous: list[tuple[str, int]] = []
 
     for name in names:
-        matches = sf.resolve_by_name(cache, name)
+        matches = sf.find_cards_by_name(coll, name)
         if not matches:
             missing.append(name)
             continue
@@ -153,7 +151,7 @@ def main() -> int:
         # or the card hasn't been fetched yet. Exit non-zero so callers
         # in a pipeline notice.
         print(
-            f"\nwarning: {len(missing)} name(s) not found in cache:",
+            f"\nwarning: {len(missing)} name(s) not found in collection:",
             file=sys.stderr,
         )
         for name in missing:

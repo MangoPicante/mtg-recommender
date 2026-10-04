@@ -1,4 +1,4 @@
-"""Fetch and cache Scryfall oracle texts for a list of cards.
+"""Fetch Scryfall oracle text into MongoDB.
 
 The mode is chosen automatically based on how many cards were requested:
 
@@ -7,48 +7,49 @@ The mode is chosen automatically based on how many cards were requested:
 
     2+ cards : Downloads Scryfall's oracle_cards bulk file (a single
                gzip-compressed JSON Lines dump of every unique card), then
-               merges every card from that dump into the shared cache.
-               Every merged entry is stamped with the snapshot's own
+               upserts every card from that dump into the cards collection.
+               Every upserted entry is stamped with the snapshot's own
                `updated_at` timestamp (the value Scryfall gives us for that
                dump), NOT the current wall-clock time.
 
-Cache shape (cache/oracle_texts.json):
+Storage (MongoDB — see `storage.py` for connection details):
 
-    {
-      "cards": {
-        "<scryfall_id>": {
-          "name": "...",
-          "mana_cost": "...",
-          "type_line": "...",
-          "oracle_text": "...",
-          "scryfall_id": "<same as key>",
-          "oracle_id": "<Scryfall oracle id — the join key for tags>",
+    cards collection — one document per card, _id = scryfall_id:
+
+        {
+          "_id":        "<scryfall_id>",       # Mongo primary key
+          "scryfall_id":"<same as _id>",
+          "oracle_id":  "<Scryfall oracle id — the join key for tags>",
+          "name":       "...",
+          "names":      ["lightning bolt", "lightning bolt // lightning bolt"],
+                                               # lowered aliases on this doc;
+                                               # a multikey index makes
+                                               # `find({"names": lowered})`
+                                               # fast and ambiguity-tolerant.
+          "mana_cost":  "...",
+          "type_line":  "...",
+          "oracle_text":"...",
           "updated_at": "<UTC ISO 8601>"
-        },
-        ...
-      },
-      "aliases": {
-        "<lowercased card name or face name>": ["<scryfall_id>", ...],
-        ...
-      }
-    }
+        }
 
-Why id-primary + list-valued aliases:
+    `tags` is owned by the oracle_tags module and is deliberately NOT set
+    by this module — upserts use $set on the fields the fetcher owns so
+    an existing card's tags survive a bulk refresh.
+
+Why id-primary + per-doc names array:
 
     Scryfall IDs are the stable identity for a card — a name can be
     changed by errata, but the ID doesn't move. Keying by ID means the
-    card is stored exactly once even when it has multiple names (double-
-    faced, split, adventure, modal DFC). The aliases index bridges the
-    user-facing lookup ("Lightning Bolt") to the id-keyed store in two
-    O(1) hops.
+    card is stored exactly once even when it has multiple names
+    (double-faced, split, adventure, modal DFC). The `names` array on
+    each doc, backed by a multikey index, bridges the user-facing
+    lookup ("Lightning Bolt") to the id-keyed store without a separate
+    alias collection.
 
-    Alias VALUES are lists so that name collisions surface to the caller
-    instead of being silently resolved. For example, both the real
-    "Delver of Secrets // Insectile Aberration" and a hypothetical art-
-    card "Delver of Secrets // Delver of Secrets" contribute a face
-    alias for "delver of secrets"; both ids end up in the list, and the
-    downstream consumer picks based on whatever criterion matters to
-    them (type line, canonical name shape, set code, etc.).
+    Multiple cards may share a lowered name (art-card variants, meld
+    pieces, cards named after their faces); `find({"names": lowered})`
+    returns a cursor of every matching doc, and the caller decides how
+    to disambiguate.
 
 Per-card `updated_at` semantics:
 
@@ -62,18 +63,17 @@ Per-card `updated_at` semantics:
 Bulk-download triggers (any one is enough):
 
     1. --refresh flag set.
-    2. Empty cache.
-    3. Any requested card isn't in the cache yet — the whole point of
+    2. Empty cards collection.
+    3. Any requested card isn't in the collection yet — the whole point of
        bulk mode is to serve the request, so if we're missing something,
        download and try to satisfy it.
     4. Any cached card's `updated_at` is older than the current bulk
        snapshot's `updated_at` — merging refreshes that entry.
 
-    If none apply, skip the 24 MB download.
+    If none apply, skip the ~24 MB download.
 
-The cache/ directory is gitignored so nothing here leaks into the repo.
+Usage (after `pip install -e .`, with MONGODB_URI set in .env):
 
-Usage (after `pip install -e .`, which registers the `scryfall-fetch` script):
     scryfall-fetch "Lightning Bolt"                    # 1 card  -> /cards/named
     scryfall-fetch "Lightning Bolt" "Counterspell"     # 2+ cards -> bulk
     scryfall-fetch --file cards.txt                    # from a file
@@ -95,6 +95,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+from pymongo import UpdateOne
+from pymongo.collection import Collection
+
+from . import storage
+
 # ---------------------------------------------------------------------------
 # Configuration constants
 # ---------------------------------------------------------------------------
@@ -111,19 +116,6 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# All cached data lives in cache/, which .gitignore excludes from the repo.
-#
-# CWD-relative rather than module-relative because the module now lives inside
-# an installable package (src/mtg_recommender/) — a module-relative path would
-# either bury cache/ inside the package tree during development or vanish into
-# site-packages when installed as a wheel. Users running the CLI from the
-# project root (the common case) still get ./cache/ as expected; anything else
-# can be overridden with --cache.
-CACHE_DIR = Path.cwd() / "cache"
-# Single unified cache: id-keyed card store plus name -> id alias index.
-CACHE_PATH = CACHE_DIR / "oracle_texts.json"
-
-
 # ---------------------------------------------------------------------------
 # Time helper
 # ---------------------------------------------------------------------------
@@ -138,53 +130,44 @@ def now_utc_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Cache I/O
-# ---------------------------------------------------------------------------
-
-def load_cache(path: Path) -> dict:
-    """Load the unified cache. Returns a fresh shell if the file doesn't exist.
-
-    The shell shape ({"cards": {}, "aliases": {}}) is what the rest of the
-    script expects, so callers can always assume both keys are present.
-    Any stray top-level fields left over from earlier schemas are silently
-    ignored, and a cache saved in a previous name-keyed schema will look
-    like it has "cards" but no "aliases" — the next bulk merge repopulates
-    both correctly.
-    """
-    if not path.exists():
-        return {"cards": {}, "aliases": {}}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return {
-        "cards": data.get("cards", {}),
-        "aliases": data.get("aliases", {}),
-    }
-
-
-def save_cache(path: Path, cache: dict) -> None:
-    """Write the unified cache back to disk (pretty-printed, deterministic order)."""
-    # mkdir(parents=True) is safe if the directory already exists.
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        # sort_keys keeps diffs stable when the cache is inspected by hand.
-        # ensure_ascii=False preserves Unicode symbols in oracle text
-        # (mana symbols encoded as characters, curly quotes, etc.).
-        json.dumps(cache, indent=2, ensure_ascii=False, sort_keys=True),
-        encoding="utf-8",
-    )
-
-
-# ---------------------------------------------------------------------------
 # Card projection
 # ---------------------------------------------------------------------------
 
+def build_names(raw: dict) -> list[str]:
+    """Return the lowered-name array a card doc gets stored with.
+
+    The names array powers alias lookup (`cards.find({"names": lowered})`).
+    It contains the lowered form of the card's main `name` plus one entry
+    per face name on multi-faced cards (transform DFC, MDFC, split,
+    adventure, meld). Duplicates are collapsed because art-card variants
+    sometimes repeat the same face name twice (e.g. the "Delver of
+    Secrets // Delver of Secrets" art card contributes a single
+    "delver of secrets" entry rather than two).
+
+    Order is preserved by dict insertion, which keeps the stored array
+    stable across runs — the combined name always comes first, then
+    face names left-to-right. Stability matters for diff-friendly
+    document comparisons (useful when inspecting records by hand).
+    """
+    seen: dict[str, None] = {}
+    name = raw.get("name")
+    if name:
+        seen[name.lower()] = None
+    for face in raw.get("card_faces", []) or []:
+        face_name = face.get("name")
+        if face_name:
+            seen[face_name.lower()] = None
+    return list(seen.keys())
+
+
 def extract_card_fields(data: dict, updated_at: str) -> dict:
-    """Reduce a full Scryfall card object down to the fields we care about.
+    """Reduce a full Scryfall card object into the Mongo document shape.
 
     `updated_at` is passed in explicitly so the caller decides what "last
     updated" means for this entry — the snapshot timestamp for bulk merges,
     the current wall-clock for single fetches. This keeps the projection
     function pure (no hidden time dependency) and lets both fetch paths
-    produce identical-shaped entries.
+    produce identical-shaped documents.
 
     Multi-faced card handling (transform DFC, MDFC, split, adventure,
     meld) — Scryfall doesn't populate the same top-level fields for every
@@ -207,16 +190,12 @@ def extract_card_fields(data: dict, updated_at: str) -> dict:
     downstream text processing wants a single searchable blob and the
     clearer face boundary helps NLP tokenisers.
 
-    Note: `scryfall_id` is kept inside the value even though it's the key
-    in the cache, so downstream code that reads a card value can identify
-    it without needing to know which key it came from.
-
-    `oracle_id` is also copied in — distinct from `scryfall_id`, it names
-    the ORACLE entity (the gameplay card) rather than a specific printing.
-    A single oracle_id can map to many scryfall_ids across reprints, and
-    the oracle_tags bulk joins to cards via oracle_id. Keeping it on each
-    card entry means a downstream tag import doesn't need to go back to
-    the raw Scryfall objects to figure out which card is which.
+    The returned dict uses `_id = scryfall_id` so it can be upserted into
+    Mongo directly. `scryfall_id` is kept as a separate field for API
+    symmetry — callers that iterate a cursor get the id without having
+    to pop `_id`. `oracle_id` names the ORACLE entity (the gameplay
+    card) rather than a specific printing; the oracle_tags import joins
+    on it.
     """
     faces = data.get("card_faces") or []
 
@@ -243,18 +222,23 @@ def extract_card_fields(data: dict, updated_at: str) -> dict:
             face.get("oracle_text", "") for face in faces
         )
 
+    scryfall_id = data.get("id")
     return {
+        # `_id` is the Mongo primary key; keeping scryfall_id duplicated
+        # as a top-level field means code reading documents doesn't need
+        # to know about Mongo's reserved key naming.
+        "_id": scryfall_id,
+        "scryfall_id": scryfall_id,
+        # Join key for the oracle_tags bulk. Falls back to None if the
+        # raw object omits it (shouldn't happen for real Scryfall
+        # responses but is defended against so an odd test fixture
+        # doesn't crash the fetcher).
+        "oracle_id": data.get("oracle_id"),
         "name": data.get("name"),
+        "names": build_names(data),
         "mana_cost": pick("mana_cost"),
         "type_line": pick("type_line"),
         "oracle_text": oracle_text,
-        "scryfall_id": data.get("id"),
-        # oracle_id is the join key used by the oracle_tags bulk; see the
-        # docstring. Falls back to None if the raw object omits it (which
-        # shouldn't happen for real Scryfall responses but is defended
-        # against so an odd test fixture or a schema drift doesn't crash
-        # the fetcher).
-        "oracle_id": data.get("oracle_id"),
         "updated_at": updated_at,
     }
 
@@ -293,67 +277,117 @@ def fetch_card_raw_named(name: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Storage & alias management
+# Mongo storage ops
 # ---------------------------------------------------------------------------
+#
+# Every mutating op targets only the fields THIS module owns and uses $set
+# (not replace) so an existing card's `tags` array — written by the
+# oracle_tags module — survives a bulk refresh. The fields owned here are:
+#
+#     _id, scryfall_id, oracle_id, name, names, mana_cost, type_line,
+#     oracle_text, updated_at
 
-def _add_alias(aliases: dict, name: str | None, card_id: str) -> None:
-    """Append `card_id` to the alias list for `name` (lowercased), avoiding duplicates."""
-    if not name:
-        return
-    ids = aliases.setdefault(name.lower(), [])
-    if card_id not in ids:
-        ids.append(card_id)
+# Field keys scryfall_fetch sets on an upsert. Kept as a module-level
+# constant so the single-mode and bulk-mode paths stay in lockstep.
+_OWNED_FIELDS = (
+    "scryfall_id", "oracle_id", "name", "names",
+    "mana_cost", "type_line", "oracle_text", "updated_at",
+)
 
 
-def register_aliases(aliases: dict, raw: dict, card_id: str) -> None:
-    """Add `card_id` to the alias list for the card's full name and each face name.
+def _set_payload(doc: dict) -> dict:
+    """Project a full card doc down to the $set payload for an upsert.
 
-    Every alias value is a list of ids. Multiple cards can share the same
-    lowered name (art-card variants, meld pieces, etc.) — they all end up
-    in the list, and the caller resolves the ambiguity at lookup time.
-    Internal deduplication means calling this twice for the same card
-    (e.g. across a re-merge) doesn't grow the list unbounded.
+    _id is handled by the filter clause, not $set — Mongo refuses to
+    $set the primary key. Everything else owned by this module is
+    included; `tags` is deliberately absent.
     """
-    _add_alias(aliases, raw.get("name"), card_id)
-    # `card_faces` may be missing, None, or a list; guard for all three.
-    for face in raw.get("card_faces", []) or []:
-        _add_alias(aliases, face.get("name"), card_id)
+    return {k: doc[k] for k in _OWNED_FIELDS if k in doc}
 
 
-def store_card(cache: dict, raw: dict, updated_at: str, extra_aliases=()) -> bool:
-    """Project `raw` and store it in the id-keyed card store, plus register aliases.
+def upsert_card(coll: Collection, raw: dict, updated_at: str) -> bool:
+    """Upsert a single card into Mongo. Returns True on success, False on no-id.
 
-    Returns True on success, False if the raw response is missing a
-    Scryfall id (which would leave us with no key to store it under —
-    should be impossible in practice but we guard rather than crash).
-
-    `extra_aliases` lets the caller register additional lowered-name
-    aliases beyond what `register_aliases` derives from the raw object.
-    Single-mode uses this to record whatever the user typed, in case
-    their spelling differs from Scryfall's canonical name.
+    "Success" here just means the raw object had an `id` field to key the
+    document under — a missing `id` would silently vanish without a
+    place to go, so we skip and tell the caller.
     """
-    card_id = raw.get("id")
-    if not card_id:
+    doc = extract_card_fields(raw, updated_at=updated_at)
+    sid = doc["_id"]
+    if not sid:
         return False
-    cache["cards"][card_id] = extract_card_fields(raw, updated_at=updated_at)
-    register_aliases(cache["aliases"], raw, card_id)
-    for alias in extra_aliases:
-        _add_alias(cache["aliases"], alias, card_id)
+    coll.update_one({"_id": sid}, {"$set": _set_payload(doc)}, upsert=True)
     return True
 
 
-def resolve_by_name(cache: dict, name: str) -> list[dict]:
-    """Two-step lookup: name -> [ids] -> [cards]. Returns [] if either step misses.
+def bulk_upsert_cards(coll: Collection, bulk: list[dict], snapshot_updated_at: str) -> int:
+    """Upsert every card from a bulk list in a single pymongo bulk_write call.
 
-    Returns a list because a single name can legitimately map to more than
-    one card (art-card variants, meld pieces, cards named after their
-    faces). Callers who only want one card should apply their own picking
-    logic (e.g. prefer entries whose `name` doesn't self-repeat, or match
-    on a specific `type_line`); this function stays neutral and just
-    returns every card that claims this name.
+    `bulk_write` is massively faster than per-doc `update_one` for the
+    ~40k oracle_cards dump — pymongo batches ops under the hood and
+    sends them to the server in groups. `ordered=False` lets failures
+    on individual ops not stop the rest; a card with no `id` is just
+    skipped as it is in the single-doc path.
+
+    Returns the count of ops queued (which equals the count of cards
+    with a usable id — practically all of them for a real snapshot).
     """
-    ids = cache["aliases"].get(name.lower(), [])
-    return [cache["cards"][cid] for cid in ids if cid in cache["cards"]]
+    ops: list[UpdateOne] = []
+    for raw in bulk:
+        doc = extract_card_fields(raw, updated_at=snapshot_updated_at)
+        sid = doc["_id"]
+        if not sid:
+            continue
+        ops.append(UpdateOne({"_id": sid}, {"$set": _set_payload(doc)}, upsert=True))
+    if ops:
+        coll.bulk_write(ops, ordered=False)
+    return len(ops)
+
+
+def find_cards_by_name(coll: Collection, name: str) -> list[dict]:
+    """Return every card whose `names` array contains the lowered input.
+
+    Mongo returns a cursor; this helper materialises it to a list because
+    a single name may legitimately match more than one card (art-card
+    variants, meld pieces, cards named after their faces). The multikey
+    index on `names` makes this O(log n) despite the array semantics.
+
+    Callers who only want one card apply their own picking logic — this
+    function stays neutral and returns every matching doc.
+    """
+    return list(coll.find({"names": name.lower()}))
+
+
+def has_stale_cards(coll: Collection, snapshot_updated_at: str) -> bool:
+    """Does the cards collection hold any entry older than the current snapshot?
+
+    Timestamps are stored as ISO 8601 strings. ISO 8601 strings written
+    with the same fractional-second precision are directly string-comparable,
+    but Scryfall is not quite consistent about trailing zeros, so string
+    compare of e.g. "...40.749+00:00" vs "...40.749000+00:00" would
+    spuriously flag the former as older. We compare with
+    `datetime.fromisoformat` on both sides by doing the scan client-side
+    — one tiny read of `updated_at` plus `_id` per document is enough.
+
+    Returns True on the first stale entry found; iteration stops there.
+    Malformed or missing `updated_at` values are skipped (treated as
+    "not stale") so a corrupted doc doesn't force a 24 MB redownload.
+    """
+    snapshot_dt = datetime.fromisoformat(snapshot_updated_at)
+    # Project only the fields we need to keep the scan cheap. The server
+    # streams one small subdocument per card rather than the full ~2 KB
+    # payload.
+    for entry in coll.find({}, {"updated_at": 1}):
+        entry_ts = entry.get("updated_at")
+        if not entry_ts:
+            continue
+        try:
+            entry_dt = datetime.fromisoformat(entry_ts)
+        except ValueError:
+            continue
+        if entry_dt < snapshot_dt:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -407,50 +441,6 @@ def download_bulk_oracle_cards(meta: dict) -> list[dict]:
         if line:
             cards.append(json.loads(line))
     return cards
-
-
-def merge_bulk_into_cache(bulk: list[dict], cache: dict, snapshot_updated_at: str) -> int:
-    """Store every card in `bulk` under its scryfall_id and refresh aliases.
-
-    Returns the count of cards successfully stored (i.e. those with a
-    valid `id` — practically all of them). Every stored card is stamped
-    with `snapshot_updated_at`.
-    """
-    merged = 0
-    for raw in bulk:
-        if store_card(cache, raw, snapshot_updated_at):
-            merged += 1
-    return merged
-
-
-def has_stale_cards(cards: dict, snapshot_updated_at: str) -> bool:
-    """Does the card store hold any entry older than the current bulk snapshot?
-
-    Iterates the id-keyed store (each card exactly once — no double-
-    counting via aliases). Returns True as soon as it finds an entry
-    whose `updated_at` is earlier than `snapshot_updated_at`, meaning
-    that entry could be refreshed by merging the current bulk file.
-
-    Timestamps are parsed with `datetime.fromisoformat` rather than
-    compared as raw strings. String compare of e.g. "...40.749+00:00"
-    vs "...40.749000+00:00" would spuriously mark the former as older
-    even though they're the same instant; parsing normalises both sides.
-
-    Malformed or missing `updated_at` values are treated as "not stale"
-    (skipped) — a corrupted entry shouldn't force a 24 MB redownload.
-    """
-    snapshot_dt = datetime.fromisoformat(snapshot_updated_at)
-    for entry in cards.values():
-        entry_ts = entry.get("updated_at")
-        if not entry_ts:
-            continue
-        try:
-            entry_dt = datetime.fromisoformat(entry_ts)
-        except ValueError:
-            continue
-        if entry_dt < snapshot_dt:
-            return True
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -532,19 +522,15 @@ def read_names(args: argparse.Namespace) -> list[str]:
 # Mode implementations
 # ---------------------------------------------------------------------------
 
-def run_single_mode(name: str, cache: dict, refresh: bool) -> bool:
-    """Fetch a single card via /cards/named and store it in the shared cache.
+def run_single_mode(name: str, coll: Collection, refresh: bool) -> bool:
+    """Fetch a single card via /cards/named and upsert it into Mongo.
 
-    Returns True if the cache changed (used by main() to decide whether to
-    save). Cached entries are skipped unless --refresh is set. No rate
-    limiting is needed because we only make one API call per invocation.
-
-    On store, we also register the user's typed name as an alias — Scryfall's
-    exact-match resolver can accept slight variations, so the canonical
-    response name might not match what the user typed verbatim, and we want
-    the next lookup for that exact spelling to still hit the cache.
+    Returns True if the collection changed (used by main() to decide
+    the summary line). Cached entries are skipped unless --refresh is
+    set. No rate limiting is needed because we only make one API call
+    per invocation.
     """
-    if not refresh and resolve_by_name(cache, name):
+    if not refresh and find_cards_by_name(coll, name):
         # Any non-empty match list counts as a cache hit for the CLI's
         # skip-fetch decision. Disambiguation across multiple matches is
         # the downstream consumer's problem.
@@ -566,49 +552,52 @@ def run_single_mode(name: str, cache: dict, refresh: bool) -> bool:
     # Real-time timestamp — this is when *we* pulled the card. It won't
     # coincide with a Scryfall bulk snapshot's timestamp, which is what
     # the freshness check in run_bulk_mode relies on.
-    return store_card(cache, raw, now_utc_iso(), extra_aliases=[name])
+    return upsert_card(coll, raw, now_utc_iso())
 
 
-def run_bulk_mode(names: list[str], cache: dict, refresh: bool) -> bool:
-    """Ensure the cache holds what we need from the current snapshot, then report.
+def run_bulk_mode(names: list[str], coll: Collection, refresh: bool) -> bool:
+    """Ensure Mongo holds what we need from the current snapshot, then report.
 
     Downloads the bulk file when any of these apply:
       - --refresh forces it,
-      - the cache is empty,
-      - a requested name isn't in the cache (we clearly need it),
-      - any cached entry is older than the current snapshot (stale).
-    Otherwise skips the 24 MB download.
+      - the cards collection is empty,
+      - a requested name isn't in the collection (we clearly need it),
+      - any card is older than the current snapshot (stale).
+    Otherwise skips the ~24 MB download.
 
-    After the merge (or skip), report each requested name as cached or not
-    found. Missing names after a fresh download are real "not found"s —
-    the card doesn't exist in the current Scryfall snapshot (misspelling,
-    unreleased, or a token / meme card).
+    After the merge (or skip), report each requested name as cached or
+    not found. Missing names after a fresh download are real
+    "not found"s — the card doesn't exist in the current Scryfall
+    snapshot (misspelling, unreleased, or a token / meme card).
     """
     meta = get_bulk_oracle_metadata()
     snapshot_updated_at = meta["updated_at"]
 
     # Evaluate cheap checks first so we can short-circuit before the
-    # potentially O(n) staleness scan.
-    any_missing = any(not resolve_by_name(cache, n) for n in names)
+    # potentially O(n) staleness scan. estimated_document_count() is a
+    # metadata read on Mongo — cheaper than count_documents({}).
+    cards_present = coll.estimated_document_count() > 0
+    any_missing = any(not find_cards_by_name(coll, n) for n in names)
     needs_download = (
         refresh
-        or not cache["cards"]
+        or not cards_present
         or any_missing
-        or has_stale_cards(cache["cards"], snapshot_updated_at)
+        or has_stale_cards(coll, snapshot_updated_at)
     )
     changed = False
 
     if needs_download:
         bulk = download_bulk_oracle_cards(meta)
-        before = len(cache["cards"])
-        merge_bulk_into_cache(bulk, cache, snapshot_updated_at)
+        before = coll.estimated_document_count()
+        bulk_upsert_cards(coll, bulk, snapshot_updated_at)
         changed = True
-        print(f"bulk  : cache now holds {len(cache['cards'])} unique cards (was {before})")
+        after = coll.estimated_document_count()
+        print(f"bulk  : collection now holds {after} unique cards (was {before})")
     else:
-        print(f"bulk  : cache already covers snapshot {snapshot_updated_at}")
+        print(f"bulk  : collection already covers snapshot {snapshot_updated_at}")
 
     for name in names:
-        matches = resolve_by_name(cache, name)
+        matches = find_cards_by_name(coll, name)
         if not matches:
             # After a fresh merge, a missing name is a real "not found" —
             # the card isn't in the current Scryfall snapshot.
@@ -629,14 +618,12 @@ def run_bulk_mode(names: list[str], cache: dict, refresh: bool) -> bool:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Fetch and cache Scryfall oracle text.")
+    parser = argparse.ArgumentParser(description="Fetch Scryfall oracle text into MongoDB.")
     parser.add_argument("cards", nargs="*", help="Card names (quote multi-word names).")
     parser.add_argument("-f", "--file",
                         help="Path to a file with one card name per line (# for comments).")
     parser.add_argument("--refresh", action="store_true",
                         help="Refetch even if already cached (single card) or force redownload the bulk snapshot.")
-    parser.add_argument("--cache", type=Path, default=CACHE_PATH,
-                        help="Unified cache file path.")
     args = parser.parse_args()
 
     names = read_names(args)
@@ -644,20 +631,22 @@ def main() -> int:
         # parser.error() prints usage and exits with code 2.
         parser.error("no card names provided (pass names as args or via --file)")
 
-    cache = load_cache(args.cache)
+    # Ensure indexes before any read/write — idempotent on Mongo's side,
+    # so the cost is one trip per CLI run and brand-new deployments work
+    # without a separate migration step.
+    storage.ensure_indexes()
+    coll = storage.cards_collection()
+
     # Mode is chosen by count: a single card hits the API directly, anything
-    # more falls to the bulk path (which merges every card into the cache).
+    # more falls to the bulk path (which upserts every card from the snapshot).
     if len(names) == 1:
-        changed = run_single_mode(names[0], cache, args.refresh)
+        changed = run_single_mode(names[0], coll, args.refresh)
     else:
-        changed = run_bulk_mode(names, cache, args.refresh)
+        changed = run_bulk_mode(names, coll, args.refresh)
 
     if changed:
-        save_cache(args.cache, cache)
-        print(
-            f"\nsaved {len(cache['cards'])} unique cards "
-            f"({len(cache['aliases'])} aliases) to {args.cache}"
-        )
+        total = coll.estimated_document_count()
+        print(f"\nsaved {total} unique cards to MongoDB ({coll.database.name}.{coll.name})")
     else:
         print("\nno changes")
     return 0

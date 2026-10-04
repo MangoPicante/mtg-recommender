@@ -1,7 +1,8 @@
 """Repeatable, offline tests for scryfall_fetch.py.
 
-Every HTTP call is mocked so the suite is deterministic and takes well
-under a second. No network access, no writes outside `TemporaryDirectory`.
+Every HTTP call is mocked and every Mongo op routes through mongomock,
+so the suite is deterministic and takes well under a second. No network
+access, no real Mongo required.
 
 Run with:
 
@@ -11,17 +12,15 @@ Run with:
 
 Test classes are grouped by concern so a failure narrows the search:
 
-    TestCardProjection            extract_card_fields
-    TestAliases                   _add_alias, register_aliases
-    TestStoreCard                 store_card
-    TestResolveByName             resolve_by_name (including ambiguity)
-    TestHasStaleCards             freshness comparison + precision quirks
-    TestCacheIO                   load_cache / save_cache roundtrip
-    TestReadNames                 --file + positional arg parsing
-    TestGetBulkOracleMetadata     /bulk-data response filtering
-    TestDownloadBulkOracleCards   gzip detection + JSONL parsing
-    TestSingleMode                run_single_mode with a mocked API
-    TestBulkMode                  run_bulk_mode + every download trigger
+    TestCardProjection          extract_card_fields + build_names
+    TestUpsertCard              upsert_card / bulk_upsert_cards + $set payload
+    TestFindCardsByName         find_cards_by_name via the names index
+    TestHasStaleCards           freshness comparison + precision quirks
+    TestReadNames               --file + positional arg parsing (pure)
+    TestGetBulkOracleMetadata   /bulk-data response filtering
+    TestDownloadBulkOracleCards gzip detection + JSONL parsing
+    TestSingleMode              run_single_mode against mongomock
+    TestBulkMode                run_bulk_mode + every download trigger
 """
 from __future__ import annotations
 
@@ -36,7 +35,10 @@ from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 
+import mongomock
+
 from mtg_recommender import scryfall_fetch as sf
+from mtg_recommender import storage
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +116,7 @@ BALA_GED_MDFC_RAW = {
 
 
 # An art-card variant whose faces both share a name. Used to exercise
-# alias-collision cases that motivated list-valued aliases.
+# alias-collision cases that motivated the multikey names index.
 DELVER_ART_RAW = {
     "id": "id-delver-art",
     "oracle_id": "oracle-delver-art",
@@ -132,7 +134,7 @@ def call_silent(fn, *args, **kwargs):
     """Invoke fn with stdout/stderr swallowed. Returns fn's return value.
 
     scryfall_fetch's mode functions print progress messages that would
-    otherwise clutter test output. We're asserting on cache state and
+    otherwise clutter test output. We're asserting on Mongo state and
     return values, not on printed text, so silencing keeps the test
     output clean.
     """
@@ -140,8 +142,20 @@ def call_silent(fn, *args, **kwargs):
         return fn(*args, **kwargs)
 
 
+class _MongoBackedTestCase(unittest.TestCase):
+    """Shared setup: fresh mongomock client per test, indexes pre-created."""
+
+    def setUp(self):
+        storage.reset_client(mongomock.MongoClient())
+        storage.ensure_indexes()
+        self.coll = storage.cards_collection()
+
+    def tearDown(self):
+        storage.reset_client(None)
+
+
 # ---------------------------------------------------------------------------
-# Pure card projection
+# Pure card projection (extract_card_fields, build_names)
 # ---------------------------------------------------------------------------
 
 class TestCardProjection(unittest.TestCase):
@@ -152,7 +166,36 @@ class TestCardProjection(unittest.TestCase):
         self.assertEqual(result["mana_cost"], "{R}")
         self.assertEqual(result["oracle_text"], LIGHTNING_BOLT_RAW["oracle_text"])
         self.assertEqual(result["scryfall_id"], "id-lb")
+        self.assertEqual(result["_id"], "id-lb")
         self.assertEqual(result["updated_at"], LATER)
+
+    def test_names_contains_lowered_main_name(self):
+        result = sf.extract_card_fields(LIGHTNING_BOLT_RAW, updated_at=LATER)
+        self.assertEqual(result["names"], ["lightning bolt"])
+
+    def test_names_contains_combined_and_face_names_for_dfc(self):
+        result = sf.extract_card_fields(DELVER_RAW, updated_at=LATER)
+        # Order: combined name first, then face names left-to-right.
+        self.assertEqual(
+            result["names"],
+            [
+                "delver of secrets // insectile aberration",
+                "delver of secrets",
+                "insectile aberration",
+            ],
+        )
+
+    def test_names_dedupes_when_faces_share_name(self):
+        # Art-card variant whose two faces are both "Delver of Secrets"
+        # must contribute a single "delver of secrets" to the names array.
+        result = sf.extract_card_fields(DELVER_ART_RAW, updated_at=LATER)
+        self.assertEqual(
+            result["names"],
+            [
+                "delver of secrets // delver of secrets",
+                "delver of secrets",
+            ],
+        )
 
     def test_multifaced_card_missing_top_level_oracle_joins_faces(self):
         # No top-level oracle_text; must join face texts with the separator.
@@ -175,26 +218,14 @@ class TestCardProjection(unittest.TestCase):
         self.assertIsNone(result["oracle_text"])
 
     def test_mdfc_null_toplevel_falls_back_to_joined_string(self):
-        # Bala Ged Recovery: top-level mana_cost / oracle_text are null,
-        # per-face values live under card_faces. The projection joins
-        # per-face mana costs with " // " (Scryfall's own convention for
-        # combined card names), preserving the empty back-face cost as
-        # a trailing empty string ("{2}{G} // ").
         result = sf.extract_card_fields(BALA_GED_MDFC_RAW, updated_at=LATER)
         self.assertEqual(result["mana_cost"], "{2}{G} // ")
-        # type_line was populated at the top level, so it stays as-is
-        # (Scryfall combined it for us).
         self.assertEqual(result["type_line"], "Sorcery // Land")
-        # oracle_text still gets the "\n---\n" treatment for downstream
-        # text processing — clearer face boundary for NLP tokenisers.
         self.assertIn("Return target card", result["oracle_text"])
         self.assertIn("Add {G}", result["oracle_text"])
         self.assertIn("\n---\n", result["oracle_text"])
 
     def test_null_toplevel_type_line_joins_per_face_with_slashes(self):
-        # Hypothetical layout where Scryfall didn't combine type_line at
-        # the top level either (e.g. some Room / split layouts). We
-        # should still emit "Creature // Enchantment"-style output.
         raw = {
             "id": "x",
             "name": "Front // Back",
@@ -210,265 +241,190 @@ class TestCardProjection(unittest.TestCase):
         self.assertEqual(result["type_line"], "Creature // Enchantment")
 
     def test_transform_dfc_prefers_populated_toplevel_fields(self):
-        # Delver's front-face mana cost bubbles up to the top level, so
-        # we prefer the top-level string rather than making up a list.
-        # (Same for its combined type_line.)
         result = sf.extract_card_fields(DELVER_RAW, updated_at=LATER)
         self.assertEqual(result["mana_cost"], "{U}")
         self.assertEqual(result["type_line"], DELVER_RAW["type_line"])
 
-    def test_single_face_card_keeps_scalar_fields(self):
-        # Regression guard: adding per-face fallback must not turn every
-        # card into a list. Single-faced cards keep their string values.
-        result = sf.extract_card_fields(LIGHTNING_BOLT_RAW, updated_at=LATER)
-        self.assertEqual(result["mana_cost"], "{R}")
-        self.assertEqual(result["type_line"], "Instant")
-
     def test_oracle_id_is_copied_when_present(self):
-        # oracle_id is the join key for the oracle_tags bulk, so the
-        # projection must carry it through verbatim from the raw object.
         result = sf.extract_card_fields(LIGHTNING_BOLT_RAW, updated_at=LATER)
         self.assertEqual(result["oracle_id"], "oracle-lb")
 
     def test_oracle_id_is_none_when_missing(self):
-        # Guard against schema drift: if Scryfall ever omits oracle_id,
-        # we store None rather than raising. The downstream tag import
-        # can log and skip these entries.
         raw_without_oracle_id = {"id": "x", "name": "X"}
         result = sf.extract_card_fields(raw_without_oracle_id, updated_at=LATER)
         self.assertIsNone(result["oracle_id"])
 
 
 # ---------------------------------------------------------------------------
-# Alias registration
+# upsert_card / bulk_upsert_cards
 # ---------------------------------------------------------------------------
 
-class TestAliases(unittest.TestCase):
+class TestUpsertCard(_MongoBackedTestCase):
 
-    def test_add_alias_creates_list_with_lowered_key(self):
-        aliases: dict = {}
-        sf._add_alias(aliases, "Lightning Bolt", "id-lb")
-        self.assertEqual(aliases, {"lightning bolt": ["id-lb"]})
-
-    def test_add_alias_dedupes_same_id(self):
-        aliases: dict = {}
-        sf._add_alias(aliases, "LB", "id1")
-        sf._add_alias(aliases, "LB", "id1")
-        self.assertEqual(aliases, {"lb": ["id1"]})
-
-    def test_add_alias_accumulates_distinct_ids(self):
-        aliases: dict = {}
-        sf._add_alias(aliases, "Same Name", "id1")
-        sf._add_alias(aliases, "Same Name", "id2")
-        self.assertEqual(aliases, {"same name": ["id1", "id2"]})
-
-    def test_add_alias_ignores_empty_or_none_name(self):
-        aliases: dict = {}
-        sf._add_alias(aliases, "", "id1")
-        sf._add_alias(aliases, None, "id2")
-        self.assertEqual(aliases, {})
-
-    def test_register_aliases_single_face(self):
-        aliases: dict = {}
-        sf.register_aliases(aliases, LIGHTNING_BOLT_RAW, "id-lb")
-        self.assertEqual(aliases, {"lightning bolt": ["id-lb"]})
-
-    def test_register_aliases_dfc_registers_combined_name_and_each_face(self):
-        aliases: dict = {}
-        sf.register_aliases(aliases, DELVER_RAW, "id-delver")
-        self.assertEqual(
-            set(aliases),
-            {
-                "delver of secrets // insectile aberration",
-                "delver of secrets",
-                "insectile aberration",
-            },
-        )
-
-    def test_two_cards_sharing_face_name_both_appear_in_alias_list(self):
-        aliases: dict = {}
-        sf.register_aliases(aliases, DELVER_RAW, "id-delver")
-        sf.register_aliases(aliases, DELVER_ART_RAW, "id-delver-art")
-        # "Delver of Secrets" is now a claim from both cards. Order isn't
-        # guaranteed to matter, so compare as a set.
-        self.assertEqual(
-            set(aliases["delver of secrets"]),
-            {"id-delver", "id-delver-art"},
-        )
-
-
-# ---------------------------------------------------------------------------
-# store_card
-# ---------------------------------------------------------------------------
-
-class TestStoreCard(unittest.TestCase):
-
-    def test_stores_under_scryfall_id(self):
-        cache = {"cards": {}, "aliases": {}}
-        ok = sf.store_card(cache, LIGHTNING_BOLT_RAW, updated_at=LATER)
+    def test_single_upsert_stores_under_scryfall_id(self):
+        ok = sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=LATER)
         self.assertTrue(ok)
-        self.assertIn("id-lb", cache["cards"])
-        self.assertEqual(cache["cards"]["id-lb"]["name"], "Lightning Bolt")
-        self.assertEqual(cache["cards"]["id-lb"]["updated_at"], LATER)
-
-    def test_registers_aliases_from_raw(self):
-        cache = {"cards": {}, "aliases": {}}
-        sf.store_card(cache, LIGHTNING_BOLT_RAW, updated_at=LATER)
-        self.assertEqual(cache["aliases"], {"lightning bolt": ["id-lb"]})
-
-    def test_extra_aliases_are_registered_and_deduped(self):
-        cache = {"cards": {}, "aliases": {}}
-        sf.store_card(
-            cache,
-            LIGHTNING_BOLT_RAW,
-            updated_at=LATER,
-            extra_aliases=["lightning bolt", "LiGhTnInG bOlT", ""],
-        )
-        # Both extras collapse to the same lowered key as the raw's name,
-        # so we still expect exactly one id in that list.
-        self.assertEqual(cache["aliases"]["lightning bolt"], ["id-lb"])
+        doc = self.coll.find_one({"_id": "id-lb"})
+        self.assertIsNotNone(doc)
+        self.assertEqual(doc["name"], "Lightning Bolt")
+        self.assertEqual(doc["updated_at"], LATER)
+        self.assertEqual(doc["names"], ["lightning bolt"])
+        self.assertEqual(doc["oracle_id"], "oracle-lb")
 
     def test_returns_false_and_stores_nothing_without_id(self):
-        cache = {"cards": {}, "aliases": {}}
-        ok = sf.store_card(cache, {"name": "No id"}, updated_at=LATER)
+        ok = sf.upsert_card(self.coll, {"name": "No id"}, updated_at=LATER)
         self.assertFalse(ok)
-        self.assertEqual(cache["cards"], {})
-        self.assertEqual(cache["aliases"], {})
+        self.assertEqual(self.coll.count_documents({}), 0)
+
+    def test_upsert_preserves_existing_tags_field(self):
+        # tags is owned by oracle_tags, not scryfall_fetch. A refetch of
+        # the same card must NOT clobber the tags array an earlier
+        # tag-import run wrote.
+        self.coll.insert_one({
+            "_id": "id-lb",
+            "scryfall_id": "id-lb",
+            "name": "Lightning Bolt (old)",
+            "updated_at": EARLIER,
+            "tags": ["spot-removal", "burn-any"],
+        })
+        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=LATER)
+        doc = self.coll.find_one({"_id": "id-lb"})
+        # Fetcher-owned fields updated:
+        self.assertEqual(doc["name"], "Lightning Bolt")
+        self.assertEqual(doc["updated_at"], LATER)
+        # Fetcher-foreign field intact:
+        self.assertEqual(doc["tags"], ["spot-removal", "burn-any"])
+
+    def test_bulk_upsert_stores_everything(self):
+        count = sf.bulk_upsert_cards(
+            self.coll, [LIGHTNING_BOLT_RAW, SOL_RING_RAW, DELVER_RAW], LATER
+        )
+        self.assertEqual(count, 3)
+        self.assertEqual(self.coll.count_documents({}), 3)
+        self.assertEqual(self.coll.find_one({"_id": "id-delver"})["name"],
+                         "Delver of Secrets // Insectile Aberration")
+
+    def test_bulk_upsert_skips_entries_missing_id(self):
+        count = sf.bulk_upsert_cards(
+            self.coll, [LIGHTNING_BOLT_RAW, {"name": "no id"}], LATER
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(self.coll.count_documents({}), 1)
+
+    def test_bulk_upsert_preserves_existing_tags(self):
+        # Same guarantee as single-upsert but through the bulk path.
+        self.coll.insert_one({
+            "_id": "id-lb", "scryfall_id": "id-lb", "name": "Old",
+            "updated_at": EARLIER, "tags": ["spot-removal"],
+        })
+        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], LATER)
+        doc = self.coll.find_one({"_id": "id-lb"})
+        self.assertEqual(doc["tags"], ["spot-removal"])
+        self.assertEqual(doc["updated_at"], LATER)
+
+    def test_empty_bulk_is_a_noop(self):
+        # Bulk-write doesn't like being called with an empty op list;
+        # the helper must handle this cleanly.
+        count = sf.bulk_upsert_cards(self.coll, [], LATER)
+        self.assertEqual(count, 0)
 
 
 # ---------------------------------------------------------------------------
-# resolve_by_name
+# find_cards_by_name
 # ---------------------------------------------------------------------------
 
-class TestResolveByName(unittest.TestCase):
+class TestFindCardsByName(_MongoBackedTestCase):
 
-    @staticmethod
-    def _cache_with(*raws, updated_at=LATER):
-        cache = {"cards": {}, "aliases": {}}
-        for r in raws:
-            sf.store_card(cache, r, updated_at=updated_at)
-        return cache
+    def _seed(self, *raws, updated_at=LATER):
+        sf.bulk_upsert_cards(self.coll, list(raws), updated_at)
 
     def test_hit_returns_single_element_list(self):
-        cache = self._cache_with(LIGHTNING_BOLT_RAW)
-        matches = sf.resolve_by_name(cache, "Lightning Bolt")
+        self._seed(LIGHTNING_BOLT_RAW)
+        matches = sf.find_cards_by_name(self.coll, "Lightning Bolt")
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["scryfall_id"], "id-lb")
 
     def test_lookup_is_case_insensitive(self):
-        cache = self._cache_with(LIGHTNING_BOLT_RAW)
+        self._seed(LIGHTNING_BOLT_RAW)
         self.assertEqual(
-            sf.resolve_by_name(cache, "LIGHTNING BOLT")[0]["scryfall_id"], "id-lb"
+            sf.find_cards_by_name(self.coll, "LIGHTNING BOLT")[0]["scryfall_id"],
+            "id-lb",
         )
 
     def test_miss_returns_empty_list(self):
-        cache = self._cache_with(LIGHTNING_BOLT_RAW)
-        self.assertEqual(sf.resolve_by_name(cache, "Unknown Card"), [])
+        self._seed(LIGHTNING_BOLT_RAW)
+        self.assertEqual(sf.find_cards_by_name(self.coll, "Unknown Card"), [])
 
     def test_dfc_resolvable_via_either_face_name(self):
-        cache = self._cache_with(DELVER_RAW)
-        by_front = sf.resolve_by_name(cache, "Delver of Secrets")
-        by_back = sf.resolve_by_name(cache, "Insectile Aberration")
-        by_combined = sf.resolve_by_name(cache, "Delver of Secrets // Insectile Aberration")
-        for ms in (by_front, by_back, by_combined):
-            self.assertEqual(len(ms), 1)
-            self.assertEqual(ms[0]["scryfall_id"], "id-delver")
+        self._seed(DELVER_RAW)
+        for q in ("Delver of Secrets", "Insectile Aberration",
+                  "Delver of Secrets // Insectile Aberration"):
+            with self.subTest(q=q):
+                matches = sf.find_cards_by_name(self.coll, q)
+                self.assertEqual(len(matches), 1)
+                self.assertEqual(matches[0]["scryfall_id"], "id-delver")
 
     def test_ambiguous_name_returns_all_matching_cards(self):
-        cache = self._cache_with(DELVER_RAW, DELVER_ART_RAW)
-        matches = sf.resolve_by_name(cache, "Delver of Secrets")
+        self._seed(DELVER_RAW, DELVER_ART_RAW)
+        matches = sf.find_cards_by_name(self.coll, "Delver of Secrets")
         self.assertEqual(
             {m["scryfall_id"] for m in matches},
             {"id-delver", "id-delver-art"},
         )
-
-    def test_dangling_alias_id_is_filtered_out(self):
-        # If an alias points to an id no longer in cards (e.g. hand-edited
-        # cache), we skip it rather than KeyError.
-        cache = {"cards": {}, "aliases": {"ghost": ["nonexistent-id"]}}
-        self.assertEqual(sf.resolve_by_name(cache, "ghost"), [])
 
 
 # ---------------------------------------------------------------------------
 # has_stale_cards
 # ---------------------------------------------------------------------------
 
-class TestHasStaleCards(unittest.TestCase):
+class TestHasStaleCards(_MongoBackedTestCase):
 
-    def test_empty_cache_is_not_stale(self):
-        # Emptiness is a separate trigger (handled in run_bulk_mode) —
-        # the staleness check itself should just say "nothing older exists."
-        self.assertFalse(sf.has_stale_cards({}, LATER))
+    def test_empty_collection_is_not_stale(self):
+        self.assertFalse(sf.has_stale_cards(self.coll, LATER))
 
     def test_all_entries_at_snapshot_are_not_stale(self):
-        cards = {"id1": {"updated_at": LATER}, "id2": {"updated_at": LATER}}
-        self.assertFalse(sf.has_stale_cards(cards, LATER))
+        self.coll.insert_many([
+            {"_id": "a", "updated_at": LATER},
+            {"_id": "b", "updated_at": LATER},
+        ])
+        self.assertFalse(sf.has_stale_cards(self.coll, LATER))
 
     def test_entry_newer_than_snapshot_is_not_stale(self):
-        # A single-fetch happened after the snapshot's publication time.
-        cards = {"id1": {"updated_at": "2999-01-01T00:00:00+00:00"}}
-        self.assertFalse(sf.has_stale_cards(cards, LATER))
+        self.coll.insert_one({"_id": "a", "updated_at": "2999-01-01T00:00:00+00:00"})
+        self.assertFalse(sf.has_stale_cards(self.coll, LATER))
 
     def test_any_entry_older_than_snapshot_triggers_stale(self):
-        cards = {"fresh": {"updated_at": LATER}, "old": {"updated_at": EARLIER}}
-        self.assertTrue(sf.has_stale_cards(cards, LATER))
+        self.coll.insert_many([
+            {"_id": "fresh", "updated_at": LATER},
+            {"_id": "old", "updated_at": EARLIER},
+        ])
+        self.assertTrue(sf.has_stale_cards(self.coll, LATER))
 
     def test_precision_agnostic_across_fractional_second_widths(self):
-        # Same instant, different fractional-second precision. Naive
-        # string comparison would falsely mark the shorter form as older.
-        cards = {"a": {"updated_at": "2026-07-31T09:03:40.749+00:00"}}
+        # Same instant written with different fractional-second widths.
+        # String compare would mark the shorter form as older; the
+        # fromisoformat parse normalises both sides.
+        self.coll.insert_one({"_id": "a", "updated_at": "2026-07-31T09:03:40.749+00:00"})
         snapshot = "2026-07-31T09:03:40.749000+00:00"
-        self.assertFalse(sf.has_stale_cards(cards, snapshot))
+        self.assertFalse(sf.has_stale_cards(self.coll, snapshot))
 
     def test_malformed_timestamp_is_skipped_not_treated_as_stale(self):
-        cards = {
-            "good": {"updated_at": LATER},
-            "bad": {"updated_at": "definitely not a date"},
-        }
-        # We don't want a single corrupt entry to force a 24 MB redownload.
-        self.assertFalse(sf.has_stale_cards(cards, LATER))
+        self.coll.insert_many([
+            {"_id": "good", "updated_at": LATER},
+            {"_id": "bad", "updated_at": "definitely not a date"},
+        ])
+        self.assertFalse(sf.has_stale_cards(self.coll, LATER))
 
     def test_missing_timestamp_is_skipped(self):
-        cards = {"noop": {}, "good": {"updated_at": LATER}}
-        self.assertFalse(sf.has_stale_cards(cards, LATER))
+        self.coll.insert_many([
+            {"_id": "noop"},
+            {"_id": "good", "updated_at": LATER},
+        ])
+        self.assertFalse(sf.has_stale_cards(self.coll, LATER))
 
 
 # ---------------------------------------------------------------------------
-# Cache I/O
-# ---------------------------------------------------------------------------
-
-class TestCacheIO(unittest.TestCase):
-
-    def test_load_missing_file_returns_empty_shell(self):
-        with TemporaryDirectory() as d:
-            path = Path(d) / "nope.json"
-            cache = sf.load_cache(path)
-            self.assertEqual(cache, {"cards": {}, "aliases": {}})
-
-    def test_roundtrip_preserves_structure(self):
-        with TemporaryDirectory() as d:
-            path = Path(d) / "cache.json"
-            projected = sf.extract_card_fields(LIGHTNING_BOLT_RAW, updated_at=LATER)
-            cache = {
-                "cards": {"id-lb": projected},
-                "aliases": {"lightning bolt": ["id-lb"]},
-            }
-            sf.save_cache(path, cache)
-            reloaded = sf.load_cache(path)
-            self.assertEqual(reloaded, cache)
-
-    def test_load_tolerates_missing_aliases_key(self):
-        # An older or hand-edited cache without an "aliases" key must
-        # still load cleanly with an empty aliases dict.
-        with TemporaryDirectory() as d:
-            path = Path(d) / "cache.json"
-            path.write_text(json.dumps({"cards": {}}), encoding="utf-8")
-            cache = sf.load_cache(path)
-            self.assertEqual(cache, {"cards": {}, "aliases": {}})
-
-
-# ---------------------------------------------------------------------------
-# read_names (input parsing)
+# read_names (input parsing — pure, unchanged by the Mongo switch)
 # ---------------------------------------------------------------------------
 
 class TestReadNames(unittest.TestCase):
@@ -502,7 +458,6 @@ class TestReadNames(unittest.TestCase):
             names = sf.read_names(
                 self._args(file=str(p), cards=["Lightning Bolt", "Counterspell"])
             )
-            # "Lightning Bolt" from args is deduped against the file entry.
             self.assertEqual(names, ["Sol Ring", "Lightning Bolt", "Counterspell"])
 
     def test_decklist_format_strips_leading_quantities(self):
@@ -516,8 +471,6 @@ class TestReadNames(unittest.TestCase):
             self.assertEqual(names, ["Sol Ring", "Forest", "Lightning Bolt"])
 
     def test_decklist_format_preserves_dfc_slashes(self):
-        # DFC names have "//" inside them — the qty strip must not clip
-        # anything past the first word.
         with TemporaryDirectory() as d:
             p = Path(d) / "deck.txt"
             p.write_text(
@@ -539,7 +492,7 @@ class TestReadNames(unittest.TestCase):
             p = Path(d) / "deck.txt"
             p.write_text(
                 "1 Lightning Bolt (STA) 42\n"
-                "4 Counterspell (LEA)\n"        # collector number omitted
+                "4 Counterspell (LEA)\n"
                 "1 Bala Ged Recovery // Bala Ged Sanctuary (ZNR) 180\n",
                 encoding="utf-8",
             )
@@ -561,14 +514,13 @@ class TestReadNames(unittest.TestCase):
             self.assertEqual(names, ["Force of Will", "Flusterstorm"])
 
     def test_parse_decklist_line_directly(self):
-        # A few edge cases surfaced as a table for easier scanning.
         cases = [
             ("1 Sol Ring", "Sol Ring"),
             ("10 Forest", "Forest"),
             ("4x Lightning Bolt", "Lightning Bolt"),
-            ("Sol Ring", "Sol Ring"),                                # already bare
-            ("  1  Sol Ring  ", "Sol Ring"),                         # extra whitespace
-            ("SB: 1 Force of Will (EMA) 49", "Force of Will"),       # everything
+            ("Sol Ring", "Sol Ring"),
+            ("  1  Sol Ring  ", "Sol Ring"),
+            ("SB: 1 Force of Will (EMA) 49", "Force of Will"),
             ("1 Bala Ged Recovery // Bala Ged Sanctuary", "Bala Ged Recovery // Bala Ged Sanctuary"),
             ("# comment", None),
             ("", None),
@@ -640,8 +592,6 @@ class TestDownloadBulkOracleCards(unittest.TestCase):
         self.assertEqual({c["id"] for c in cards}, {"id-lb", "id-sol-ring"})
 
     def test_decompresses_gzipped_payload(self):
-        # Detection happens via the 0x1f 0x8b magic bytes, independent of
-        # any Content-Encoding header.
         payload = json.dumps(LIGHTNING_BOLT_RAW).encode()
         gz = gzip.compress(payload)
         with patch(
@@ -672,55 +622,47 @@ class TestDownloadBulkOracleCards(unittest.TestCase):
 # Single-card mode
 # ---------------------------------------------------------------------------
 
-class TestSingleMode(unittest.TestCase):
+class TestSingleMode(_MongoBackedTestCase):
 
     def test_cache_hit_skips_fetch(self):
-        cache = {"cards": {}, "aliases": {}}
-        sf.store_card(cache, LIGHTNING_BOLT_RAW, updated_at=LATER)
+        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=LATER)
         with patch.object(sf, "fetch_card_raw_named") as mocked:
-            changed = call_silent(sf.run_single_mode, "Lightning Bolt", cache, False)
+            changed = call_silent(sf.run_single_mode, "Lightning Bolt", self.coll, False)
         mocked.assert_not_called()
         self.assertFalse(changed)
 
     def test_refresh_forces_fetch_even_when_cached(self):
-        cache = {"cards": {}, "aliases": {}}
-        sf.store_card(cache, LIGHTNING_BOLT_RAW, updated_at=EARLIER)
+        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=EARLIER)
         with patch.object(
             sf, "fetch_card_raw_named", return_value=LIGHTNING_BOLT_RAW
         ) as mocked:
-            changed = call_silent(sf.run_single_mode, "Lightning Bolt", cache, True)
+            changed = call_silent(sf.run_single_mode, "Lightning Bolt", self.coll, True)
         mocked.assert_called_once_with("Lightning Bolt")
         self.assertTrue(changed)
 
-    def test_fetch_stores_card_and_registers_user_typed_alias(self):
-        cache = {"cards": {}, "aliases": {}}
+    def test_fetch_stores_card_resolvable_by_lowered_name(self):
         # User's typed casing differs from Scryfall's canonical.
         with patch.object(sf, "fetch_card_raw_named", return_value=LIGHTNING_BOLT_RAW):
-            changed = call_silent(sf.run_single_mode, "lightning BOLT", cache, False)
+            changed = call_silent(sf.run_single_mode, "lightning BOLT", self.coll, False)
         self.assertTrue(changed)
-        self.assertIn("id-lb", cache["cards"])
-        # Both the user's spelling and the canonical form resolve.
+        # The stored doc's names array contains the canonical lowered form,
+        # which any lookup against lowered variants will match via the
+        # multikey index.
         self.assertEqual(
-            sf.resolve_by_name(cache, "lightning bolt")[0]["scryfall_id"], "id-lb"
-        )
-        self.assertEqual(
-            sf.resolve_by_name(cache, "LIGHTNING BOLT")[0]["scryfall_id"], "id-lb"
+            sf.find_cards_by_name(self.coll, "LIGHTNING BOLT")[0]["scryfall_id"],
+            "id-lb",
         )
 
-    def test_404_returns_false_and_leaves_cache_unchanged(self):
-        cache = {"cards": {}, "aliases": {}}
-        # fetch_card_raw_named returns None on 404.
+    def test_404_returns_false_and_leaves_collection_unchanged(self):
         with patch.object(sf, "fetch_card_raw_named", return_value=None):
-            changed = call_silent(sf.run_single_mode, "Unknown Card", cache, False)
+            changed = call_silent(sf.run_single_mode, "Unknown Card", self.coll, False)
         self.assertFalse(changed)
-        self.assertEqual(cache["cards"], {})
-        self.assertEqual(cache["aliases"], {})
+        self.assertEqual(self.coll.count_documents({}), 0)
 
     def test_http_error_returns_false_gracefully(self):
-        cache = {"cards": {}, "aliases": {}}
         err = HTTPError("url", 500, "Server Error", {}, None)
         with patch.object(sf, "fetch_card_raw_named", side_effect=err):
-            changed = call_silent(sf.run_single_mode, "Anything", cache, False)
+            changed = call_silent(sf.run_single_mode, "Anything", self.coll, False)
         self.assertFalse(changed)
 
 
@@ -728,8 +670,6 @@ class TestSingleMode(unittest.TestCase):
 # Bulk mode (all four download triggers + happy paths)
 # ---------------------------------------------------------------------------
 
-# Metadata dict returned by the mocked get_bulk_oracle_metadata across
-# all bulk-mode tests. Its updated_at is LATER.
 FAKE_META = {
     "type": "oracle_cards",
     "updated_at": LATER,
@@ -738,108 +678,94 @@ FAKE_META = {
 }
 
 
-class TestBulkMode(unittest.TestCase):
+class TestBulkMode(_MongoBackedTestCase):
 
-    def _cache(self):
-        return {"cards": {}, "aliases": {}}
-
-    def test_download_triggered_when_cache_empty(self):
-        cache = self._cache()
+    def test_download_triggered_when_collection_empty(self):
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(
                  sf, "download_bulk_oracle_cards",
                  return_value=[LIGHTNING_BOLT_RAW, SOL_RING_RAW],
              ) as dl:
             changed = call_silent(
-                sf.run_bulk_mode, ["Lightning Bolt", "Sol Ring"], cache, False
+                sf.run_bulk_mode, ["Lightning Bolt", "Sol Ring"], self.coll, False
             )
         dl.assert_called_once()
         self.assertTrue(changed)
-        self.assertEqual(len(cache["cards"]), 2)
+        self.assertEqual(self.coll.count_documents({}), 2)
 
     def test_download_skipped_when_all_requested_present_and_fresh(self):
-        cache = self._cache()
-        sf.store_card(cache, LIGHTNING_BOLT_RAW, updated_at=LATER)
-        sf.store_card(cache, SOL_RING_RAW, updated_at=LATER)
+        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW, SOL_RING_RAW], LATER)
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(sf, "download_bulk_oracle_cards") as dl:
             changed = call_silent(
-                sf.run_bulk_mode, ["Lightning Bolt", "Sol Ring"], cache, False
+                sf.run_bulk_mode, ["Lightning Bolt", "Sol Ring"], self.coll, False
             )
         dl.assert_not_called()
         self.assertFalse(changed)
 
     def test_download_triggered_when_any_requested_card_missing(self):
-        # Cache is fresh but doesn't cover Sol Ring — must download.
-        cache = self._cache()
-        sf.store_card(cache, LIGHTNING_BOLT_RAW, updated_at=LATER)
+        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=LATER)
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(
                  sf, "download_bulk_oracle_cards",
                  return_value=[LIGHTNING_BOLT_RAW, SOL_RING_RAW],
              ) as dl:
             changed = call_silent(
-                sf.run_bulk_mode, ["Lightning Bolt", "Sol Ring"], cache, False
+                sf.run_bulk_mode, ["Lightning Bolt", "Sol Ring"], self.coll, False
             )
         dl.assert_called_once()
         self.assertTrue(changed)
-        self.assertIn("id-sol-ring", cache["cards"])
+        self.assertIsNotNone(self.coll.find_one({"_id": "id-sol-ring"}))
 
-    def test_download_triggered_when_cache_has_stale_entries(self):
-        cache = self._cache()
-        # Everything requested IS in cache, but stamped older than snapshot.
-        sf.store_card(cache, LIGHTNING_BOLT_RAW, updated_at=EARLIER)
+    def test_download_triggered_when_collection_has_stale_entries(self):
+        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=EARLIER)
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(
                  sf, "download_bulk_oracle_cards",
                  return_value=[LIGHTNING_BOLT_RAW],
              ) as dl:
             changed = call_silent(
-                sf.run_bulk_mode, ["Lightning Bolt"], cache, False
+                sf.run_bulk_mode, ["Lightning Bolt"], self.coll, False
             )
         dl.assert_called_once()
         self.assertTrue(changed)
         # The stale entry was restamped with the snapshot timestamp.
-        self.assertEqual(cache["cards"]["id-lb"]["updated_at"], LATER)
+        self.assertEqual(
+            self.coll.find_one({"_id": "id-lb"})["updated_at"], LATER
+        )
 
     def test_refresh_forces_download_even_when_everything_current(self):
-        cache = self._cache()
-        sf.store_card(cache, LIGHTNING_BOLT_RAW, updated_at=LATER)
+        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=LATER)
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(
                  sf, "download_bulk_oracle_cards",
                  return_value=[LIGHTNING_BOLT_RAW],
              ) as dl:
-            call_silent(sf.run_bulk_mode, ["Lightning Bolt"], cache, True)
+            call_silent(sf.run_bulk_mode, ["Lightning Bolt"], self.coll, True)
         dl.assert_called_once()
 
-    def test_ambiguous_shared_face_name_ends_up_with_multiple_ids(self):
-        cache = self._cache()
+    def test_ambiguous_shared_face_name_matches_multiple_docs(self):
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(
                  sf, "download_bulk_oracle_cards",
                  return_value=[DELVER_RAW, DELVER_ART_RAW],
              ):
-            call_silent(sf.run_bulk_mode, ["Delver of Secrets"], cache, False)
-        matches = sf.resolve_by_name(cache, "Delver of Secrets")
+            call_silent(sf.run_bulk_mode, ["Delver of Secrets"], self.coll, False)
+        matches = sf.find_cards_by_name(self.coll, "Delver of Secrets")
         self.assertEqual(
             {m["scryfall_id"] for m in matches},
             {"id-delver", "id-delver-art"},
         )
 
     def test_unknown_card_after_fresh_merge_is_not_found(self):
-        # Empty cache, request includes a card that isn't in the bulk.
-        # The download runs (empty cache trigger), but "Nonexistent" still
-        # can't be resolved.
-        cache = self._cache()
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(
                  sf, "download_bulk_oracle_cards",
                  return_value=[LIGHTNING_BOLT_RAW],
              ):
-            call_silent(sf.run_bulk_mode, ["Lightning Bolt", "Nonexistent"], cache, False)
-        self.assertEqual(sf.resolve_by_name(cache, "Nonexistent"), [])
-        self.assertNotEqual(sf.resolve_by_name(cache, "Lightning Bolt"), [])
+            call_silent(sf.run_bulk_mode, ["Lightning Bolt", "Nonexistent"], self.coll, False)
+        self.assertEqual(sf.find_cards_by_name(self.coll, "Nonexistent"), [])
+        self.assertNotEqual(sf.find_cards_by_name(self.coll, "Lightning Bolt"), [])
 
 
 if __name__ == "__main__":
