@@ -65,6 +65,7 @@ dev = [
 scryfall-fetch = "mtg_recommender.scryfall_fetch:main"
 scryfall-fetch-tags = "mtg_recommender.oracle_tags:main"
 extract-oracle = "mtg_recommender.extract_oracle:main"
+mtg-inspect = "mtg_recommender.inspect:main"
 
 # -----------------------------------------------------------------------------
 # Hatchling-specific configuration
