@@ -9,18 +9,27 @@ A tool that takes a Magic: The Gathering decklist and recommends cards for it, g
 
 ## Current state
 
-- `scryfall_fetch.py` — fetches Scryfall oracle text for a card or decklist, caching to `cache/oracle_texts.json` (id-keyed, with a name-alias index). Chooses single-card vs. bulk-download mode automatically.
-- `extract_oracle.py` — writes a trimmed per-decklist subset of the cache for downstream consumers.
-- `test_scryfall_fetch.py` — offline unit tests; every HTTP call is mocked.
+Phase 1 is done. All reads and writes go through MongoDB; the on-disk JSON cache from early prototyping is gone.
+
+Modules under `src/mtg_recommender/`:
+
+- `storage.py` — Mongo client/config/indexes; owns `cards` + `tags` + `meta` collection handles and the two multikey indexes the fetchers depend on.
+- `scryfall_fetch.py` — Scryfall oracle-text fetcher (single + bulk modes) → `cards` collection. Carries `oracle_id` on every doc so tag import can join.
+- `oracle_tags.py` — oracle-tags bulk importer. Writes the slug-keyed catalog to `tags` and attaches `tags: [slug, ...]` arrays to every card.
+- `extract_oracle.py` — per-decklist JSON subset exporter for downstream consumers.
+- `inspect.py` — read-only inspection CLI (`card` / `tag` / `list` / `stats` subcommands).
+- `check.py` — Mongo health check (connectivity + indexes + counts).
+
+Tests: offline unittest + mongomock suite plus an opt-in integration suite (`tests/integration/`) that runs against a real cluster when `MONGODB_INTEGRATION_URI` is set. `justfile` wraps the common dev + CLI flows.
 
 ## Phases
 
-### Phase 1 — foundations
+### Phase 1 — foundations _(done)_
 
-- Oracle-text cache with scryfall-id identity + name-alias index. _(done)_
-- Decklist parser tolerant of Moxfield / Arena / MTGGoldfish exports. _(done)_
-- **Oracletag acquisition.** Pulled from the Scryfall `/bulk-data` endpoint (the tagger project's tags are published there alongside the oracle bulk files). Need to verify which bulk type carries them and in what shape before writing the import.
-- **MongoDB persistence.** Upload the fetched data (oracle text, oracletags, and later the embeddings) to **MongoDB Atlas** and make it the source of truth. Schema: **one wide document per card**, `_id = scryfall_id`, with `oracle_text`, `tags`, `text_embedding`, `tag_embedding`, etc. as fields on that document. The on-disk JSON cache (`cache/oracle_texts.json`) goes away once Mongo is wired up — no dual-write, no offline fallback.
+- Oracle-text store with scryfall-id identity and a multikey `names` index for alias lookup.
+- Decklist parser tolerant of Moxfield / Arena / MTGGoldfish exports.
+- Oracletag acquisition from Scryfall's `/bulk-data` endpoint (`oracle_tags` type), slug-keyed catalog, hierarchy preserved.
+- MongoDB persistence — `cards` + `tags` + `meta` collections, indexes created idempotently, snapshot timestamps tracked in `meta`.
 
 ### Phase 2 — card representation (next)
 
@@ -44,4 +53,8 @@ A tool that takes a Magic: The Gathering decklist and recommends cards for it, g
 
 ## Open questions
 
-_None blocking right now._
+### Phase 2 kickoff
+
+- **Encoder choice.** Off-the-shelf sentence-transformers (`all-MiniLM-L6-v2`, 384-dim; or `all-mpnet-base-v2`, 768-dim) vs. an MTG-fine-tuned model. Start off-the-shelf and only fine-tune if evaluation signal demands it.
+- **Where embeddings live.** A 384-dim float32 vector is ~1.5 KB per card doc on 38k cards (~60 MB). A 768-dim vector doubles that. Options: inline on the card doc (simplest, keeps the join free) vs. a sibling `embeddings` collection (keeps card docs lean for non-recommender reads). Inline is the default; revisit if doc size becomes a problem.
+- **`alpha` for the weighted fuse.** The text-vs-tag blend starts as a module-level constant; make it tunable before the recommender runs so we can sweep it against an evaluation set.
