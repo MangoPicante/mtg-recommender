@@ -54,8 +54,12 @@ A [`justfile`](justfile) wraps the common dev + CLI flows. Install
 [just](https://just.systems) and run `just` with no target to list recipes.
 `just install` runs the editable install above; `just test` runs the offline
 suite; `just lint` runs ruff; `just fetch`, `just tags`, `just check`,
-`just inspect`, `just extract`, `just embed` delegate to the console scripts
-with argument pass-through.
+`just inspect`, `just extract`, `just embed`, `just fuse` delegate to the
+console scripts with argument pass-through. `just populate` runs the whole
+`fetch → tag → embed → fuse` pipeline end-to-end — the single command that
+takes a cold Mongo cluster to a recommendation-ready state (slow on first
+run: embedding ~40k cards on CPU is a few minutes plus a one-time ~420 MB
+sentence-transformers download).
 
 ### MongoDB
 
