@@ -218,29 +218,9 @@ The subset drops Mongo bookkeeping (`_id`, `names`, `updated_at`, `oracle_id`,
 python -m unittest discover tests
 ```
 
-Every HTTP call is mocked; every Mongo op routes through `mongomock`. 184
-offline tests, well under a second total — no network, no real Mongo required.
-
-### Integration tests (opt-in)
-
-A small suite under `tests/integration/` exercises the real pymongo driver
-against a real Mongo cluster. These tests silently skip unless
-`MONGODB_INTEGRATION_URI` is set — pointing them at your Atlas cluster is
-safe because each test class creates a disposable uuid-suffixed database and
-drops it on teardown:
-
-```bash
-# bash/zsh:
-MONGODB_INTEGRATION_URI="mongodb+srv://..." python -m unittest discover tests
-
-# PowerShell:
-$env:MONGODB_INTEGRATION_URI = "mongodb+srv://..."
-python -m unittest discover tests
-```
-
-Nine integration tests cover connectivity, `ensure_indexes`, card
-round-tripping, tag attachment, and the meta timestamp — see
-`tests/integration/test_mongo_integration.py` for the full list.
+Every HTTP call is mocked; every Mongo op routes through `mongomock`. Full
+suite runs in well under a second — no network, no real Mongo required. For
+real-cluster coverage, run `mtg-check` against your own `MONGODB_URI`.
 
 ## Project layout
 
@@ -263,9 +243,7 @@ mtg-recommender/
 │   ├── test_explore.py
 │   ├── test_check.py
 │   ├── test_extract_oracle.py
-│   ├── test_embeddings.py
-│   └── integration/             # opt-in; needs MONGODB_INTEGRATION_URI
-│       └── test_mongo_integration.py
+│   └── test_embeddings.py
 ├── pyproject.toml               # PEP 621 metadata, build config, entry points
 ├── justfile                     # task runner for the common dev + CLI flows
 ├── .env.example                 # template; copy to .env + fill in MONGODB_URI

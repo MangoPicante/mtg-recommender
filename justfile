@@ -44,11 +44,6 @@ test:
 test-verbose:
     python -m unittest discover tests -v
 
-# Run only the integration suite (needs MONGODB_INTEGRATION_URI, typically in .env).
-test-integration:
-    python -m unittest discover tests/integration -v
-
-
 # Verify the Mongo cluster is reachable and healthy (`mtg-check` wrapper).
 check *ARGS:
     mtg-check {{ARGS}}

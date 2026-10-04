@@ -20,7 +20,7 @@ Modules under `src/mtg_recommender/`:
 - `explore.py` — read-only inspection CLI, invoked as `mtg-inspect` (`card` / `tag` / `list` / `stats` subcommands).
 - `check.py` — Mongo health check (connectivity + indexes + counts).
 
-Tests: offline unittest + mongomock suite plus an opt-in integration suite (`tests/integration/`) that runs against a real cluster when `MONGODB_INTEGRATION_URI` is set. `justfile` wraps the common dev + CLI flows.
+Tests: offline unittest + mongomock suite only — no integration suite. `mtg-check` serves as the real-cluster smoke. `justfile` wraps the common dev + CLI flows.
 
 ## Phases
 

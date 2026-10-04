@@ -1,9 +1,8 @@
 name: CI
 
-# Lint + offline test suite on every push to main and every PR.
-# The integration tests under tests/integration/ are deliberately not run
-# in CI — they need a MONGODB_INTEGRATION_URI we're not willing to put in
-# a repository secret for this project.
+# Lint + offline test suite on every push to main and every PR. The
+# project has no integration suite — real-cluster coverage is `mtg-check`,
+# run locally against the user's own MONGODB_URI.
 
 on:
   push:
