@@ -59,13 +59,14 @@ dev = [
     "mongomock>=4.1",
 ]
 
-# Console scripts exposed by `pip install`. All three main() functions return
-# int exit codes, so the generated wrappers propagate those to the shell.
+# Console scripts exposed by `pip install`. Every main() returns an int exit
+# code, so the generated wrappers propagate those to the shell.
 [project.scripts]
 scryfall-fetch = "mtg_recommender.scryfall_fetch:main"
 scryfall-fetch-tags = "mtg_recommender.oracle_tags:main"
 extract-oracle = "mtg_recommender.extract_oracle:main"
 mtg-inspect = "mtg_recommender.inspect:main"
+mtg-check = "mtg_recommender.check:main"
 
 # -----------------------------------------------------------------------------
 # Hatchling-specific configuration
