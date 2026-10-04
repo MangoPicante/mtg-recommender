@@ -17,7 +17,7 @@ Modules under `src/mtg_recommender/`:
 - `scryfall_fetch.py` — Scryfall oracle-text fetcher (single + bulk modes) → `cards` collection. Carries `oracle_id` on every doc so tag import can join.
 - `oracle_tags.py` — oracle-tags bulk importer. Writes the slug-keyed catalog to `tags` and attaches `tags: [slug, ...]` arrays to every card.
 - `extract_oracle.py` — per-decklist JSON subset exporter for downstream consumers.
-- `inspect.py` — read-only inspection CLI (`card` / `tag` / `list` / `stats` subcommands).
+- `explore.py` — read-only inspection CLI, invoked as `mtg-inspect` (`card` / `tag` / `list` / `stats` subcommands).
 - `check.py` — Mongo health check (connectivity + indexes + counts).
 
 Tests: offline unittest + mongomock suite plus an opt-in integration suite (`tests/integration/`) that runs against a real cluster when `MONGODB_INTEGRATION_URI` is set. `justfile` wraps the common dev + CLI flows.

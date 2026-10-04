@@ -17,7 +17,7 @@ Usage (after `pip install -e .`):
     mtg-inspect stats
 
 Equivalently from a source checkout:
-    python -m mtg_recommender.inspect card "Wrath of God"
+    python -m mtg_recommender.explore card "Wrath of God"
 """
 from __future__ import annotations
 

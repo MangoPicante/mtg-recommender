@@ -65,7 +65,7 @@ dev = [
 scryfall-fetch = "mtg_recommender.scryfall_fetch:main"
 scryfall-fetch-tags = "mtg_recommender.oracle_tags:main"
 extract-oracle = "mtg_recommender.extract_oracle:main"
-mtg-inspect = "mtg_recommender.inspect:main"
+mtg-inspect = "mtg_recommender.explore:main"
 mtg-check = "mtg_recommender.check:main"
 
 # -----------------------------------------------------------------------------
