@@ -1,6 +1,11 @@
 # Scryfall cache (regenerated locally)
 cache/
 
+# Default output of extract_oracle.py — regeneratable from the cache, so no
+# reason to track it. Named outputs the user chose explicitly (-o foo.json)
+# are NOT covered by this rule; add those by hand if desired.
+oracle_subset.json
+
 # Python
 __pycache__/
 *.py[cod]
