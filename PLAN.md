@@ -31,12 +31,12 @@ Tests: offline unittest + mongomock suite plus an opt-in integration suite (`tes
 - Oracletag acquisition from Scryfall's `/bulk-data` endpoint (`oracle_tags` type), slug-keyed catalog, hierarchy preserved.
 - MongoDB persistence — `cards` + `tags` + `meta` collections, indexes created idempotently, snapshot timestamps tracked in `meta`.
 
-### Phase 2 — card representation (next)
+### Phase 2 — card representation (in progress)
 
-- **Oracle-text embeddings.** Embed each card's oracle text into a vector. Pick an encoder (sentence-transformers off-the-shelf vs. an MTG-token-aware fine-tune).
-- **Oracletag embeddings + clustering.** Embed each unique oracletag and cluster them so semantically-similar tags (e.g. "removal" / "destroy creature" / "exile creature") land near each other. Lets us treat a tag as "this + its neighbours" rather than as an opaque string.
-- **Combined card vector.** Fuse the oracle-text embedding with the aggregated tag embedding into one vector per card via **weighted average** (`alpha * text_vec + (1 - alpha) * tag_vec`). Requires the two embedding spaces to share dimensionality; `alpha` starts as a tunable constant and can be revisited once we have evaluation signal.
-- Persist embeddings on the card's Mongo document; regenerate when `updated_at` or the card's tag set changes.
+- **Oracle-text embeddings.** _(done)_ Each card's `oracle_text` is encoded via `sentence-transformers/all-mpnet-base-v2` (768-dim) and persisted as `text_embedding` on the card doc. Encoder is overridable through the `MTG_EMBEDDING_MODEL` env var. The CLI (`mtg-embed cards`) skips docs that already carry a vector; `--refresh` re-embeds.
+- **Oracletag embeddings.** _(done)_ Each tag's `label + description` is encoded with the same model and persisted as `embedding` on the tag doc. `mtg-embed tags` runs the same skip / `--refresh` pattern. Clustering of these embeddings — "treat a tag as this + its neighbours" — is the next sub-step.
+- **Combined card vector.** _(next)_ Fuse `text_embedding` with the aggregated tag embedding into one vector per card via **weighted average** (`alpha * text_vec + (1 - alpha) * tag_vec`). Requires both spaces to share dimensionality (they do — same encoder); `alpha` starts as a tunable constant.
+- **Freshness.** Still TODO — regenerate `text_embedding` when `updated_at` moves and `card_vector` when either input changes. For v1 the user runs `mtg-embed --refresh` manually; auto-invalidation lands with the fuse step.
 
 ### Phase 3 — recommendation
 

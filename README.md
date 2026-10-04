@@ -22,8 +22,9 @@ Under `src/mtg_recommender/`:
 | `scryfall_fetch` | Fetches Scryfall oracle text for one card or a decklist into the `cards` collection. Switches between `/cards/named` (single card) and the oracle-cards bulk download (2+ cards) automatically. Each card document is keyed by `scryfall_id` with a `names: [lowered, ...]` array for alias lookup. The `tags` field is left for `oracle_tags` to populate. |
 | `oracle_tags` | Downloads the Scryfall oracle-tags bulk, writes a slug-keyed catalog to the `tags` collection (hierarchy + aliases + descriptions preserved), and attaches `tags: [slug, ...]` arrays to each card by joining on `oracle_id`. |
 | `extract_oracle` | Writes a trimmed per-decklist JSON subset of the cards collection for downstream consumers that don't speak Mongo. |
-| `inspect` | Read-only ad-hoc inspection CLI. Subcommands: `card`, `tag`, `list`, `stats`. Human-readable output for one-off exploration and debugging. |
+| `explore` | Read-only ad-hoc inspection CLI (installed as `mtg-inspect`). Subcommands: `card`, `tag`, `list`, `stats`. Human-readable output for one-off exploration and debugging. |
 | `check` | Read-only health check. Pings the Mongo server, verifies the configured database + indexes, and reports a doc count per collection. Exit 0 on success, 1 if any check fails. |
+| `embeddings` | Phase 2. Encodes each card's `oracle_text` into `text_embedding` on the card doc and each tag's label+description into `embedding` on the tag doc. Uses `sentence-transformers/all-mpnet-base-v2` (768-dim) by default; `MTG_EMBEDDING_MODEL` env var overrides. |
 
 Tests live under `tests/` and are offline — every HTTP call is mocked, every
 Mongo op goes through `mongomock`.
@@ -53,8 +54,8 @@ A [`justfile`](justfile) wraps the common dev + CLI flows. Install
 [just](https://just.systems) and run `just` with no target to list recipes.
 `just install` runs the editable install above; `just test` runs the offline
 suite; `just lint` runs ruff; `just fetch`, `just tags`, `just check`,
-`just inspect`, `just extract` delegate to the console scripts with argument
-pass-through.
+`just inspect`, `just extract`, `just embed` delegate to the console scripts
+with argument pass-through.
 
 ### MongoDB
 
@@ -148,6 +149,38 @@ mtg-inspect stats --top 20                  # top-N tag aggregation
 Output is human-readable text — use `extract-oracle` for a machine-readable
 JSON subset. Nothing in this CLI writes to Mongo.
 
+### Embed cards and tags (Phase 2)
+
+The embedding path is opt-in because `sentence-transformers` pulls in `torch`
+(~1 GB download). Install the extra once:
+
+```bash
+pip install -e ".[embeddings]"
+```
+
+Then encode:
+
+```bash
+# Default: embed every card whose oracle_text isn't already encoded.
+mtg-embed cards
+
+# Same for tags. The text fed to the encoder is "<label>. <description>".
+mtg-embed tags
+
+# Re-embed everything (expensive — all-mpnet-base-v2 ~runs minutes on CPU
+# across the full ~40k-card snapshot).
+mtg-embed cards --refresh
+
+# Smoke-test with a cap before committing to the full encode:
+mtg-embed cards --limit 50
+```
+
+Vectors land as `list[float]` on the card doc (`text_embedding`) and the tag
+doc (`embedding`). Default model is `sentence-transformers/all-mpnet-base-v2`
+(768-dim); override via the `MTG_EMBEDDING_MODEL` env var without touching
+code. The weighted-average fuse into a single `card_vector` is the next
+Phase 2 slice.
+
 ### Extract a decklist subset
 
 ```bash
@@ -168,7 +201,7 @@ The subset drops Mongo bookkeeping (`_id`, `names`, `updated_at`, `oracle_id`,
 python -m unittest discover tests
 ```
 
-Every HTTP call is mocked; every Mongo op routes through `mongomock`. 145
+Every HTTP call is mocked; every Mongo op routes through `mongomock`. 184
 offline tests, well under a second total — no network, no real Mongo required.
 
 ### Integration tests (opt-in)
@@ -204,13 +237,16 @@ mtg-recommender/
 │       ├── oracle_tags.py       # oracle-tags importer -> tags collection + attach
 │       ├── extract_oracle.py    # per-decklist JSON subset exporter
 │       ├── explore.py           # read-only ad-hoc inspection CLI (mtg-inspect)
-│       └── check.py             # read-only Mongo health check
+│       ├── check.py             # read-only Mongo health check
+│       └── embeddings.py        # Phase 2 encoder + mtg-embed CLI
 ├── tests/
 │   ├── test_storage.py          # offline, mongomock-backed
 │   ├── test_scryfall_fetch.py
 │   ├── test_oracle_tags.py
 │   ├── test_explore.py
 │   ├── test_check.py
+│   ├── test_extract_oracle.py
+│   ├── test_embeddings.py
 │   └── integration/             # opt-in; needs MONGODB_INTEGRATION_URI
 │       └── test_mongo_integration.py
 ├── pyproject.toml               # PEP 621 metadata, build config, entry points
