@@ -42,10 +42,11 @@ dependencies = []
 [project.optional-dependencies]
 dev = []
 
-# Console scripts exposed by `pip install`. Both main() functions already return
+# Console scripts exposed by `pip install`. All three main() functions return
 # int exit codes, so the generated wrappers propagate those to the shell.
 [project.scripts]
 scryfall-fetch = "mtg_recommender.scryfall_fetch:main"
+scryfall-fetch-tags = "mtg_recommender.oracle_tags:main"
 extract-oracle = "mtg_recommender.extract_oracle:main"
 
 # -----------------------------------------------------------------------------
