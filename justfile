@@ -6,10 +6,17 @@
 # recipes delegate to. Pass extra flags through to the underlying CLIs;
 # each CLI's `--help` is the authoritative reference.
 #
-# Recipes run through bash. On Windows this points at Git Bash, which
-# ships with git-for-windows and is on PATH by default.
+# Recipes use POSIX-shell syntax. On Windows we point at `sh` rather
+# than `bash.exe`: `bash.exe` on PATH almost always resolves to the WSL
+# shim at C:\Windows\System32\bash.exe, which fails with
+# `execvpe(/bin/bash)` when no WSL distro is installed. Windows ships
+# no System32-level `sh.exe`, so `sh` on PATH reliably picks up Git
+# for Windows's POSIX shell (`C:\Program Files\Git\bin\sh.exe`) — and
+# scoop/choco installs of just pull Git Bash in automatically. If
+# `sh` is missing from PATH, add Git's bin dir to PATH or install
+# Git for Windows.
 
-set windows-shell := ["bash.exe", "-c"]
+set windows-shell := ["sh", "-c"]
 
 
 # List every recipe (default when no target is given).
