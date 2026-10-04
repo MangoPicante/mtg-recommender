@@ -28,19 +28,32 @@ classifiers = [
     "Topic :: Games/Entertainment",
 ]
 
-# Intentionally empty — the current modules are stdlib-only. Dependencies will
-# arrive as later phases land; see PLAN.md.
+# Runtime deps for Phase 1 persistence. Kept minimal; heavier embedding libs
+# arrive in Phase 2.
 #
 # Expected additions:
-#   Phase 1 (persistence) — pymongo, python-dotenv
-#   Phase 2 (embeddings)  — sentence-transformers (pulls torch), numpy, scikit-learn
-dependencies = []
+#   Phase 2 (embeddings) — sentence-transformers (pulls torch), numpy, scikit-learn
+dependencies = [
+    # pymongo >=4.6 is the current LTS line; aligns with Atlas 7.x and ships
+    # the Stable API v1 bits that make server-version drift painless.
+    "pymongo>=4.6",
+    # python-dotenv lets `pip install -e .` + a local .env file "just work"
+    # for CLI runs. The storage module falls back to os.environ when dotenv
+    # isn't installed, so this is optional-but-nice; keeping it in runtime
+    # deps because the user flow depends on it.
+    "python-dotenv>=1.0",
+]
 
 # Optional extras let a user opt into heavier dep groups:
 #   pip install -e ".[dev]"
-# Add new groups here as they become needed (`mongo`, `embeddings`, etc.).
+# Add new groups here as they become needed (`embeddings`, etc.).
 [project.optional-dependencies]
-dev = []
+dev = [
+    # mongomock provides an in-memory pymongo-compatible Mongo client. The
+    # test suite uses it to keep every test offline and fast; it is not
+    # imported by any runtime code.
+    "mongomock>=4.1",
+]
 
 # Console scripts exposed by `pip install`. All three main() functions return
 # int exit codes, so the generated wrappers propagate those to the shell.
