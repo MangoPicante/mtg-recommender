@@ -52,8 +52,9 @@ pip install -e ".[dev]"
 A [`justfile`](justfile) wraps the common dev + CLI flows. Install
 [just](https://just.systems) and run `just` with no target to list recipes.
 `just install` runs the editable install above; `just test` runs the offline
-suite; `just fetch`, `just tags`, `just check`, `just inspect`, `just extract`
-delegate to the console scripts with argument pass-through.
+suite; `just lint` runs ruff; `just fetch`, `just tags`, `just check`,
+`just inspect`, `just extract` delegate to the console scripts with argument
+pass-through.
 
 ### MongoDB
 

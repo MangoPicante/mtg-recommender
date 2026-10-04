@@ -22,7 +22,6 @@ from pymongo.errors import PyMongoError
 
 from . import storage
 
-
 # Indexes the rest of the package relies on. Keep in sync with
 # `storage.ensure_indexes` — the check is the inverse of that function.
 _REQUIRED_CARDS_INDEXES = ("names_lookup", "oracle_id_lookup")

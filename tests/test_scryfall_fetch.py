@@ -40,7 +40,6 @@ import mongomock
 from mtg_recommender import scryfall_fetch as sf
 from mtg_recommender import storage
 
-
 # ---------------------------------------------------------------------------
 # Fixture data
 # ---------------------------------------------------------------------------

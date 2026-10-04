@@ -30,16 +30,12 @@ import io
 import json
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 import mongomock
 
 from mtg_recommender import oracle_tags as ot
-from mtg_recommender import scryfall_fetch as sf
 from mtg_recommender import storage
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
