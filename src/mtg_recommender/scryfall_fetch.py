@@ -550,16 +550,6 @@ def run_bulk_mode(coll: Collection) -> bool:
     cards_present = coll.estimated_document_count() > 0
     stored_snapshot = storage.get_snapshot_timestamp(META_SOURCE)
 
-    # One-shot migration: `scryfall_id` used to be stored as a duplicate
-    # of `_id` on every card. Writes no longer carry it, so unchanged
-    # cards from before this change still have it. $unset-ing on every
-    # CLI run is self-healing — the first run after upgrade cleans the
-    # cluster; every run after that is a 0-match no-op.
-    coll.update_many(
-        {"scryfall_id": {"$exists": True}},
-        {"$unset": {"scryfall_id": ""}},
-    )
-
     # Fast path: meta says we're already covering this snapshot.
     if cards_present and stored_snapshot == snapshot_updated_at:
         print(f"bulk  : already fresh (snapshot {snapshot_updated_at})")
