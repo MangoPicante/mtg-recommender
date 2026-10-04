@@ -21,14 +21,21 @@ encoder.
 
 Mongo storage:
 
-    cards.text_embedding : list[float]   # one entry per oracle_text embed
-    cards.card_vector    : list[float]   # fused text + aggregated tag vector
-    tags.embedding       : list[float]   # one entry per label+description embed
+    cards.text_embedding : BSON Binary    # packed float32 bytes
+    cards.card_vector    : BSON Binary    # packed float32 bytes
+    tags.embedding       : BSON Binary    # packed float32 bytes
 
-Vectors are stored as plain BSON double arrays (what pymongo serialises
-`list[float]` as). That costs ~8 bytes per dim, so a 768-dim vector adds
-~6 KB per doc; 38k cards is ~230 MB total. Compact enough that we don't
-need to reach for BSON Binary with float32 yet.
+Vectors are stored as BSON Binary (subtype 0) containing packed
+little-endian float32 — the native dtype sentence-transformers models
+produce. A 768-dim vector is 3 KB per doc instead of the 6 KB a BSON
+double array would take, which matters on Atlas's free tier (text +
+card_vector together land at ~240 MB on a 40 k-card cluster instead
+of the ~490 MB a float64 round-trip would require). Lossless relative
+to what the encoder actually computes.
+
+`_unpack_embedding` accepts the legacy `list[float]` shape too, so a
+cluster populated before this change keeps reading correctly until
+the next re-embed pass overwrites each entry with the packed form.
 
 Usage (after `pip install -e .`):
 
@@ -56,6 +63,7 @@ import sys
 from typing import Iterable, Optional
 
 import numpy as np
+from bson import Binary
 from pymongo import UpdateOne
 from pymongo.collection import Collection
 
@@ -81,6 +89,49 @@ DEFAULT_LOG_EVERY = 500
 # aggregate pull similar cards together. Tunable per invocation via
 # `mtg-embed fuse --alpha`; a sweep over an evaluation set is a Phase 3 task.
 DEFAULT_ALPHA = 0.6
+
+
+# ---------------------------------------------------------------------------
+# Storage format: BSON Binary of packed float32
+# ---------------------------------------------------------------------------
+
+def _pack_embedding(vec: np.ndarray) -> Binary:
+    """Serialise a numpy vector as BSON Binary of little-endian float32.
+
+    sentence-transformers models output float32 natively; the previous
+    `list[float]` → BSON-double path padded every entry to 8 bytes for
+    no gain. Packing the raw float32 bytes halves embedding storage
+    without any precision loss relative to what the encoder produced.
+    BSON subtype 0 (generic binary) is the default and the right fit —
+    we're not using a UUID or any other typed binary.
+    """
+    return Binary(np.ascontiguousarray(vec, dtype=np.float32).tobytes())
+
+
+def _unpack_embedding(stored) -> np.ndarray:
+    """Return a float64 numpy array regardless of how the embedding was stored.
+
+    Two shapes may appear in the wild:
+
+      - `bytes` / `bson.Binary` (current format) — packed float32 bytes.
+        `np.frombuffer` is zero-copy, then we upcast to float64 so
+        downstream math (cosine sim, mean, normalise) matches the
+        existing fuse pipeline.
+      - `list[float]` (legacy, pre-float32-storage) — BSON double array.
+        Still readable so a cluster populated before this change keeps
+        working until the next re-embed pass overwrites each entry.
+
+    Anything else is a bug (bad data, wrong field) and gets a loud
+    TypeError rather than being coerced silently.
+    """
+    if isinstance(stored, (bytes, bytearray, memoryview, Binary)):
+        return np.frombuffer(bytes(stored), dtype=np.float32).astype(np.float64)
+    if isinstance(stored, list):
+        return np.array(stored, dtype=np.float64)
+    raise TypeError(
+        f"unexpected embedding storage type {type(stored).__name__}; "
+        "expected bytes/Binary (current format) or list[float] (legacy)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +310,7 @@ def _run_embed_loop(
             convert_to_numpy=True,
         )
         ops = [
-            UpdateOne({"_id": sid}, {"$set": {field: vec.tolist()}})
+            UpdateOne({"_id": sid}, {"$set": {field: _pack_embedding(vec)}})
             for sid, vec in zip(batch_ids, vectors)
         ]
         coll.bulk_write(ops, ordered=False)
@@ -339,10 +390,11 @@ def _load_tag_embeddings(tags_coll: Collection) -> dict[str, np.ndarray]:
 
     The tag catalog is small (~2k entries), so holding it in memory for
     the fuse pass is trivial — much cheaper than one Mongo round-trip
-    per card.
+    per card. `_unpack_embedding` handles both the current float32-packed
+    bytes and legacy list[float] shape.
     """
     return {
-        doc["_id"]: np.array(doc["embedding"], dtype=np.float64)
+        doc["_id"]: _unpack_embedding(doc["embedding"])
         for doc in tags_coll.find(
             {"embedding": {"$exists": True}}, {"_id": 1, "embedding": 1}
         )
@@ -412,7 +464,7 @@ def fuse_card_vectors(
         return n
 
     for doc in cursor:
-        text_vec = np.array(doc["text_embedding"], dtype=np.float64)
+        text_vec = _unpack_embedding(doc["text_embedding"])
         tag_slugs = doc.get("tags") or []
         tag_vec = _aggregate_tag_vector(tag_slugs, tag_embeddings)
         if tag_vec is not None and tag_vec.shape != text_vec.shape:
@@ -425,7 +477,7 @@ def fuse_card_vectors(
             )
         fused = _fuse_vectors(text_vec, tag_vec, alpha)
         batch_ops.append(
-            UpdateOne({"_id": doc["_id"]}, {"$set": {"card_vector": fused.tolist()}})
+            UpdateOne({"_id": doc["_id"]}, {"$set": {"card_vector": _pack_embedding(fused)}})
         )
         if len(batch_ops) >= batch_size:
             done += flush()

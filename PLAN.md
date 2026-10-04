@@ -56,5 +56,5 @@ Tests: offline unittest + mongomock suite only — no integration suite. `mtg-ch
 ### Phase 2 kickoff
 
 - **Encoder choice.** Off-the-shelf sentence-transformers (`all-MiniLM-L6-v2`, 384-dim; or `all-mpnet-base-v2`, 768-dim) vs. an MTG-fine-tuned model. Start off-the-shelf and only fine-tune if evaluation signal demands it.
-- **Where embeddings live.** A 384-dim float32 vector is ~1.5 KB per card doc on 38k cards (~60 MB). A 768-dim vector doubles that. Options: inline on the card doc (simplest, keeps the join free) vs. a sibling `embeddings` collection (keeps card docs lean for non-recommender reads). Inline is the default; revisit if doc size becomes a problem.
+- **Where embeddings live.** _(answered)_ Inline on the card doc, stored as BSON Binary of packed little-endian float32 — 4 bytes per dim instead of the 8 a BSON double array takes. A 768-dim text + card_vector pair lands at ~240 MB on 40k cards (fits Atlas's free tier); the sibling-collection variant was ruled out because downstream reads always want the card + its vector together, so the join would be pure cost.
 - **`alpha` for the weighted fuse.** The text-vs-tag blend starts as a module-level constant; make it tunable before the recommender runs so we can sweep it against an evaluation set.
