@@ -7,10 +7,14 @@ for the full roadmap.
 
 ## Current state
 
-Phase 1 is done: Scryfall oracle text and oracle tags both land in MongoDB
-Atlas (two collections, `cards` and `tags`, with a `meta` collection for
-snapshot timestamps). Everything downstream — embeddings, recommendation,
-UI — is still TODO.
+Phases 1 and 2 are done. Scryfall oracle text and tags land in MongoDB
+Atlas; every card has a 768-dim `text_embedding`, every tag has an
+`embedding`, and each card carries a fused `card_vector` ready for
+similarity search. Phase 3 has started: the EDHREC JSON client is in
+(`edhrec_fetch` module, cached per commander in a new `edhrec` collection
+with a 7-day TTL); still TODO are per-deck tag clustering, cluster
+evaluation against EDHREC lift, candidate ranking, and the `recommend`
+CLI. See [PLAN.md](PLAN.md) for the full Phase 3 roadmap.
 
 ### Modules
 
@@ -32,8 +36,9 @@ Mongo op goes through `mongomock`.
 
 ## Setup
 
-Python 3.10+ is required. The package has two runtime dependencies today
-(`pymongo`, `python-dotenv`); heavier libraries arrive with Phase 2 embeddings.
+Python 3.10+ is required. Runtime dependencies: `pymongo`, `python-dotenv`,
+and `sentence-transformers` (which pulls `torch`, ~1 GB on first install —
+needed for the Phase 2 encoder).
 
 ```bash
 # recommended: isolated venv
@@ -66,7 +71,7 @@ Scryfall snapshot are near-instant).
 
 ### MongoDB
 
-The three CLIs read and write via MongoDB — set up Atlas (or any
+Every CLI reads and writes via MongoDB — set up Atlas (or any
 pymongo-compatible Mongo) and plug the connection string into `.env`:
 
 ```bash
@@ -77,9 +82,12 @@ cp .env.example .env
 
 `.env` is gitignored; `.env.example` is the checked-in template.
 
-Collections (`cards`, `tags`, `meta`) and their indexes are created on first
-run — no separate migration step. See the docstring of `storage.py` for the
-full document schemas.
+Collections (`cards`, `tags`, `meta`, `edhrec`) and their indexes are
+created on first run — no separate migration step. See the docstring of
+`storage.py` for the full document schemas. `meta` holds both snapshot
+timestamps (from `scryfall-fetch` / `scryfall-fetch-tags`) and
+embedding-config signatures (from `mtg-embed`'s auto-invalidation);
+`edhrec` holds the per-commander payload cache for Phase 3.
 
 ### Verifying your cluster
 
@@ -96,9 +104,11 @@ the error you care about shows up first.
 
 ## Usage
 
-All three CLIs are installed as console scripts by `pip install -e .`.
-Equivalent `python -m mtg_recommender.<module>` forms also work from a source
-checkout.
+The console scripts (`scryfall-fetch`, `scryfall-fetch-tags`, `mtg-embed`,
+`mtg-inspect`, `mtg-check`, `extract-oracle`) are installed by
+`pip install -e .`. Equivalent `python -m mtg_recommender.<module>` forms
+also work from a source checkout. Phase 3's `edhrec_fetch` ships as a
+library only for now — the recommender CLI will land in a follow-up PR.
 
 ### Fetch oracle text
 
@@ -241,6 +251,37 @@ The subset drops Mongo bookkeeping (`_id`, `names`, `updated_at`, `oracle_id`,
 `tags`) and keeps the downstream-facing fields (`name`, `mana_cost`,
 `type_line`, `oracle_text`, `scryfall_id`).
 
+### EDHREC commander signals (Phase 3)
+
+The `edhrec_fetch` module pulls per-commander card signals from EDHREC's
+public, keyless JSON API at `json.edhrec.com`. No CLI yet — this is a
+library used by the Phase 3 recommender. Example from Python:
+
+```python
+from mtg_recommender import edhrec_fetch as ef
+
+# One HTTP round trip the first time, Mongo cache (7-day TTL) thereafter.
+signals = ef.get_commander_signals("Atraxa, Praetors' Voice")
+
+# Each signal: name, scryfall_id, lift, synergy, num_decks,
+# potential_decks, trend_zscore, inclusion_rate (computed property).
+top_by_lift = sorted(signals, key=lambda s: s.lift, reverse=True)[:10]
+for s in top_by_lift:
+    print(f"{s.name:<40} lift={s.lift:>5.2f}  decks={s.num_decks:>5}")
+```
+
+The response is cached in the `edhrec` Mongo collection keyed by commander
+slug. Pass `force=True` to bypass the cache. Set `EDHREC_CACHE_TTL_DAYS`
+to override the default 7-day TTL (set lower during active development).
+
+**Scope:** single-name commanders. Partner / background commanders use a
+different URL shape on EDHREC and are deferred to a follow-up helper.
+
+**Why direct JSON, not `pyedhrec`:** that wrapper hasn't shipped since Feb
+2024 and doesn't expose `lift` (which EDHREC promoted to its primary metric
+in late 2026). Hitting `json.edhrec.com` ourselves is ~200 lines of code,
+one fewer transitive dep, and gives us the signals we actually need.
+
 ## Testing
 
 ```bash
@@ -264,7 +305,8 @@ mtg-recommender/
 │       ├── extract_oracle.py    # per-decklist JSON subset exporter
 │       ├── explore.py           # read-only ad-hoc inspection CLI (mtg-inspect)
 │       ├── check.py             # read-only Mongo health check
-│       └── embeddings.py        # Phase 2 encoder + mtg-embed CLI
+│       ├── embeddings.py        # Phase 2 encoder + mtg-embed CLI
+│       └── edhrec_fetch.py      # Phase 3 EDHREC JSON client + per-commander cache
 ├── tests/
 │   ├── test_storage.py          # offline, mongomock-backed
 │   ├── test_scryfall_fetch.py
@@ -272,7 +314,10 @@ mtg-recommender/
 │   ├── test_explore.py
 │   ├── test_check.py
 │   ├── test_extract_oracle.py
-│   └── test_embeddings.py
+│   ├── test_embeddings.py
+│   ├── test_edhrec_fetch.py
+│   └── fixtures/                # trimmed sample payloads used by HTTP-mocked tests
+│       └── edhrec_atraxa_trimmed.json
 ├── pyproject.toml               # PEP 621 metadata, build config, entry points
 ├── justfile                     # task runner for the common dev + CLI flows
 ├── .env.example                 # template; copy to .env + fill in MONGODB_URI
