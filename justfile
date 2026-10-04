@@ -43,7 +43,7 @@ lint:
 lint-fix:
     ruff check . --fix
 
-# Run the offline test suite (set MONGODB_INTEGRATION_URI for the real suite).
+# Run the offline test suite.
 test:
     python -m unittest discover tests
 
@@ -77,6 +77,14 @@ embed-smoke:
 
 # Fuse text + aggregated tag embeddings into card_vector (`mtg-embed fuse` wrapper).
 fuse *ARGS:
+    mtg-embed fuse {{ARGS}}
+
+# Populate Mongo end-to-end: fetch → tag → embed cards + tags → fuse. Idempotent (reruns skip work the collection already covers); --refresh forces every step.
+populate *ARGS:
+    scryfall-fetch {{ARGS}}
+    scryfall-fetch-tags {{ARGS}}
+    mtg-embed cards {{ARGS}}
+    mtg-embed tags {{ARGS}}
     mtg-embed fuse {{ARGS}}
 
 # Export a trimmed JSON subset for a decklist file (`extract-oracle` wrapper).
