@@ -30,6 +30,7 @@ Under `src/mtg_recommender/`:
 | `check` | Read-only health check. Pings the Mongo server, verifies the configured database + indexes, and reports a doc count per collection. Exit 0 on success, 1 if any check fails. |
 | `embeddings` | Phase 2. Encodes each card's `oracle_text` into `text_embedding` on the card doc and each tag's label+description into `embedding` on the tag doc; also fuses the two into a single unit `card_vector` per card via a weighted average (`alpha * text + (1 - alpha) * tag`, defaults to `alpha=0.6`). Uses `sentence-transformers/all-mpnet-base-v2` (768-dim) by default; `MTG_EMBEDDING_MODEL` env var overrides. |
 | `edhrec_fetch` | Phase 3. Thin client over EDHREC's public keyless JSON API at `json.edhrec.com`. Fetches per-commander card signals (lift, synergy, inclusion rate, trend) and caches the payload in the `edhrec` Mongo collection with a 7-day TTL. Each signal carries a Scryfall UUID so joining back to our `cards` collection is a direct `_id` lookup. |
+| `deck_profile` | Phase 3. Given a decklist, resolves cards against the `names` index, unions their tag slugs, loads tag embeddings, and clusters them into themes via `sklearn.cluster.HDBSCAN` (cosine metric). Returns a `DeckProfile` carrying per-cluster unit centroids + member tags + deck-card membership. Labels each cluster with the tag closest to its centroid. |
 
 Tests live under `tests/` and are offline — every HTTP call is mocked, every
 Mongo op goes through `mongomock`.
@@ -282,6 +283,39 @@ different URL shape on EDHREC and are deferred to a follow-up helper.
 in late 2026). Hitting `json.edhrec.com` ourselves is ~200 lines of code,
 one fewer transitive dep, and gives us the signals we actually need.
 
+### Deck profile and tag clustering (Phase 3)
+
+The `deck_profile` module takes a decklist and surfaces its themes by
+clustering the union of per-card tags in embedding space. Library-only
+until the recommender CLI lands:
+
+```python
+from mtg_recommender import deck_profile as dp
+
+profile = dp.build_deck_profile([
+    "Lightning Bolt", "Wrath of God", "Sol Ring",
+    "Birds of Paradise", "Brainstorm",
+])
+
+print(f"deck resolved: {len(profile.deck_card_ids)} cards")
+print(f"missing: {profile.missing_names}")
+for cluster in profile.clusters:
+    print(f"  theme {cluster.label!r}: {len(cluster.tags)} tags, "
+          f"{len(cluster.deck_card_ids)} deck cards")
+print(f"noise (unclustered tags): {profile.noise_tags}")
+```
+
+Each cluster's `centroid` is a unit vector in the tag embedding space —
+Phase 3 step 4 (candidate ranking) uses it as a query vector against
+`card_vector` to find candidate cards, with EDHREC lift (from
+`edhrec_fetch`) layered on as a per-commander quality signal.
+
+**Clustering details:** `sklearn.cluster.HDBSCAN` with `metric="cosine"`
+and `min_cluster_size=2` by default. Lower `min_cluster_size` for small
+decks; raise it (3–4) to keep only strong themes. Tags without a stored
+embedding (or that HDBSCAN flags as noise) land in `profile.noise_tags`
+so the caller can audit what was dropped.
+
 ## Testing
 
 ```bash
@@ -306,7 +340,8 @@ mtg-recommender/
 │       ├── explore.py           # read-only ad-hoc inspection CLI (mtg-inspect)
 │       ├── check.py             # read-only Mongo health check
 │       ├── embeddings.py        # Phase 2 encoder + mtg-embed CLI
-│       └── edhrec_fetch.py      # Phase 3 EDHREC JSON client + per-commander cache
+│       ├── edhrec_fetch.py      # Phase 3 EDHREC JSON client + per-commander cache
+│       └── deck_profile.py      # Phase 3 per-deck tag clustering (HDBSCAN)
 ├── tests/
 │   ├── test_storage.py          # offline, mongomock-backed
 │   ├── test_scryfall_fetch.py
@@ -316,6 +351,7 @@ mtg-recommender/
 │   ├── test_extract_oracle.py
 │   ├── test_embeddings.py
 │   ├── test_edhrec_fetch.py
+│   ├── test_deck_profile.py
 │   └── fixtures/                # trimmed sample payloads used by HTTP-mocked tests
 │       └── edhrec_atraxa_trimmed.json
 ├── pyproject.toml               # PEP 621 metadata, build config, entry points
