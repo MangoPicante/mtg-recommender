@@ -1,16 +1,12 @@
-"""Fetch Scryfall oracle text into MongoDB.
+"""Fetch Scryfall oracle text into MongoDB (bulk-only).
 
-The mode is chosen automatically based on how many cards were requested:
-
-    1 card   : One HTTPS request via /cards/named. Fast, no bulk download.
-               The resulting entry is stamped with the current UTC time.
-
-    2+ cards : Downloads Scryfall's oracle_cards bulk file (a single
-               gzip-compressed JSON Lines dump of every unique card), then
-               upserts every card from that dump into the cards collection.
-               Every upserted entry is stamped with the snapshot's own
-               `updated_at` timestamp (the value Scryfall gives us for that
-               dump), NOT the current wall-clock time.
+Downloads Scryfall's `oracle_cards` bulk file — a single gzip-compressed
+JSON Lines dump of every unique card — and upserts every entry into the
+cards collection. There is no per-card HTTP mode: fetching one card at
+a time against /cards/named was deleted because every real workflow in
+this project (embeddings, tag attachment, recommendations) wants the
+full cache anyway, and `extract-oracle` handles the "subset for a
+decklist" case against the already-populated cache.
 
 Storage (MongoDB — see `storage.py` for connection details):
 
@@ -44,43 +40,33 @@ Why id-primary + per-doc names array:
     (double-faced, split, adventure, modal DFC). The `names` array on
     each doc, backed by a multikey index, bridges the user-facing
     lookup ("Lightning Bolt") to the id-keyed store without a separate
-    alias collection.
-
-    Multiple cards may share a lowered name (art-card variants, meld
-    pieces, cards named after their faces); `find({"names": lowered})`
-    returns a cursor of every matching doc, and the caller decides how
-    to disambiguate.
+    alias collection. The lookup helper lives here so downstream modules
+    (`extract_oracle`, `explore`) can reuse it.
 
 Per-card `updated_at` semantics:
 
-    - Bulk merge  : set to the snapshot's `updated_at` (identical for
-                    every card in a given merge).
-    - Single fetch: set to `datetime.now(timezone.utc)` at fetch time.
-    - Multiple bulk merges over time or a mix of bulk + single fetches
-      leave each card with the correct time it was last refreshed from
-      Scryfall.
+    Every merged card is stamped with the snapshot's own `updated_at`
+    (the value Scryfall gives us for that dump), identical across every
+    card in a given merge. That makes the staleness scan a straight
+    `cached_entry.updated_at < snapshot.updated_at` compare and keeps
+    successive runs idempotent.
 
 Bulk-download triggers (any one is enough):
 
     1. --refresh flag set.
     2. Empty cards collection.
-    3. Any requested card isn't in the collection yet — the whole point of
-       bulk mode is to serve the request, so if we're missing something,
-       download and try to satisfy it.
-    4. Any cached card's `updated_at` is older than the current bulk
+    3. Any cached card's `updated_at` is older than the current bulk
        snapshot's `updated_at` — merging refreshes that entry.
 
     If none apply, skip the ~24 MB download.
 
 Usage (after `pip install -e .`, with MONGODB_URI set in .env):
 
-    scryfall-fetch "Lightning Bolt"                    # 1 card  -> /cards/named
-    scryfall-fetch "Lightning Bolt" "Counterspell"     # 2+ cards -> bulk
-    scryfall-fetch --file cards.txt                    # from a file
-    scryfall-fetch --file cards.txt --refresh          # force refetch/redownload
+    scryfall-fetch                 # pull if needed, else report snapshot already covered
+    scryfall-fetch --refresh       # force redownload + merge
 
 Equivalently from a source checkout without installing:
-    python -m mtg_recommender.scryfall_fetch "Lightning Bolt"
+    python -m mtg_recommender.scryfall_fetch
 """
 from __future__ import annotations
 
@@ -89,11 +75,9 @@ import gzip
 import json
 import re
 import sys
-import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
 
 from pymongo import UpdateOne
 from pymongo.collection import Collection
@@ -115,19 +99,6 @@ HEADERS = {
     "User-Agent": "MTG-Recommender/0.1 (github.com/MangoPicante/MTG-Recommender)",
     "Accept": "application/json",
 }
-
-# ---------------------------------------------------------------------------
-# Time helper
-# ---------------------------------------------------------------------------
-
-def now_utc_iso() -> str:
-    """ISO 8601 timestamp for 'right now' in UTC (e.g. '2026-07-31T12:34:56.789+00:00').
-
-    Kept as a tiny helper so every single-fetch stamps its cache entries in
-    exactly the same format Scryfall uses for its bulk snapshot timestamps.
-    """
-    return datetime.now(timezone.utc).isoformat()
-
 
 # ---------------------------------------------------------------------------
 # Card projection
@@ -254,28 +225,6 @@ def http_get_json(url: str, timeout: int = 30) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def fetch_card_raw_named(name: str) -> dict | None:
-    """Fetch the raw Scryfall card object for `name` via /cards/named.
-
-    Returns the raw response dict on success (unfiltered — the caller
-    projects it with `extract_card_fields`), or None if Scryfall responds
-    404 (unknown card). Any other HTTP error is re-raised for the caller
-    to log and skip.
-    """
-    # quote() percent-encodes spaces and special characters so the URL is
-    # valid even for names like "Jace, the Mind Sculptor".
-    url = f"{SCRYFALL_BASE}/cards/named?exact={quote(name)}"
-    try:
-        return http_get_json(url, timeout=15)
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            print(f"  not found: {name}", file=sys.stderr)
-            return None
-        # 429 (rate limited), 5xx (server errors), etc. bubble up to the
-        # caller so they can be logged with the offending card name.
-        raise
-
-
 # ---------------------------------------------------------------------------
 # Mongo storage ops
 # ---------------------------------------------------------------------------
@@ -287,8 +236,7 @@ def fetch_card_raw_named(name: str) -> dict | None:
 #     _id, scryfall_id, oracle_id, name, names, mana_cost, type_line,
 #     oracle_text, updated_at
 
-# Field keys scryfall_fetch sets on an upsert. Kept as a module-level
-# constant so the single-mode and bulk-mode paths stay in lockstep.
+# Field keys scryfall_fetch sets on an upsert.
 _OWNED_FIELDS = (
     "scryfall_id", "oracle_id", "name", "names",
     "mana_cost", "type_line", "oracle_text", "updated_at",
@@ -522,95 +470,41 @@ def read_names(args: argparse.Namespace) -> list[str]:
 # Mode implementations
 # ---------------------------------------------------------------------------
 
-def run_single_mode(name: str, coll: Collection, refresh: bool) -> bool:
-    """Fetch a single card via /cards/named and upsert it into Mongo.
-
-    Returns True if the collection changed (used by main() to decide
-    the summary line). Cached entries are skipped unless --refresh is
-    set. No rate limiting is needed because we only make one API call
-    per invocation.
-    """
-    if not refresh and find_cards_by_name(coll, name):
-        # Any non-empty match list counts as a cache hit for the CLI's
-        # skip-fetch decision. Disambiguation across multiple matches is
-        # the downstream consumer's problem.
-        print(f"cached: {name}")
-        return False
-
-    print(f"fetch : {name}")
-    try:
-        raw = fetch_card_raw_named(name)
-    except urllib.error.HTTPError as e:
-        print(f"  http error {e.code}: {name}", file=sys.stderr)
-        return False
-    except urllib.error.URLError as e:
-        print(f"  network error: {e.reason}", file=sys.stderr)
-        return False
-
-    if raw is None:
-        return False
-    # Real-time timestamp — this is when *we* pulled the card. It won't
-    # coincide with a Scryfall bulk snapshot's timestamp, which is what
-    # the freshness check in run_bulk_mode relies on.
-    return upsert_card(coll, raw, now_utc_iso())
-
-
-def run_bulk_mode(names: list[str], coll: Collection, refresh: bool) -> bool:
-    """Ensure Mongo holds what we need from the current snapshot, then report.
+def run_bulk_mode(coll: Collection, refresh: bool) -> bool:
+    """Ensure Mongo holds the current Scryfall oracle_cards snapshot.
 
     Downloads the bulk file when any of these apply:
       - --refresh forces it,
       - the cards collection is empty,
-      - a requested name isn't in the collection (we clearly need it),
       - any card is older than the current snapshot (stale).
-    Otherwise skips the ~24 MB download.
+    Otherwise skips the ~24 MB download and reports the snapshot is
+    already covered.
 
-    After the merge (or skip), report each requested name as cached or
-    not found. Missing names after a fresh download are real
-    "not found"s — the card doesn't exist in the current Scryfall
-    snapshot (misspelling, unreleased, or a token / meme card).
+    Returns True iff the collection changed, so `main` can print the
+    final doc count only when it's actually useful.
     """
     meta = get_bulk_oracle_metadata()
     snapshot_updated_at = meta["updated_at"]
 
-    # Evaluate cheap checks first so we can short-circuit before the
-    # potentially O(n) staleness scan. estimated_document_count() is a
-    # metadata read on Mongo — cheaper than count_documents({}).
+    # Cheap checks first (metadata-only reads) so we can short-circuit
+    # before the O(n) staleness scan.
     cards_present = coll.estimated_document_count() > 0
-    any_missing = any(not find_cards_by_name(coll, n) for n in names)
     needs_download = (
         refresh
         or not cards_present
-        or any_missing
         or has_stale_cards(coll, snapshot_updated_at)
     )
-    changed = False
 
-    if needs_download:
-        bulk = download_bulk_oracle_cards(meta)
-        before = coll.estimated_document_count()
-        bulk_upsert_cards(coll, bulk, snapshot_updated_at)
-        changed = True
-        after = coll.estimated_document_count()
-        print(f"bulk  : collection now holds {after} unique cards (was {before})")
-    else:
+    if not needs_download:
         print(f"bulk  : collection already covers snapshot {snapshot_updated_at}")
+        return False
 
-    for name in names:
-        matches = find_cards_by_name(coll, name)
-        if not matches:
-            # After a fresh merge, a missing name is a real "not found" —
-            # the card isn't in the current Scryfall snapshot.
-            print(f"  not found: {name}", file=sys.stderr)
-        elif len(matches) == 1:
-            print(f"cached: {name}")
-        else:
-            # Surface the ambiguity so the user knows a downstream
-            # consumer will have to pick between these ids.
-            print(f"cached: {name} ({len(matches)} matches)")
-            for m in matches:
-                print(f"          - {m.get('name')} [{m.get('scryfall_id')}]")
-    return changed
+    bulk = download_bulk_oracle_cards(meta)
+    before = coll.estimated_document_count()
+    bulk_upsert_cards(coll, bulk, snapshot_updated_at)
+    after = coll.estimated_document_count()
+    print(f"bulk  : collection now holds {after} unique cards (was {before})")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -618,18 +512,14 @@ def run_bulk_mode(names: list[str], coll: Collection, refresh: bool) -> bool:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Fetch Scryfall oracle text into MongoDB.")
-    parser.add_argument("cards", nargs="*", help="Card names (quote multi-word names).")
-    parser.add_argument("-f", "--file",
-                        help="Path to a file with one card name per line (# for comments).")
-    parser.add_argument("--refresh", action="store_true",
-                        help="Refetch even if already cached (single card) or force redownload the bulk snapshot.")
+    parser = argparse.ArgumentParser(
+        description="Download Scryfall's oracle_cards bulk and merge it into MongoDB."
+    )
+    parser.add_argument(
+        "--refresh", action="store_true",
+        help="Force redownload of the bulk snapshot even if the cache looks current.",
+    )
     args = parser.parse_args()
-
-    names = read_names(args)
-    if not names:
-        # parser.error() prints usage and exits with code 2.
-        parser.error("no card names provided (pass names as args or via --file)")
 
     # Ensure indexes before any read/write — idempotent on Mongo's side,
     # so the cost is one trip per CLI run and brand-new deployments work
@@ -637,13 +527,7 @@ def main() -> int:
     storage.ensure_indexes()
     coll = storage.cards_collection()
 
-    # Mode is chosen by count: a single card hits the API directly, anything
-    # more falls to the bulk path (which upserts every card from the snapshot).
-    if len(names) == 1:
-        changed = run_single_mode(names[0], coll, args.refresh)
-    else:
-        changed = run_bulk_mode(names, coll, args.refresh)
-
+    changed = run_bulk_mode(coll, args.refresh)
     if changed:
         total = coll.estimated_document_count()
         print(f"\nsaved {total} unique cards to MongoDB ({coll.database.name}.{coll.name})")

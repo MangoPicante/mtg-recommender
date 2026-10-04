@@ -19,7 +19,7 @@ Under `src/mtg_recommender/`:
 | Module | What it does |
 | --- | --- |
 | `storage` | Thin wrapper around pymongo. Reads `MONGODB_URI` (and optional overrides) from `.env`, caches a single `MongoClient` per process, exposes handles to the `cards` / `tags` / `meta` collections, and declares the indexes the rest of the package relies on (`cards.names` for alias lookup, `cards.oracle_id` for the tag join). |
-| `scryfall_fetch` | Fetches Scryfall oracle text for one card or a decklist into the `cards` collection. Switches between `/cards/named` (single card) and the oracle-cards bulk download (2+ cards) automatically. Each card document is keyed by `scryfall_id` with a `names: [lowered, ...]` array for alias lookup. The `tags` field is left for `oracle_tags` to populate. |
+| `scryfall_fetch` | Downloads Scryfall's `oracle_cards` bulk and merges it into the `cards` collection. Bulk-only: no `/cards/named` single-card path. Each card document is keyed by `scryfall_id` with a `names: [lowered, ...]` array for alias lookup (used by `extract_oracle` and `explore`). The `tags` field is left for `oracle_tags` to populate. |
 | `oracle_tags` | Downloads the Scryfall oracle-tags bulk, writes a slug-keyed catalog to the `tags` collection (hierarchy + aliases + descriptions preserved), and attaches `tags: [slug, ...]` arrays to each card by joining on `oracle_id`. |
 | `extract_oracle` | Writes a trimmed per-decklist JSON subset of the cards collection for downstream consumers that don't speak Mongo. |
 | `explore` | Read-only ad-hoc inspection CLI (installed as `mtg-inspect`). Subcommands: `card`, `tag`, `list`, `stats`. Human-readable output for one-off exploration and debugging. |
@@ -95,24 +95,24 @@ checkout.
 
 ### Fetch oracle text
 
+Pulls Scryfall's `oracle_cards` bulk (~24 MB gzipped, one entry per unique
+card) and upserts every card into the `cards` collection. There's no
+per-card HTTP mode: the real workflows downstream (embeddings, tag attach,
+recommendations) all want the full cache, and carving out a decklist-sized
+subset is `extract-oracle`'s job once the cache is populated.
+
 ```bash
-# single card -> /cards/named (fast, one request)
-scryfall-fetch "Lightning Bolt"
+# Idempotent: downloads only if the collection is empty, has stale entries,
+# or --refresh is passed. Otherwise reports "snapshot already covered".
+scryfall-fetch
 
-# multiple cards -> oracle-cards bulk download, upserted into the cards collection
-scryfall-fetch "Lightning Bolt" "Counterspell"
-
-# from a decklist file (one card per line, '#' for comments; Moxfield / Arena /
-# MTGGoldfish export formats are tolerated)
-scryfall-fetch --file deck.txt
-
-# force refetch / redownload even if the collection looks fresh
-scryfall-fetch --file deck.txt --refresh
+# Force redownload + merge even if the local cache looks current.
+scryfall-fetch --refresh
 ```
 
-Upserts touch only the fields `scryfall_fetch` owns, so a card's `tags` array
-(written by `oracle_tags`) survives a refetch. Full document shape and
-semantics are in the top-of-file docstring of `scryfall_fetch.py`.
+Upserts touch only the fields `scryfall_fetch` owns, so a card's `tags`
+array (written by `oracle_tags`) survives a refetch. Full document shape
+and semantics are in the top-of-file docstring of `scryfall_fetch.py`.
 
 ### Attach oracle tags
 

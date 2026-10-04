@@ -16,10 +16,10 @@ Test classes are grouped by concern so a failure narrows the search:
     TestUpsertCard              upsert_card / bulk_upsert_cards + $set payload
     TestFindCardsByName         find_cards_by_name via the names index
     TestHasStaleCards           freshness comparison + precision quirks
-    TestReadNames               --file + positional arg parsing (pure)
+    TestReadNames               --file + positional arg parsing (pure; still
+                                 used by extract_oracle)
     TestGetBulkOracleMetadata   /bulk-data response filtering
     TestDownloadBulkOracleCards gzip detection + JSONL parsing
-    TestSingleMode              run_single_mode against mongomock
     TestBulkMode                run_bulk_mode + every download trigger
 """
 from __future__ import annotations
@@ -33,7 +33,6 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
-from urllib.error import HTTPError
 
 import mongomock
 
@@ -618,55 +617,7 @@ class TestDownloadBulkOracleCards(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Single-card mode
-# ---------------------------------------------------------------------------
-
-class TestSingleMode(_MongoBackedTestCase):
-
-    def test_cache_hit_skips_fetch(self):
-        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=LATER)
-        with patch.object(sf, "fetch_card_raw_named") as mocked:
-            changed = call_silent(sf.run_single_mode, "Lightning Bolt", self.coll, False)
-        mocked.assert_not_called()
-        self.assertFalse(changed)
-
-    def test_refresh_forces_fetch_even_when_cached(self):
-        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=EARLIER)
-        with patch.object(
-            sf, "fetch_card_raw_named", return_value=LIGHTNING_BOLT_RAW
-        ) as mocked:
-            changed = call_silent(sf.run_single_mode, "Lightning Bolt", self.coll, True)
-        mocked.assert_called_once_with("Lightning Bolt")
-        self.assertTrue(changed)
-
-    def test_fetch_stores_card_resolvable_by_lowered_name(self):
-        # User's typed casing differs from Scryfall's canonical.
-        with patch.object(sf, "fetch_card_raw_named", return_value=LIGHTNING_BOLT_RAW):
-            changed = call_silent(sf.run_single_mode, "lightning BOLT", self.coll, False)
-        self.assertTrue(changed)
-        # The stored doc's names array contains the canonical lowered form,
-        # which any lookup against lowered variants will match via the
-        # multikey index.
-        self.assertEqual(
-            sf.find_cards_by_name(self.coll, "LIGHTNING BOLT")[0]["scryfall_id"],
-            "id-lb",
-        )
-
-    def test_404_returns_false_and_leaves_collection_unchanged(self):
-        with patch.object(sf, "fetch_card_raw_named", return_value=None):
-            changed = call_silent(sf.run_single_mode, "Unknown Card", self.coll, False)
-        self.assertFalse(changed)
-        self.assertEqual(self.coll.count_documents({}), 0)
-
-    def test_http_error_returns_false_gracefully(self):
-        err = HTTPError("url", 500, "Server Error", {}, None)
-        with patch.object(sf, "fetch_card_raw_named", side_effect=err):
-            changed = call_silent(sf.run_single_mode, "Anything", self.coll, False)
-        self.assertFalse(changed)
-
-
-# ---------------------------------------------------------------------------
-# Bulk mode (all four download triggers + happy paths)
+# Bulk mode (every download trigger + happy paths)
 # ---------------------------------------------------------------------------
 
 FAKE_META = {
@@ -685,36 +636,19 @@ class TestBulkMode(_MongoBackedTestCase):
                  sf, "download_bulk_oracle_cards",
                  return_value=[LIGHTNING_BOLT_RAW, SOL_RING_RAW],
              ) as dl:
-            changed = call_silent(
-                sf.run_bulk_mode, ["Lightning Bolt", "Sol Ring"], self.coll, False
-            )
+            changed = call_silent(sf.run_bulk_mode, self.coll, False)
         dl.assert_called_once()
         self.assertTrue(changed)
         self.assertEqual(self.coll.count_documents({}), 2)
 
-    def test_download_skipped_when_all_requested_present_and_fresh(self):
+    def test_download_skipped_when_snapshot_already_covered(self):
+        # Pre-populate at the snapshot's own timestamp — nothing to do.
         sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW, SOL_RING_RAW], LATER)
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(sf, "download_bulk_oracle_cards") as dl:
-            changed = call_silent(
-                sf.run_bulk_mode, ["Lightning Bolt", "Sol Ring"], self.coll, False
-            )
+            changed = call_silent(sf.run_bulk_mode, self.coll, False)
         dl.assert_not_called()
         self.assertFalse(changed)
-
-    def test_download_triggered_when_any_requested_card_missing(self):
-        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=LATER)
-        with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
-             patch.object(
-                 sf, "download_bulk_oracle_cards",
-                 return_value=[LIGHTNING_BOLT_RAW, SOL_RING_RAW],
-             ) as dl:
-            changed = call_silent(
-                sf.run_bulk_mode, ["Lightning Bolt", "Sol Ring"], self.coll, False
-            )
-        dl.assert_called_once()
-        self.assertTrue(changed)
-        self.assertIsNotNone(self.coll.find_one({"_id": "id-sol-ring"}))
 
     def test_download_triggered_when_collection_has_stale_entries(self):
         sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=EARLIER)
@@ -723,9 +657,7 @@ class TestBulkMode(_MongoBackedTestCase):
                  sf, "download_bulk_oracle_cards",
                  return_value=[LIGHTNING_BOLT_RAW],
              ) as dl:
-            changed = call_silent(
-                sf.run_bulk_mode, ["Lightning Bolt"], self.coll, False
-            )
+            changed = call_silent(sf.run_bulk_mode, self.coll, False)
         dl.assert_called_once()
         self.assertTrue(changed)
         # The stale entry was restamped with the snapshot timestamp.
@@ -740,31 +672,24 @@ class TestBulkMode(_MongoBackedTestCase):
                  sf, "download_bulk_oracle_cards",
                  return_value=[LIGHTNING_BOLT_RAW],
              ) as dl:
-            call_silent(sf.run_bulk_mode, ["Lightning Bolt"], self.coll, True)
+            call_silent(sf.run_bulk_mode, self.coll, True)
         dl.assert_called_once()
 
-    def test_ambiguous_shared_face_name_matches_multiple_docs(self):
+    def test_merged_cards_resolvable_by_shared_face_name(self):
+        # The names-index path still works end-to-end after a bulk merge:
+        # art-card and front-face variants both land in the collection
+        # and both answer a lookup by the shared face name.
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(
                  sf, "download_bulk_oracle_cards",
                  return_value=[DELVER_RAW, DELVER_ART_RAW],
              ):
-            call_silent(sf.run_bulk_mode, ["Delver of Secrets"], self.coll, False)
+            call_silent(sf.run_bulk_mode, self.coll, False)
         matches = sf.find_cards_by_name(self.coll, "Delver of Secrets")
         self.assertEqual(
             {m["scryfall_id"] for m in matches},
             {"id-delver", "id-delver-art"},
         )
-
-    def test_unknown_card_after_fresh_merge_is_not_found(self):
-        with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
-             patch.object(
-                 sf, "download_bulk_oracle_cards",
-                 return_value=[LIGHTNING_BOLT_RAW],
-             ):
-            call_silent(sf.run_bulk_mode, ["Lightning Bolt", "Nonexistent"], self.coll, False)
-        self.assertEqual(sf.find_cards_by_name(self.coll, "Nonexistent"), [])
-        self.assertNotEqual(sf.find_cards_by_name(self.coll, "Lightning Bolt"), [])
 
 
 if __name__ == "__main__":
