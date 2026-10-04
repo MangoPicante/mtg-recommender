@@ -25,8 +25,11 @@ Storage (MongoDB — see `storage.py` for connection details):
     cards collection — one document per card, _id = scryfall_id:
 
         {
-          "_id":              "<scryfall_id>",       # Mongo primary key
-          "scryfall_id":      "<same as _id>",
+          "_id":              "<scryfall_id>",       # Mongo primary key;
+                                                     # consumers that want
+                                                     # a semantic field name
+                                                     # rename at export time
+                                                     # (extract_oracle does).
           "oracle_id":        "<join key for oracle_tags>",
           "name":             "...",
           "names":            ["lightning bolt", ...],  # lowered aliases
@@ -180,12 +183,14 @@ def extract_card_fields(data: dict, updated_at: str) -> dict:
     downstream text processing wants a single searchable blob and the
     clearer face boundary helps NLP tokenisers.
 
-    The returned dict uses `_id = scryfall_id` so it can be upserted into
-    Mongo directly. `scryfall_id` is kept as a separate field for API
-    symmetry — callers that iterate a cursor get the id without having
-    to pop `_id`. `oracle_id` names the ORACLE entity (the gameplay
-    card) rather than a specific printing; the oracle_tags import joins
-    on it.
+    The returned dict uses `_id = scryfall_id` so it can be upserted
+    into Mongo directly. We don't duplicate the id into a separate
+    `scryfall_id` field — the storage saving (~37 bytes × 40 k cards ≈
+    1.5 MB) is small but the duplicate was pure noise. Consumers that
+    want a semantic field name (e.g. `extract_oracle`'s JSON output)
+    rename `_id → scryfall_id` at export time. `oracle_id` names the
+    ORACLE entity (the gameplay card) rather than a specific printing;
+    the oracle_tags import joins on it.
     """
     faces = data.get("card_faces") or []
 
@@ -212,13 +217,11 @@ def extract_card_fields(data: dict, updated_at: str) -> dict:
             face.get("oracle_text", "") for face in faces
         )
 
-    scryfall_id = data.get("id")
     return {
-        # `_id` is the Mongo primary key; keeping scryfall_id duplicated
-        # as a top-level field means code reading documents doesn't need
-        # to know about Mongo's reserved key naming.
-        "_id": scryfall_id,
-        "scryfall_id": scryfall_id,
+        # `_id` is the Mongo primary key AND the scryfall id. No
+        # separate `scryfall_id` field — downstream code that wants
+        # the semantic name reads `_id` or renames at export.
+        "_id": data.get("id"),
         # Join key for the oracle_tags bulk. Falls back to None if the
         # raw object omits it (shouldn't happen for real Scryfall
         # responses but is defended against so an odd test fixture
@@ -258,16 +261,18 @@ def http_get_json(url: str, timeout: int = 30) -> dict:
 # (not replace) so an existing card's `tags` array — written by the
 # oracle_tags module — survives a bulk merge. The fields owned here are:
 #
-#     _id, scryfall_id, oracle_id, name, names, mana_cost, type_line,
-#     oracle_text, oracle_text_sha, updated_at
+#     _id, oracle_id, name, names, mana_cost, type_line, oracle_text,
+#     oracle_text_sha, updated_at
 #
 # A content-change merge also $unsets `text_embedding` and `card_vector`
 # — not owned here, but conceptually downstream of oracle_text, so a
 # fresh text invalidates both. See bulk_upsert_cards.
 
-# Field keys scryfall_fetch sets on an upsert.
+# Field keys scryfall_fetch sets on an upsert. `_id` is handled by the
+# filter clause (Mongo refuses to $set the primary key), so it's absent
+# from this list even though it's an owned field.
 _OWNED_FIELDS = (
-    "scryfall_id", "oracle_id", "name", "names",
+    "oracle_id", "name", "names",
     "mana_cost", "type_line", "oracle_text", "oracle_text_sha", "updated_at",
 )
 
@@ -544,6 +549,16 @@ def run_bulk_mode(coll: Collection) -> bool:
 
     cards_present = coll.estimated_document_count() > 0
     stored_snapshot = storage.get_snapshot_timestamp(META_SOURCE)
+
+    # One-shot migration: `scryfall_id` used to be stored as a duplicate
+    # of `_id` on every card. Writes no longer carry it, so unchanged
+    # cards from before this change still have it. $unset-ing on every
+    # CLI run is self-healing — the first run after upgrade cleans the
+    # cluster; every run after that is a 0-match no-op.
+    coll.update_many(
+        {"scryfall_id": {"$exists": True}},
+        {"$unset": {"scryfall_id": ""}},
+    )
 
     # Fast path: meta says we're already covering this snapshot.
     if cards_present and stored_snapshot == snapshot_updated_at:

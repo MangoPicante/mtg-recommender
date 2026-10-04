@@ -34,7 +34,7 @@ from . import storage
 def _fmt_card(doc: dict) -> str:
     """Render one card document as a block of text."""
     name = doc.get("name") or "(unnamed)"
-    sid = doc.get("scryfall_id") or doc.get("_id") or "?"
+    sid = doc.get("_id") or "?"
     mana = doc.get("mana_cost") or ""
     type_line = doc.get("type_line") or ""
     oracle = doc.get("oracle_text") or ""
@@ -151,8 +151,10 @@ def cmd_list(args: argparse.Namespace) -> int:
             print("no cards in collection", file=sys.stderr)
         return 1
 
-    # Sort by name for stable, scannable output.
-    cursor = coll.find(query, {"name": 1, "scryfall_id": 1}).sort("name", 1).limit(args.limit)
+    # Sort by name for stable, scannable output. `_id` is included by
+    # default in Mongo projections, so we don't need to spell it out —
+    # the formatter below falls back to it when name is absent.
+    cursor = coll.find(query, {"name": 1}).sort("name", 1).limit(args.limit)
     rows = list(cursor)
     header_what = f"cards tagged '{args.tag}'" if args.tag else "cards"
     print(f"showing {len(rows)} of {total} {header_what}:")

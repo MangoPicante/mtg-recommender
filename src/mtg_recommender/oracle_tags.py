@@ -25,9 +25,9 @@ Shape of the raw oracle_tags JSONL (one line per tag):
       ]
     }
 
-The join to cards is by `oracle_id` (NOT scryfall_id). The oracle id
-names the GAMEPLAY card — a single oracle_id can map to many
-scryfall_ids across reprints. `scryfall_fetch.extract_card_fields`
+The join to cards is by `oracle_id` (NOT the scryfall id). The oracle
+id names the GAMEPLAY card — a single oracle_id can map to many
+scryfall ids across reprints. `scryfall_fetch.extract_card_fields`
 carries oracle_id on every card document and `storage.ensure_indexes`
 creates a Mongo index on it, so the join is an indexed query.
 

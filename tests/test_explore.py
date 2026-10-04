@@ -47,7 +47,7 @@ class _MongoBackedTestCase(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 WRATH = {
-    "_id": "id-wrath", "scryfall_id": "id-wrath", "oracle_id": "oracle-wrath",
+    "_id": "id-wrath", "oracle_id": "oracle-wrath",
     "name": "Wrath of God", "names": ["wrath of god"],
     "mana_cost": "{2}{W}{W}", "type_line": "Sorcery",
     "oracle_text": "Destroy all creatures. They can't be regenerated.",
@@ -56,7 +56,7 @@ WRATH = {
 }
 
 BOLT = {
-    "_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt",
+    "_id": "id-bolt", "oracle_id": "oracle-bolt",
     "name": "Lightning Bolt", "names": ["lightning bolt"],
     "mana_cost": "{R}", "type_line": "Instant",
     "oracle_text": "Lightning Bolt deals 3 damage to any target.",
@@ -65,7 +65,7 @@ BOLT = {
 }
 
 BOLT_ART = {
-    "_id": "id-bolt-art", "scryfall_id": "id-bolt-art", "oracle_id": "oracle-bolt-art",
+    "_id": "id-bolt-art", "oracle_id": "oracle-bolt-art",
     "name": "Lightning Bolt // Lightning Bolt",
     "names": ["lightning bolt // lightning bolt", "lightning bolt"],
     "mana_cost": None, "type_line": None, "oracle_text": None,
@@ -174,7 +174,7 @@ class TestCmdTag(_MongoBackedTestCase):
 
     def test_hit_shows_catalog_and_card_count(self):
         self.tags.insert_one(TAG_SPOT)
-        self.cards.insert_many([BOLT, dict(BOLT, _id="other", scryfall_id="other", names=["other"])])
+        self.cards.insert_many([BOLT, dict(BOLT, _id="other", names=["other"])])
         rc, out, err = _run(["tag", "spot-removal"])
         self.assertEqual(rc, 0)
         self.assertIn("spot-removal", out)
@@ -254,9 +254,9 @@ class TestCmdStats(_MongoBackedTestCase):
     def test_top_tags_aggregation(self):
         # 3 cards all tagged "spot-removal", 1 of them also "burn-any".
         docs = [
-            dict(BOLT, _id="a", scryfall_id="a", names=["a"], tags=["spot-removal", "burn-any"]),
-            dict(BOLT, _id="b", scryfall_id="b", names=["b"], tags=["spot-removal"]),
-            dict(BOLT, _id="c", scryfall_id="c", names=["c"], tags=["spot-removal"]),
+            dict(BOLT, _id="a", names=["a"], tags=["spot-removal", "burn-any"]),
+            dict(BOLT, _id="b", names=["b"], tags=["spot-removal"]),
+            dict(BOLT, _id="c", names=["c"], tags=["spot-removal"]),
         ]
         self.cards.insert_many(docs)
         rc, out, _ = _run(["stats", "--top", "5"])
