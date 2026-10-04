@@ -46,11 +46,16 @@ dependencies = [
     # isn't installed, so this is optional-but-nice; keeping it in runtime
     # deps because the user flow depends on it.
     "python-dotenv>=1.0",
+    # sentence-transformers is the encoder used by the mtg-embed CLI. It
+    # pulls torch (~1 GB); the project's audience is small enough that we
+    # don't maintain a separate "Phase 1 only" slim install. 2.7 is the
+    # current stable line and ships the API we rely on
+    # (SentenceTransformer.encode kwargs).
+    "sentence-transformers>=2.7",
 ]
 
 # Optional extras let a user opt into heavier dep groups:
 #   pip install -e ".[dev]"
-#   pip install -e ".[embeddings]"
 [project.optional-dependencies]
 dev = [
     # mongomock provides an in-memory pymongo-compatible Mongo client. The
@@ -59,13 +64,6 @@ dev = [
     "mongomock>=4.1",
     # ruff is the linter run by `just lint` and the CI workflow.
     "ruff>=0.6",
-]
-embeddings = [
-    # sentence-transformers is the encoder used by the mtg-embed CLI. It
-    # pulls torch (~1 GB), so it's opt-in rather than a runtime dep — the
-    # Phase 1 fetchers don't need it. 2.7 is the current stable line and
-    # ships the API we rely on (SentenceTransformer.encode kwargs).
-    "sentence-transformers>=2.7",
 ]
 
 # Console scripts exposed by `pip install`. Every main() returns an int exit

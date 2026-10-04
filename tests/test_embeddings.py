@@ -232,14 +232,6 @@ class TestEncoderCache(unittest.TestCase):
         emb.reset_encoder(fake)
         self.assertIs(emb.get_encoder(), fake)
 
-    def test_missing_sentence_transformers_dep_raises_actionable_error(self):
-        emb.reset_encoder(None)
-        with patch.dict("sys.modules", {"sentence_transformers": None}):
-            with self.assertRaises(RuntimeError) as ctx:
-                emb.get_encoder()
-        self.assertIn("sentence-transformers", str(ctx.exception))
-        self.assertIn("[embeddings]", str(ctx.exception))
-
 
 # ---------------------------------------------------------------------------
 # main() CLI

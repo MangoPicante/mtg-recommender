@@ -151,14 +151,9 @@ JSON subset. Nothing in this CLI writes to Mongo.
 
 ### Embed cards and tags (Phase 2)
 
-The embedding path is opt-in because `sentence-transformers` pulls in `torch`
-(~1 GB download). Install the extra once:
-
-```bash
-pip install -e ".[embeddings]"
-```
-
-Then encode:
+`sentence-transformers` (and its transitive `torch` dep, ~1 GB on first
+install) is a runtime dep now, so no extra install step is needed. Just
+encode:
 
 ```bash
 # Default: embed every card whose oracle_text isn't already encoded.
