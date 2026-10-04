@@ -99,7 +99,6 @@ from pymongo.collection import Collection
 from . import scryfall_fetch as sf
 from . import storage
 
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------

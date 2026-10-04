@@ -27,7 +27,8 @@ import os
 import unittest
 import uuid
 
-from mtg_recommender import oracle_tags, scryfall_fetch as sf, storage
+from mtg_recommender import oracle_tags, storage
+from mtg_recommender import scryfall_fetch as sf
 
 INTEGRATION_URI = os.environ.get("MONGODB_INTEGRATION_URI")
 

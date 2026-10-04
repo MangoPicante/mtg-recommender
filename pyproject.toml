@@ -57,6 +57,8 @@ dev = [
     # test suite uses it to keep every test offline and fast; it is not
     # imported by any runtime code.
     "mongomock>=4.1",
+    # ruff is the linter run by `just lint` and the CI workflow.
+    "ruff>=0.6",
 ]
 
 # Console scripts exposed by `pip install`. Every main() returns an int exit
@@ -76,3 +78,22 @@ mtg-check = "mtg_recommender.check:main"
 # an explicit declaration is safer and documents the layout.
 [tool.hatch.build.targets.wheel]
 packages = ["src/mtg_recommender"]
+
+# -----------------------------------------------------------------------------
+# Ruff — linter config
+# -----------------------------------------------------------------------------
+
+[tool.ruff]
+# Match the Python floor declared in [project].requires-python.
+target-version = "py310"
+# A bit roomier than the default 88 — the project's docstrings tolerate wider.
+line-length = 100
+
+[tool.ruff.lint]
+# Start conservative: pyflakes (F) catches real bugs; pycodestyle errors (E)
+# catch basic syntax hygiene; isort (I) keeps imports sorted. Expand later
+# as the project grows.
+select = ["E", "F", "I"]
+# E501 (line too long) off because the project's house style tolerates longer
+# docstring lines; we'll revisit if real code starts drifting.
+ignore = ["E501"]

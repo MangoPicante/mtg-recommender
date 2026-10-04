@@ -28,6 +28,14 @@ clean:
     find . -name __pycache__ -type d -prune -exec rm -rf {} +
 
 
+# Lint the codebase with ruff (CI runs this too).
+lint:
+    ruff check .
+
+# Apply ruff's auto-fixes where it can.
+lint-fix:
+    ruff check . --fix
+
 # Run the offline test suite (set MONGODB_INTEGRATION_URI for the real suite).
 test:
     python -m unittest discover tests
