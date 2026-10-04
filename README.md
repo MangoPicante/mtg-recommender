@@ -53,13 +53,15 @@ pip install -e ".[dev]"
 A [`justfile`](justfile) wraps the common dev + CLI flows. Install
 [just](https://just.systems) and run `just` with no target to list recipes.
 `just install` runs the editable install above; `just test` runs the offline
-suite; `just lint` runs ruff; `just fetch`, `just tags`, `just check`,
-`just inspect`, `just extract`, `just embed`, `just fuse` delegate to the
-console scripts with argument pass-through. `just populate` runs the whole
-`fetch → tag → embed → fuse` pipeline end-to-end — the single command that
-takes a cold Mongo cluster to a recommendation-ready state (slow on first
-run: embedding ~40k cards on CPU is a few minutes plus a one-time ~420 MB
-sentence-transformers download).
+suite; `just lint` runs ruff; `just check`, `just inspect`, `just extract`,
+`just embed`, `just fuse` delegate to the console scripts (the embed ones
+with argument pass-through); `just fetch` and `just tags` are flagless
+because the underlying fetchers are idempotent + diff-aware. `just populate`
+runs the whole `fetch → tag → embed → fuse` pipeline end-to-end — the single
+command that takes a cold Mongo cluster to a recommendation-ready state
+(slow on first run: embedding ~40k cards on CPU is a few minutes plus a
+one-time ~420 MB sentence-transformers download; reruns on an unchanged
+Scryfall snapshot are near-instant).
 
 ### MongoDB
 
@@ -106,22 +108,28 @@ recommendations) all want the full cache, and carving out a decklist-sized
 subset is `extract-oracle`'s job once the cache is populated.
 
 ```bash
-# Idempotent: downloads only if the collection is empty, has stale entries,
-# or --refresh is passed. Otherwise reports "already fresh".
+# Idempotent + diff-aware. No flags needed.
 scryfall-fetch
-
-# Force redownload + merge even if the local cache looks current.
-scryfall-fetch --refresh
 ```
 
-Reruns are cheap: the current snapshot timestamp is persisted in the `meta`
-collection under `_id = "oracle_cards"`, so a rerun on an unchanged snapshot
-needs one `/bulk-data` metadata call and one `meta` read — no per-card
-staleness scan. The scan remains as a correctness fallback for pre-meta
-clusters.
+Reruns are cheap on two levels:
+
+1. **Fast-path skip.** The current snapshot timestamp lives in the `meta`
+   collection under `_id = "oracle_cards"`. If the stored timestamp matches
+   the current `/bulk-data` metadata and the cache is non-empty, the module
+   skips without reading any card docs — one meta call total.
+2. **Diff-aware merge.** When the snapshot moves, each card carries an
+   `oracle_text_sha` (16-hex sha256 prefix). The merge classifies incoming
+   cards as new / changed / unchanged against the stored sha and writes
+   only new/changed entries. A content change also `$unset`s
+   `text_embedding` and `card_vector` so the next `mtg-embed cards` /
+   `mtg-embed fuse` re-encodes only what moved. On a typical Scryfall
+   snapshot bump that's a tiny bulk_write instead of ~40k pointless
+   `$set` operations.
 
 Upserts touch only the fields `scryfall_fetch` owns, so a card's `tags`
-array (written by `oracle_tags`) survives a refetch. Full document shape
+array (written by `oracle_tags`) survives every merge. For corruption
+recovery, drop the `cards` collection and rerun. Full document shape
 and semantics are in the top-of-file docstring of `scryfall_fetch.py`.
 
 ### Attach oracle tags
@@ -131,17 +139,20 @@ Scryfall's Tagger project classifies cards by what they *do* ("spot-removal",
 and attach per-card tag lists to the `cards` collection:
 
 ```bash
-# downloads oracle_tags bulk (~6 MB), writes catalog, attaches tags to each card
+# Idempotent + diff-aware. No flags needed.
 scryfall-fetch-tags
-
-# force redownload even if the stored snapshot timestamp matches
-scryfall-fetch-tags --refresh
 ```
 
+Download triggers: no stored snapshot, snapshot moved since last run, OR any
+card in `cards` is missing the `tags` field (a `scryfall-fetch` run added
+new cards since the last tag import). The attach pass itself is diff-aware
+— it writes only to oracle_ids whose tag list actually changed, and
+`$unset`s `card_vector` on those cards so `mtg-embed fuse` re-fuses only
+what moved. Unchanged oracle_ids get no write.
+
 Join is by `oracle_id`; cards the Tagger project doesn't cover get `tags: []`.
-The snapshot timestamp lives in the `meta` collection so repeat runs skip the
-download when nothing has moved. The command requires the `cards` collection
-to be populated first — run `scryfall-fetch` on your decklists before this.
+The command requires the `cards` collection to be populated first — run
+`scryfall-fetch` before this.
 
 ### Inspect what's in Mongo
 

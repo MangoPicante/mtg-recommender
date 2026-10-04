@@ -12,17 +12,16 @@ Run with:
 
 Test classes are grouped by concern so a failure narrows the search:
 
-    TestCardProjection          extract_card_fields + build_names
-    TestUpsertCard              upsert_card / bulk_upsert_cards + $set payload
+    TestCardProjection          extract_card_fields + build_names + sha
+    TestUpsertCard              upsert_card / bulk_upsert_cards + the diff
+                                 classification (new / changed / unchanged)
     TestFindCardsByName         find_cards_by_name via the names index
-    TestHasStaleCards           freshness comparison + precision quirks
     TestReadNames               --file + positional arg parsing (pure; still
                                  used by extract_oracle)
     TestGetBulkOracleMetadata   /bulk-data response filtering
     TestDownloadBulkOracleCards gzip detection + JSONL parsing
-    TestBulkMode                run_bulk_mode: every download trigger plus the
-                                 meta-based fast-path skip and the pre-meta
-                                 cluster upgrade path
+    TestBulkMode                run_bulk_mode: fast-path meta skip, snapshot-
+                                 mismatch download, pre-meta cluster upgrade
 """
 from __future__ import annotations
 
@@ -168,6 +167,25 @@ class TestCardProjection(unittest.TestCase):
         self.assertEqual(result["scryfall_id"], "id-lb")
         self.assertEqual(result["_id"], "id-lb")
         self.assertEqual(result["updated_at"], LATER)
+        # sha of the (post-projection) oracle_text is populated and
+        # matches a direct call to the helper on the same string.
+        self.assertEqual(
+            result["oracle_text_sha"], sf.oracle_text_sha(result["oracle_text"])
+        )
+
+    def test_sha_is_stable_and_distinguishes_different_text(self):
+        a = sf.oracle_text_sha("Deals 3 damage to any target.")
+        a_dup = sf.oracle_text_sha("Deals 3 damage to any target.")
+        b = sf.oracle_text_sha("Deals 4 damage to any target.")
+        self.assertEqual(a, a_dup)
+        self.assertNotEqual(a, b)
+        # 16 hex chars by convention.
+        self.assertEqual(len(a), 16)
+
+    def test_sha_handles_none_oracle_text(self):
+        # Meld pieces and some tokens have no oracle text at all — the
+        # helper must not crash and must still return a stable string.
+        self.assertEqual(sf.oracle_text_sha(None), sf.oracle_text_sha(""))
 
     def test_names_contains_lowered_main_name(self):
         result = sf.extract_card_fields(LIGHTNING_BOLT_RAW, updated_at=LATER)
@@ -296,37 +314,103 @@ class TestUpsertCard(_MongoBackedTestCase):
         self.assertEqual(doc["tags"], ["spot-removal", "burn-any"])
 
     def test_bulk_upsert_stores_everything(self):
-        count = sf.bulk_upsert_cards(
+        new, changed, unchanged = sf.bulk_upsert_cards(
             self.coll, [LIGHTNING_BOLT_RAW, SOL_RING_RAW, DELVER_RAW], LATER
         )
-        self.assertEqual(count, 3)
+        self.assertEqual((new, changed, unchanged), (3, 0, 0))
         self.assertEqual(self.coll.count_documents({}), 3)
         self.assertEqual(self.coll.find_one({"_id": "id-delver"})["name"],
                          "Delver of Secrets // Insectile Aberration")
 
     def test_bulk_upsert_skips_entries_missing_id(self):
-        count = sf.bulk_upsert_cards(
+        new, changed, unchanged = sf.bulk_upsert_cards(
             self.coll, [LIGHTNING_BOLT_RAW, {"name": "no id"}], LATER
         )
-        self.assertEqual(count, 1)
+        self.assertEqual((new, changed, unchanged), (1, 0, 0))
         self.assertEqual(self.coll.count_documents({}), 1)
 
     def test_bulk_upsert_preserves_existing_tags(self):
         # Same guarantee as single-upsert but through the bulk path.
+        # Insert with the current sha so this counts as unchanged (if we
+        # inserted with no sha, the diff would write and $unset tags
+        # instead — a hypothetical we exercise separately).
+        bolt_sha = sf.oracle_text_sha(sf.extract_card_fields(LIGHTNING_BOLT_RAW, LATER)["oracle_text"])
         self.coll.insert_one({
             "_id": "id-lb", "scryfall_id": "id-lb", "name": "Old",
-            "updated_at": EARLIER, "tags": ["spot-removal"],
+            "updated_at": EARLIER,
+            "oracle_text_sha": bolt_sha,
+            "tags": ["spot-removal"],
         })
         sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], LATER)
         doc = self.coll.find_one({"_id": "id-lb"})
+        # Unchanged content → no write at all; stale updated_at stays.
         self.assertEqual(doc["tags"], ["spot-removal"])
-        self.assertEqual(doc["updated_at"], LATER)
+        self.assertEqual(doc["updated_at"], EARLIER)
 
     def test_empty_bulk_is_a_noop(self):
-        # Bulk-write doesn't like being called with an empty op list;
-        # the helper must handle this cleanly.
-        count = sf.bulk_upsert_cards(self.coll, [], LATER)
-        self.assertEqual(count, 0)
+        new, changed, unchanged = sf.bulk_upsert_cards(self.coll, [], LATER)
+        self.assertEqual((new, changed, unchanged), (0, 0, 0))
+
+    def test_unchanged_card_produces_no_write(self):
+        # Pre-seed at a stored sha matching what extract_card_fields will
+        # produce for the incoming raw. The bulk pass should classify
+        # this as unchanged and leave the doc intact.
+        sha = sf.oracle_text_sha(sf.extract_card_fields(LIGHTNING_BOLT_RAW, LATER)["oracle_text"])
+        self.coll.insert_one({
+            "_id": "id-lb", "scryfall_id": "id-lb", "name": "Lightning Bolt",
+            "oracle_text_sha": sha, "updated_at": EARLIER,
+            "text_embedding": [0.0] * 4, "card_vector": [0.0] * 4,
+        })
+        new, changed, unchanged = sf.bulk_upsert_cards(
+            self.coll, [LIGHTNING_BOLT_RAW], LATER
+        )
+        self.assertEqual((new, changed, unchanged), (0, 0, 1))
+        doc = self.coll.find_one({"_id": "id-lb"})
+        # No write means both downstream fields and the stale updated_at
+        # stay as they were.
+        self.assertEqual(doc["updated_at"], EARLIER)
+        self.assertEqual(doc["text_embedding"], [0.0] * 4)
+        self.assertEqual(doc["card_vector"], [0.0] * 4)
+
+    def test_changed_content_rewrites_and_clears_downstream_fields(self):
+        # Stored sha matches an OLD oracle_text; the incoming raw has
+        # new text, so the diff detects a change and $unsets both
+        # embedding fields.
+        self.coll.insert_one({
+            "_id": "id-lb", "scryfall_id": "id-lb", "name": "Old",
+            "oracle_text_sha": "deadbeefdeadbeef", "updated_at": EARLIER,
+            "text_embedding": [0.0] * 4, "card_vector": [0.0] * 4,
+            "tags": ["spot-removal"],
+        })
+        new, changed, unchanged = sf.bulk_upsert_cards(
+            self.coll, [LIGHTNING_BOLT_RAW], LATER
+        )
+        self.assertEqual((new, changed, unchanged), (0, 1, 0))
+        doc = self.coll.find_one({"_id": "id-lb"})
+        self.assertEqual(doc["name"], "Lightning Bolt")
+        self.assertEqual(doc["updated_at"], LATER)
+        # Owned-by-oracle_tags field intact across the content change.
+        self.assertEqual(doc["tags"], ["spot-removal"])
+        # Downstream fields invalidated so mtg-embed re-encodes.
+        self.assertNotIn("text_embedding", doc)
+        self.assertNotIn("card_vector", doc)
+
+    def test_pre_sha_doc_is_treated_as_changed(self):
+        # A doc from an older schema (no oracle_text_sha) must be
+        # rewritten so the sha is populated for future diff passes.
+        # Downstream fields get cleared too — safest default when we
+        # can't prove the text is unchanged.
+        self.coll.insert_one({
+            "_id": "id-lb", "scryfall_id": "id-lb", "name": "Lightning Bolt",
+            "updated_at": EARLIER, "text_embedding": [0.0] * 4,
+        })
+        new, changed, unchanged = sf.bulk_upsert_cards(
+            self.coll, [LIGHTNING_BOLT_RAW], LATER
+        )
+        self.assertEqual((new, changed, unchanged), (0, 1, 0))
+        doc = self.coll.find_one({"_id": "id-lb"})
+        self.assertIn("oracle_text_sha", doc)
+        self.assertNotIn("text_embedding", doc)
 
 
 # ---------------------------------------------------------------------------
@@ -371,56 +455,6 @@ class TestFindCardsByName(_MongoBackedTestCase):
             {m["scryfall_id"] for m in matches},
             {"id-delver", "id-delver-art"},
         )
-
-
-# ---------------------------------------------------------------------------
-# has_stale_cards
-# ---------------------------------------------------------------------------
-
-class TestHasStaleCards(_MongoBackedTestCase):
-
-    def test_empty_collection_is_not_stale(self):
-        self.assertFalse(sf.has_stale_cards(self.coll, LATER))
-
-    def test_all_entries_at_snapshot_are_not_stale(self):
-        self.coll.insert_many([
-            {"_id": "a", "updated_at": LATER},
-            {"_id": "b", "updated_at": LATER},
-        ])
-        self.assertFalse(sf.has_stale_cards(self.coll, LATER))
-
-    def test_entry_newer_than_snapshot_is_not_stale(self):
-        self.coll.insert_one({"_id": "a", "updated_at": "2999-01-01T00:00:00+00:00"})
-        self.assertFalse(sf.has_stale_cards(self.coll, LATER))
-
-    def test_any_entry_older_than_snapshot_triggers_stale(self):
-        self.coll.insert_many([
-            {"_id": "fresh", "updated_at": LATER},
-            {"_id": "old", "updated_at": EARLIER},
-        ])
-        self.assertTrue(sf.has_stale_cards(self.coll, LATER))
-
-    def test_precision_agnostic_across_fractional_second_widths(self):
-        # Same instant written with different fractional-second widths.
-        # String compare would mark the shorter form as older; the
-        # fromisoformat parse normalises both sides.
-        self.coll.insert_one({"_id": "a", "updated_at": "2026-07-31T09:03:40.749+00:00"})
-        snapshot = "2026-07-31T09:03:40.749000+00:00"
-        self.assertFalse(sf.has_stale_cards(self.coll, snapshot))
-
-    def test_malformed_timestamp_is_skipped_not_treated_as_stale(self):
-        self.coll.insert_many([
-            {"_id": "good", "updated_at": LATER},
-            {"_id": "bad", "updated_at": "definitely not a date"},
-        ])
-        self.assertFalse(sf.has_stale_cards(self.coll, LATER))
-
-    def test_missing_timestamp_is_skipped(self):
-        self.coll.insert_many([
-            {"_id": "noop"},
-            {"_id": "good", "updated_at": LATER},
-        ])
-        self.assertFalse(sf.has_stale_cards(self.coll, LATER))
 
 
 # ---------------------------------------------------------------------------
@@ -638,44 +672,65 @@ class TestBulkMode(_MongoBackedTestCase):
                  sf, "download_bulk_oracle_cards",
                  return_value=[LIGHTNING_BOLT_RAW, SOL_RING_RAW],
              ) as dl:
-            changed = call_silent(sf.run_bulk_mode, self.coll, False)
+            changed = call_silent(sf.run_bulk_mode, self.coll)
         dl.assert_called_once()
         self.assertTrue(changed)
         self.assertEqual(self.coll.count_documents({}), 2)
 
-    def test_download_skipped_when_snapshot_already_covered(self):
-        # Pre-populate at the snapshot's own timestamp — nothing to do.
+    def test_fast_path_skips_when_meta_matches_snapshot(self):
+        # Pre-populate + record meta — the common rerun case.
         sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW, SOL_RING_RAW], LATER)
+        storage.set_snapshot_timestamp(sf.META_SOURCE, LATER)
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(sf, "download_bulk_oracle_cards") as dl:
-            changed = call_silent(sf.run_bulk_mode, self.coll, False)
+            changed = call_silent(sf.run_bulk_mode, self.coll)
         dl.assert_not_called()
         self.assertFalse(changed)
 
-    def test_download_triggered_when_collection_has_stale_entries(self):
-        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=EARLIER)
+    def test_pre_meta_cluster_downloads_once_then_sets_meta(self):
+        # A cluster populated before meta tracking existed — cards are
+        # present and already match the current snapshot's content, but
+        # the meta entry is missing. The module downloads once (the diff
+        # then classifies every card as unchanged, so no writes) and
+        # sets meta so the next run hits the fast path.
+        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], LATER)
+        self.assertIsNone(storage.get_snapshot_timestamp(sf.META_SOURCE))
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(
                  sf, "download_bulk_oracle_cards",
                  return_value=[LIGHTNING_BOLT_RAW],
              ) as dl:
-            changed = call_silent(sf.run_bulk_mode, self.coll, False)
+            changed = call_silent(sf.run_bulk_mode, self.coll)
         dl.assert_called_once()
-        self.assertTrue(changed)
-        # The stale entry was restamped with the snapshot timestamp.
+        # No real content delta → report False to the caller.
+        self.assertFalse(changed)
         self.assertEqual(
-            self.coll.find_one({"_id": "id-lb"})["updated_at"], LATER
+            storage.get_snapshot_timestamp(sf.META_SOURCE), LATER
         )
 
-    def test_refresh_forces_download_even_when_everything_current(self):
-        sf.upsert_card(self.coll, LIGHTNING_BOLT_RAW, updated_at=LATER)
+    def test_snapshot_mismatch_triggers_download(self):
+        # Meta recorded an older snapshot than the current /bulk-data —
+        # fast-path check fails, download fires.
+        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], EARLIER)
+        storage.set_snapshot_timestamp(sf.META_SOURCE, EARLIER)
+        # Flip the sha so the incoming card is "changed", not "unchanged".
+        changed_raw = {**LIGHTNING_BOLT_RAW, "oracle_text": "Deals 4 damage to any target."}
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(
                  sf, "download_bulk_oracle_cards",
-                 return_value=[LIGHTNING_BOLT_RAW],
+                 return_value=[changed_raw],
              ) as dl:
-            call_silent(sf.run_bulk_mode, self.coll, True)
+            changed = call_silent(sf.run_bulk_mode, self.coll)
         dl.assert_called_once()
+        self.assertTrue(changed)
+        self.assertEqual(
+            storage.get_snapshot_timestamp(sf.META_SOURCE), LATER
+        )
+        # The new oracle_text landed.
+        self.assertIn(
+            "4 damage",
+            self.coll.find_one({"_id": "id-lb"})["oracle_text"],
+        )
 
     def test_merged_cards_resolvable_by_shared_face_name(self):
         # The names-index path still works end-to-end after a bulk merge:
@@ -686,7 +741,7 @@ class TestBulkMode(_MongoBackedTestCase):
                  sf, "download_bulk_oracle_cards",
                  return_value=[DELVER_RAW, DELVER_ART_RAW],
              ):
-            call_silent(sf.run_bulk_mode, self.coll, False)
+            call_silent(sf.run_bulk_mode, self.coll)
         matches = sf.find_cards_by_name(self.coll, "Delver of Secrets")
         self.assertEqual(
             {m["scryfall_id"] for m in matches},
@@ -694,78 +749,15 @@ class TestBulkMode(_MongoBackedTestCase):
         )
 
     def test_meta_timestamp_persisted_after_successful_merge(self):
-        # The fast-path skip only works if the merge records the snapshot
-        # it just loaded. Verify meta carries the right value after a
-        # fresh download.
         with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
              patch.object(
                  sf, "download_bulk_oracle_cards",
                  return_value=[LIGHTNING_BOLT_RAW],
              ):
-            call_silent(sf.run_bulk_mode, self.coll, False)
+            call_silent(sf.run_bulk_mode, self.coll)
         self.assertEqual(
             storage.get_snapshot_timestamp(sf.META_SOURCE), LATER
         )
-
-    def test_fast_path_skips_staleness_scan_when_meta_matches(self):
-        # After a prior merge recorded the snapshot in meta, a rerun with
-        # the same snapshot must NOT scan every card doc. We assert that
-        # by patching has_stale_cards and refusing to let it be called.
-        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], LATER)
-        storage.set_snapshot_timestamp(sf.META_SOURCE, LATER)
-        with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
-             patch.object(sf, "download_bulk_oracle_cards") as dl, \
-             patch.object(sf, "has_stale_cards") as stale:
-            changed = call_silent(sf.run_bulk_mode, self.coll, False)
-        self.assertFalse(changed)
-        dl.assert_not_called()
-        stale.assert_not_called()
-
-    def test_fast_path_bypassed_when_meta_timestamp_stale(self):
-        # Meta recorded an older snapshot than the current /bulk-data —
-        # the fast-path check must fail and we must fall through to the
-        # staleness scan + download.
-        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], EARLIER)
-        storage.set_snapshot_timestamp(sf.META_SOURCE, EARLIER)
-        with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
-             patch.object(
-                 sf, "download_bulk_oracle_cards",
-                 return_value=[LIGHTNING_BOLT_RAW],
-             ) as dl:
-            call_silent(sf.run_bulk_mode, self.coll, False)
-        dl.assert_called_once()
-        self.assertEqual(
-            storage.get_snapshot_timestamp(sf.META_SOURCE), LATER
-        )
-
-    def test_pre_meta_cluster_upgrades_to_fast_path_after_clean_scan(self):
-        # Simulates a cluster populated before meta tracking existed:
-        # cards are present and already fresh, but no meta entry exists.
-        # The slow path should determine nothing is stale, skip the
-        # download, AND write the meta entry so the next run is fast.
-        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], LATER)
-        self.assertIsNone(storage.get_snapshot_timestamp(sf.META_SOURCE))
-        with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
-             patch.object(sf, "download_bulk_oracle_cards") as dl:
-            changed = call_silent(sf.run_bulk_mode, self.coll, False)
-        dl.assert_not_called()
-        self.assertFalse(changed)
-        self.assertEqual(
-            storage.get_snapshot_timestamp(sf.META_SOURCE), LATER
-        )
-
-    def test_refresh_bypasses_fast_path_even_when_meta_matches(self):
-        # --refresh must always force the download, no matter how fresh
-        # meta claims the cache is.
-        sf.bulk_upsert_cards(self.coll, [LIGHTNING_BOLT_RAW], LATER)
-        storage.set_snapshot_timestamp(sf.META_SOURCE, LATER)
-        with patch.object(sf, "get_bulk_oracle_metadata", return_value=FAKE_META), \
-             patch.object(
-                 sf, "download_bulk_oracle_cards",
-                 return_value=[LIGHTNING_BOLT_RAW],
-             ) as dl:
-            call_silent(sf.run_bulk_mode, self.coll, True)
-        dl.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -311,7 +311,8 @@ class TestAttachTagsToCards(_MongoBackedTestCase):
             {"_id": "id-doom", "scryfall_id": "id-doom", "oracle_id": "oracle-doom", "name": "Doom"},
         )
         index = {"oracle-bolt": ["evasion", "spot-removal"], "oracle-doom": ["spot-removal"]}
-        matched, empty, unmatched = ot.attach_tags_to_cards(self.cards, index)
+        changed, matched, empty, unmatched = ot.attach_tags_to_cards(self.cards, index)
+        self.assertEqual(changed, 2)
         self.assertEqual(matched, 2)
         self.assertEqual(empty, 0)
         self.assertEqual(unmatched, 0)
@@ -328,7 +329,7 @@ class TestAttachTagsToCards(_MongoBackedTestCase):
         self._seed_cards(
             {"_id": "id-x", "scryfall_id": "id-x", "name": "X"},  # no oracle_id
         )
-        matched, empty, unmatched = ot.attach_tags_to_cards(self.cards, {"oracle-y": ["foo"]})
+        _, matched, empty, _ = ot.attach_tags_to_cards(self.cards, {"oracle-y": ["foo"]})
         self.assertEqual(matched, 0)
         self.assertEqual(empty, 1)
         self.assertEqual(self.cards.find_one({"_id": "id-x"})["tags"], [])
@@ -338,7 +339,9 @@ class TestAttachTagsToCards(_MongoBackedTestCase):
             {"_id": "id-untagged", "scryfall_id": "id-untagged",
              "oracle_id": "oracle-untagged", "name": "U"},
         )
-        matched, empty, unmatched = ot.attach_tags_to_cards(self.cards, {"oracle-bolt": ["evasion"]})
+        _, matched, empty, _ = ot.attach_tags_to_cards(
+            self.cards, {"oracle-bolt": ["evasion"]}
+        )
         self.assertEqual(matched, 0)
         self.assertEqual(empty, 1)
         self.assertEqual(self.cards.find_one({"_id": "id-untagged"})["tags"], [])
@@ -359,8 +362,51 @@ class TestAttachTagsToCards(_MongoBackedTestCase):
         )
         index = {"oracle-bolt": ["evasion"], "oracle-doom": ["spot-removal"],
                  "oracle-wrath": ["mass-removal"]}
-        _, _, unmatched = ot.attach_tags_to_cards(self.cards, index)
+        _, _, _, unmatched = ot.attach_tags_to_cards(self.cards, index)
         self.assertEqual(unmatched, 2)
+
+    def test_unchanged_oracle_id_produces_no_write(self):
+        # Card already has exactly the tags the new mapping would set —
+        # the diff should classify as unchanged (changed_oids = 0) and
+        # leave `card_vector` intact.
+        self._seed_cards(
+            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt",
+             "tags": ["evasion"], "card_vector": [0.0] * 4},
+        )
+        changed, _, _, _ = ot.attach_tags_to_cards(
+            self.cards, {"oracle-bolt": ["evasion"]}
+        )
+        self.assertEqual(changed, 0)
+        # Content unchanged → no $unset — card_vector survives.
+        self.assertEqual(
+            self.cards.find_one({"_id": "id-bolt"})["card_vector"], [0.0] * 4
+        )
+
+    def test_changed_oracle_id_unsets_card_vector(self):
+        # Card has existing card_vector; the new tags differ, so the
+        # fused vector is stale and gets cleared.
+        self._seed_cards(
+            {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt",
+             "tags": ["old-tag"], "card_vector": [0.0] * 4},
+        )
+        changed, _, _, _ = ot.attach_tags_to_cards(
+            self.cards, {"oracle-bolt": ["evasion"]}
+        )
+        self.assertEqual(changed, 1)
+        doc = self.cards.find_one({"_id": "id-bolt"})
+        self.assertEqual(doc["tags"], ["evasion"])
+        self.assertNotIn("card_vector", doc)
+
+    def test_card_missing_tags_field_gets_empty_default(self):
+        # Simulates a card freshly added by scryfall-fetch after a prior
+        # tag import: the doc has no `tags` field at all. Attach must
+        # ensure every card ends up with `tags` set so downstream code
+        # can rely on it.
+        self.cards.insert_one(
+            {"_id": "id-new", "scryfall_id": "id-new", "oracle_id": "oracle-new"}
+        )
+        ot.attach_tags_to_cards(self.cards, {"oracle-other": ["foo"]})
+        self.assertEqual(self.cards.find_one({"_id": "id-new"})["tags"], [])
 
 
 # ---------------------------------------------------------------------------
@@ -503,8 +549,12 @@ class TestMainCLI(_MongoBackedTestCase):
     def test_fresh_snapshot_skips_download(self):
         # Pre-record the current snapshot timestamp. Running main() with
         # a bulk-data response claiming the same timestamp should skip
-        # the download (second urlopen call) entirely.
-        self.cards.insert_one({"_id": "id-x", "scryfall_id": "id-x", "oracle_id": "oracle-x"})
+        # the download (second urlopen call) entirely. The seeded card
+        # has `tags: []` already — if that field were missing, the
+        # untagged-cards auto-detect would force a redownload.
+        self.cards.insert_one(
+            {"_id": "id-x", "scryfall_id": "id-x", "oracle_id": "oracle-x", "tags": []}
+        )
         storage.set_snapshot_timestamp(ot.META_SOURCE, "2026-10-03T21:00:32.494+00:00")
         metadata_payload = {
             "data": [{
@@ -523,13 +573,14 @@ class TestMainCLI(_MongoBackedTestCase):
         # tags collection untouched because the download was skipped.
         self.assertEqual(self.tags.count_documents({}), 0)
 
-    def test_refresh_forces_download_even_when_snapshot_matches(self):
-        # Seed with oracle-bolt so TAG_EVASION actually attaches to it;
-        # that keeps matched > 0 and main() happy. The point of this
-        # test is the --refresh flag, not the "no cards tagged" warning.
+    def test_untagged_cards_trigger_redownload_even_with_matching_snapshot(self):
+        # The raw taggings aren't retained after import, so when a prior
+        # scryfall-fetch added new cards with no `tags` field, we have
+        # to redownload to tag them — even if the oracle_tags snapshot
+        # hasn't moved.
         self.cards.insert_one(
             {"_id": "id-bolt", "scryfall_id": "id-bolt", "oracle_id": "oracle-bolt"}
-        )
+        )  # no `tags` field
         storage.set_snapshot_timestamp(ot.META_SOURCE, "2026-10-03T21:00:32.494+00:00")
         metadata_payload = {
             "data": [{
@@ -545,11 +596,14 @@ class TestMainCLI(_MongoBackedTestCase):
         with patch(
             "mtg_recommender.scryfall_fetch.urllib.request.urlopen",
             side_effect=[_json_response(metadata_payload), _bytes_response(gzipped)],
-        ), patch("sys.argv", ["scryfall-fetch-tags", "--refresh"]):
+        ), patch("sys.argv", ["scryfall-fetch-tags"]):
             rc = call_silent(ot.main)
         self.assertEqual(rc, 0)
-        # Catalog now populated despite the matching timestamp.
+        # Download fired and attached despite matching snapshot timestamp.
         self.assertEqual(self.tags.count_documents({}), 1)
+        self.assertEqual(
+            self.cards.find_one({"_id": "id-bolt"})["tags"], ["evasion"]
+        )
 
 
 # ---------------------------------------------------------------------------
