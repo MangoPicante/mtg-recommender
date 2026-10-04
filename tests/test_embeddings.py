@@ -7,14 +7,16 @@ deterministic numpy vectors fast enough that the full file finishes in
 well under a second.
 
 Test classes:
-    TestTagText           — label/description composition rules
-    TestEmbedCards        — batching, refresh semantics, skip-no-text, limit
-    TestEmbedTags         — mirror coverage for the tags collection
-    TestEncoderCache      — reset_encoder; missing dep raises cleanly
-    TestFuseHelpers       — _l2_normalize / _aggregate_tag_vector / _fuse_vectors
-    TestFuseCardVectors   — fuse loop: happy path, no-tags, dim mismatch,
-                            skip-already-fused, --refresh, --limit, alpha extremes
-    TestMainCLI           — argparse dispatch (cards / tags / fuse / flags)
+    TestTagText             — label/description composition rules
+    TestEmbedCards          — batching, refresh semantics, skip-no-text, limit
+    TestEmbedTags           — mirror coverage for the tags collection
+    TestEncoderCache        — reset_encoder; missing dep raises cleanly
+    TestPackUnpackEmbedding — pack/unpack helpers: Binary roundtrip,
+                               float64 downcast, legacy list[float] read
+    TestFuseHelpers         — _l2_normalize / _aggregate_tag_vector / _fuse_vectors
+    TestFuseCardVectors     — fuse loop: happy path, no-tags, dim mismatch,
+                               skip-already-fused, --refresh, --limit, alpha extremes
+    TestMainCLI             — argparse dispatch (cards / tags / fuse / flags)
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ from unittest.mock import patch
 
 import mongomock
 import numpy as np
+from bson import Binary
 
 from mtg_recommender import embeddings as emb
 from mtg_recommender import storage
@@ -109,17 +112,21 @@ class TestEmbedCards(_MongoBackedTestCase):
         ]
         self.cards.insert_many(docs)
 
-    def test_writes_text_embedding_as_list_of_floats(self):
+    def test_writes_text_embedding_as_packed_float32(self):
         self._seed(("a", "deal 3 damage"))
         with redirect_stdout(io.StringIO()):
             emb.embed_cards(self.cards)
         doc = self.cards.find_one({"_id": "a"})
         self.assertIn("text_embedding", doc)
-        self.assertIsInstance(doc["text_embedding"], list)
-        self.assertEqual(len(doc["text_embedding"]), self.encoder.dim)
-        # Must be plain Python floats, not numpy scalars (BSON would
-        # choke on numpy types without a type coder).
-        self.assertIsInstance(doc["text_embedding"][0], float)
+        # Stored as BSON Binary bytes, not a list — ~half the on-disk
+        # size of the old list[float] form, and lossless relative to
+        # the encoder's native float32 output.
+        self.assertIsInstance(doc["text_embedding"], (bytes, Binary))
+        # 8-dim float32 = 32 bytes exactly.
+        self.assertEqual(len(doc["text_embedding"]), self.encoder.dim * 4)
+        # And it round-trips through the unpack helper to the right shape.
+        vec = emb._unpack_embedding(doc["text_embedding"])
+        self.assertEqual(vec.shape, (self.encoder.dim,))
 
     def test_skips_cards_without_oracle_text(self):
         self.cards.insert_many([
@@ -194,7 +201,12 @@ class TestEmbedTags(_MongoBackedTestCase):
         for slug in ("spot-removal", "evasion"):
             doc = self.tags.find_one({"_id": slug})
             self.assertIn("embedding", doc)
-            self.assertEqual(len(doc["embedding"]), self.encoder.dim)
+            # Packed float32 → 4 bytes/dim.
+            self.assertEqual(len(doc["embedding"]), self.encoder.dim * 4)
+            self.assertEqual(
+                emb._unpack_embedding(doc["embedding"]).shape,
+                (self.encoder.dim,),
+            )
 
     def test_label_plus_description_fed_to_encoder(self):
         self.tags.insert_one(
@@ -234,6 +246,67 @@ class TestEncoderCache(unittest.TestCase):
         fake = FakeEncoder()
         emb.reset_encoder(fake)
         self.assertIs(emb.get_encoder(), fake)
+
+
+# ---------------------------------------------------------------------------
+# Storage pack/unpack
+# ---------------------------------------------------------------------------
+
+class TestPackUnpackEmbedding(unittest.TestCase):
+
+    def test_pack_returns_bson_binary_of_float32_bytes(self):
+        vec = np.array([1.0, -2.5, 0.0, 3.25], dtype=np.float32)
+        packed = emb._pack_embedding(vec)
+        self.assertIsInstance(packed, Binary)
+        # 4 dims × 4 bytes/float32 = 16 bytes exactly.
+        self.assertEqual(len(packed), 16)
+
+    def test_pack_unpack_roundtrip_is_lossless_for_float32(self):
+        # Values representable exactly in float32 round-trip without loss.
+        original = np.array([1.0, -2.5, 0.0, 3.25, 0.125], dtype=np.float32)
+        restored = emb._unpack_embedding(emb._pack_embedding(original))
+        np.testing.assert_array_equal(restored.astype(np.float32), original)
+
+    def test_pack_handles_float64_input_by_downcasting(self):
+        # Our encoder output is float32 but numeric helpers upcast to
+        # float64. Pack must accept either without complaint.
+        vec = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+        packed = emb._pack_embedding(vec)
+        self.assertEqual(len(packed), 12)
+
+    def test_unpack_accepts_legacy_list_of_float(self):
+        # Pre-float32-storage docs stored embeddings as list[float].
+        # The reader must keep handling them so a mixed-shape cluster
+        # doesn't need an explicit migration.
+        legacy = [1.0, 2.0, 3.0, 4.0]
+        restored = emb._unpack_embedding(legacy)
+        np.testing.assert_array_equal(restored, [1.0, 2.0, 3.0, 4.0])
+        self.assertEqual(restored.dtype, np.float64)
+
+    def test_unpack_rejects_unexpected_types(self):
+        with self.assertRaises(TypeError):
+            emb._unpack_embedding("not a vector")
+
+    def test_fuse_reads_legacy_list_embeddings(self):
+        # End-to-end verification that a card with legacy list[float]
+        # text_embedding fuses correctly against a tag with legacy
+        # list[float] embedding — no shape coercion needed by callers.
+        storage.reset_client(mongomock.MongoClient())
+        storage.ensure_indexes()
+        cards = storage.cards_collection()
+        tags = storage.tags_collection()
+        try:
+            tags.insert_one({"_id": "a", "label": "A", "embedding": [0.0, 1.0, 0.0, 0.0]})
+            cards.insert_one({
+                "_id": "c1", "name": "C1", "oracle_text": "x",
+                "text_embedding": [1.0, 0.0, 0.0, 0.0], "tags": ["a"],
+            })
+            with redirect_stdout(io.StringIO()):
+                emb.fuse_card_vectors(cards, tags, alpha=0.5)
+            got = emb._unpack_embedding(cards.find_one({"_id": "c1"})["card_vector"])
+            self.assertAlmostEqual(float(np.linalg.norm(got)), 1.0, places=6)
+        finally:
+            storage.reset_client(None)
 
 
 # ---------------------------------------------------------------------------
@@ -333,18 +406,20 @@ class TestFuseCardVectors(_MongoBackedTestCase):
         self.assertEqual(written, 1)
         doc = self.cards.find_one({"_id": "c1"})
         self.assertIn("card_vector", doc)
-        self.assertEqual(len(doc["card_vector"]), self.DIM)
-        self.assertAlmostEqual(
-            float(np.linalg.norm(np.array(doc["card_vector"]))), 1.0, places=6
-        )
-        # BSON needs plain floats, not numpy scalars.
-        self.assertIsInstance(doc["card_vector"][0], float)
+        # Stored as packed float32 bytes — 4 bytes per dim.
+        self.assertIsInstance(doc["card_vector"], (bytes, Binary))
+        self.assertEqual(len(doc["card_vector"]), self.DIM * 4)
+        vec = emb._unpack_embedding(doc["card_vector"])
+        self.assertEqual(vec.shape, (self.DIM,))
+        self.assertAlmostEqual(float(np.linalg.norm(vec)), 1.0, places=6)
 
     def test_card_with_no_tags_fuses_to_normalized_text(self):
         self._seed_card("c1", [0.0, 2.0, 0.0, 0.0], [])
         with redirect_stdout(io.StringIO()):
             emb.fuse_card_vectors(self.cards, self.tags, alpha=0.6)
-        got = self.cards.find_one({"_id": "c1"})["card_vector"]
+        got = emb._unpack_embedding(
+            self.cards.find_one({"_id": "c1"})["card_vector"]
+        )
         np.testing.assert_allclose(got, [0.0, 1.0, 0.0, 0.0])
 
     def test_tags_with_no_embedding_fall_back_to_text(self):
@@ -354,7 +429,9 @@ class TestFuseCardVectors(_MongoBackedTestCase):
         self._seed_card("c1", [0.0, 0.0, 3.0, 0.0], ["a"])
         with redirect_stdout(io.StringIO()):
             emb.fuse_card_vectors(self.cards, self.tags, alpha=0.5)
-        got = self.cards.find_one({"_id": "c1"})["card_vector"]
+        got = emb._unpack_embedding(
+            self.cards.find_one({"_id": "c1"})["card_vector"]
+        )
         np.testing.assert_allclose(got, [0.0, 0.0, 1.0, 0.0])
 
     def test_dim_mismatch_raises(self):
@@ -489,7 +566,8 @@ class TestMainCLI(_MongoBackedTestCase):
         self.assertEqual(rc, 0)
         doc = self.cards.find_one({"_id": "c1"})
         self.assertIn("card_vector", doc)
-        self.assertEqual(len(doc["card_vector"]), 4)
+        # Packed float32 → 4 bytes/dim.
+        self.assertEqual(len(doc["card_vector"]), 4 * 4)
         self.assertIn("wrote card_vector on 1 cards", out)
 
     def test_fuse_alpha_flag_passed_through(self):
@@ -497,7 +575,9 @@ class TestMainCLI(_MongoBackedTestCase):
         self._seed_fuse_fixture()
         rc, _, _ = _run(["fuse", "--alpha", "1.0"])
         self.assertEqual(rc, 0)
-        got = self.cards.find_one({"_id": "c1"})["card_vector"]
+        got = emb._unpack_embedding(
+            self.cards.find_one({"_id": "c1"})["card_vector"]
+        )
         np.testing.assert_allclose(got, [1.0, 0.0, 0.0, 0.0])
 
     def test_fuse_refresh_flag_passed_through(self):

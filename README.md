@@ -191,10 +191,14 @@ mtg-embed cards --refresh
 mtg-embed cards --limit 50
 ```
 
-Vectors land as `list[float]` on the card doc (`text_embedding`) and the tag
-doc (`embedding`). Default model is `sentence-transformers/all-mpnet-base-v2`
-(768-dim); override via the `MTG_EMBEDDING_MODEL` env var without touching
-code.
+Vectors land as BSON Binary (packed little-endian float32) on the card doc
+(`text_embedding`) and the tag doc (`embedding`) — 4 bytes per dim instead
+of the 8 bytes a BSON double array would take. Lossless relative to the
+encoder's native float32 output, and halves the on-disk cost: a 40 k-card
+cluster with text + card_vector lands at ~240 MB instead of ~490 MB,
+comfortable on Atlas's free tier. Default model is
+`sentence-transformers/all-mpnet-base-v2` (768-dim); override via the
+`MTG_EMBEDDING_MODEL` env var without touching code.
 
 Once both sides are populated, fuse them into a single per-card vector:
 
