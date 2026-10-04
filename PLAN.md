@@ -35,8 +35,8 @@ Tests: offline unittest + mongomock suite plus an opt-in integration suite (`tes
 
 - **Oracle-text embeddings.** _(done)_ Each card's `oracle_text` is encoded via `sentence-transformers/all-mpnet-base-v2` (768-dim) and persisted as `text_embedding` on the card doc. Encoder is overridable through the `MTG_EMBEDDING_MODEL` env var. The CLI (`mtg-embed cards`) skips docs that already carry a vector; `--refresh` re-embeds.
 - **Oracletag embeddings.** _(done)_ Each tag's `label + description` is encoded with the same model and persisted as `embedding` on the tag doc. `mtg-embed tags` runs the same skip / `--refresh` pattern. Clustering of these embeddings — "treat a tag as this + its neighbours" — is the next sub-step.
-- **Combined card vector.** _(next)_ Fuse `text_embedding` with the aggregated tag embedding into one vector per card via **weighted average** (`alpha * text_vec + (1 - alpha) * tag_vec`). Requires both spaces to share dimensionality (they do — same encoder); `alpha` starts as a tunable constant.
-- **Freshness.** Still TODO — regenerate `text_embedding` when `updated_at` moves and `card_vector` when either input changes. For v1 the user runs `mtg-embed --refresh` manually; auto-invalidation lands with the fuse step.
+- **Combined card vector.** _(done)_ `mtg-embed fuse` reads `text_embedding` + the card's tag embeddings, L2-normalizes each side, blends them via `alpha * text + (1 - alpha) * tag` (default `alpha=0.6`, overridable via `--alpha`), renormalizes, and writes the result as `card_vector` on the card doc. Cards with no (resolvable) tags collapse to the normalized text vector — tags-only would fail silently otherwise. A dim mismatch between the two spaces raises instead of producing a vector in neither space.
+- **Freshness.** Still TODO — regenerate `text_embedding` when `updated_at` moves and `card_vector` when either input changes. For v1 the user runs `mtg-embed cards --refresh` / `mtg-embed fuse --refresh` manually; auto-invalidation (per-doc source signature, probably) is a dedicated follow-up slice.
 
 ### Phase 3 — recommendation
 
