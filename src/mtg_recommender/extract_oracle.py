@@ -38,10 +38,13 @@ Output shape (JSON):
 `updated_at` is intentionally dropped — it's cache metadata about when
 we last refreshed the entry, not information about the card itself.
 
-Usage:
-    python extract_oracle.py "Lightning Bolt" "Counterspell" -o subset.json
-    python extract_oracle.py --file cards.txt -o deck_oracle.json
-    python extract_oracle.py --file cards.txt        # defaults to ./oracle_subset.json
+Usage (after `pip install -e .`, which registers the `extract-oracle` script):
+    extract-oracle "Lightning Bolt" "Counterspell" -o subset.json
+    extract-oracle --file cards.txt -o deck_oracle.json
+    extract-oracle --file cards.txt        # defaults to ./oracle_subset.json
+
+Equivalently from a source checkout without installing:
+    python -m mtg_recommender.extract_oracle --file cards.txt
 """
 from __future__ import annotations
 
@@ -50,11 +53,15 @@ import json
 import sys
 from pathlib import Path
 
-import scryfall_fetch as sf
+# Intra-package relative import — pairs with the `src/mtg_recommender/` layout
+# declared in pyproject.toml so this works both when installed (pip install -e .)
+# and when run as `python -m mtg_recommender.extract_oracle`.
+from . import scryfall_fetch as sf
 
-# Default output lives at the project root — this file is meant to be
-# shared/shipped, unlike the cache under cache/ which is gitignored.
-DEFAULT_OUTPUT = Path(__file__).resolve().parent / "oracle_subset.json"
+# Default output lives next to wherever the user runs the CLI from. CWD-relative
+# rather than module-relative so the file lands somewhere the user can see,
+# rather than inside the installed package tree. Override with -o.
+DEFAULT_OUTPUT = Path.cwd() / "oracle_subset.json"
 
 # Fields to copy per card into the output. Chosen to be everything a
 # downstream text-based recommender would want, minus the cache-only

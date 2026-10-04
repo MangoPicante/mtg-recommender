@@ -1,0 +1,58 @@
+# PEP 621 project metadata + build config. Single source of truth for
+# dependencies, Python version floor, package layout, and console entry points.
+# Replaces the earlier `requirements.txt`.
+
+[build-system]
+# Hatchling is a modern, PEP 517-compliant build backend. Picked over setuptools
+# because this is a pure-Python package with no C extensions / no exotic build
+# steps — hatchling needs ~zero configuration for that case.
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mtg-recommender"
+version = "0.1.0"
+description = "Recommend Magic: The Gathering cards for a decklist, grounded in Scryfall oracle text."
+readme = "README.md"
+# 3.10 floor matches `from __future__ import annotations` + 3.10-style union
+# syntax (`list[str] | None`) used throughout the modules.
+requires-python = ">=3.10"
+authors = [{ name = "Sean" }]
+keywords = ["magic", "mtg", "commander", "scryfall", "recommender"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Games/Entertainment",
+]
+
+# Intentionally empty — the current modules are stdlib-only. Dependencies will
+# arrive as later phases land; see PLAN.md.
+#
+# Expected additions:
+#   Phase 1 (persistence) — pymongo, python-dotenv
+#   Phase 2 (embeddings)  — sentence-transformers (pulls torch), numpy, scikit-learn
+dependencies = []
+
+# Optional extras let a user opt into heavier dep groups:
+#   pip install -e ".[dev]"
+# Add new groups here as they become needed (`mongo`, `embeddings`, etc.).
+[project.optional-dependencies]
+dev = []
+
+# Console scripts exposed by `pip install`. Both main() functions already return
+# int exit codes, so the generated wrappers propagate those to the shell.
+[project.scripts]
+scryfall-fetch = "mtg_recommender.scryfall_fetch:main"
+extract-oracle = "mtg_recommender.extract_oracle:main"
+
+# -----------------------------------------------------------------------------
+# Hatchling-specific configuration
+# -----------------------------------------------------------------------------
+
+# Tell hatchling where the package lives. Without this, hatch auto-detects, but
+# an explicit declaration is safer and documents the layout.
+[tool.hatch.build.targets.wheel]
+packages = ["src/mtg_recommender"]

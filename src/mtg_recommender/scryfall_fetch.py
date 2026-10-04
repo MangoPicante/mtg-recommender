@@ -72,11 +72,14 @@ Bulk-download triggers (any one is enough):
 
 The cache/ directory is gitignored so nothing here leaks into the repo.
 
-Usage:
-    python scryfall_fetch.py "Lightning Bolt"                    # 1 card  -> /cards/named
-    python scryfall_fetch.py "Lightning Bolt" "Counterspell"     # 2+ cards -> bulk
-    python scryfall_fetch.py --file cards.txt                    # from a file
-    python scryfall_fetch.py --file cards.txt --refresh          # force refetch/redownload
+Usage (after `pip install -e .`, which registers the `scryfall-fetch` script):
+    scryfall-fetch "Lightning Bolt"                    # 1 card  -> /cards/named
+    scryfall-fetch "Lightning Bolt" "Counterspell"     # 2+ cards -> bulk
+    scryfall-fetch --file cards.txt                    # from a file
+    scryfall-fetch --file cards.txt --refresh          # force refetch/redownload
+
+Equivalently from a source checkout without installing:
+    python -m mtg_recommender.scryfall_fetch "Lightning Bolt"
 """
 from __future__ import annotations
 
@@ -108,7 +111,14 @@ HEADERS = {
 }
 
 # All cached data lives in cache/, which .gitignore excludes from the repo.
-CACHE_DIR = Path(__file__).resolve().parent / "cache"
+#
+# CWD-relative rather than module-relative because the module now lives inside
+# an installable package (src/mtg_recommender/) — a module-relative path would
+# either bury cache/ inside the package tree during development or vanish into
+# site-packages when installed as a wheel. Users running the CLI from the
+# project root (the common case) still get ./cache/ as expected; anything else
+# can be overridden with --cache.
+CACHE_DIR = Path.cwd() / "cache"
 # Single unified cache: id-keyed card store plus name -> id alias index.
 CACHE_PATH = CACHE_DIR / "oracle_texts.json"
 
