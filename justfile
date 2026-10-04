@@ -73,6 +73,10 @@ embed *ARGS:
 embed-smoke:
     mtg-embed cards --limit 20
 
+# Fuse text + aggregated tag embeddings into card_vector (`mtg-embed fuse` wrapper).
+fuse *ARGS:
+    mtg-embed fuse {{ARGS}}
+
 # Export a trimmed JSON subset for a decklist file (`extract-oracle` wrapper).
 extract FILE *ARGS:
     extract-oracle --file {{FILE}} {{ARGS}}

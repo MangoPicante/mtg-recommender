@@ -24,7 +24,7 @@ Under `src/mtg_recommender/`:
 | `extract_oracle` | Writes a trimmed per-decklist JSON subset of the cards collection for downstream consumers that don't speak Mongo. |
 | `explore` | Read-only ad-hoc inspection CLI (installed as `mtg-inspect`). Subcommands: `card`, `tag`, `list`, `stats`. Human-readable output for one-off exploration and debugging. |
 | `check` | Read-only health check. Pings the Mongo server, verifies the configured database + indexes, and reports a doc count per collection. Exit 0 on success, 1 if any check fails. |
-| `embeddings` | Phase 2. Encodes each card's `oracle_text` into `text_embedding` on the card doc and each tag's label+description into `embedding` on the tag doc. Uses `sentence-transformers/all-mpnet-base-v2` (768-dim) by default; `MTG_EMBEDDING_MODEL` env var overrides. |
+| `embeddings` | Phase 2. Encodes each card's `oracle_text` into `text_embedding` on the card doc and each tag's label+description into `embedding` on the tag doc; also fuses the two into a single unit `card_vector` per card via a weighted average (`alpha * text + (1 - alpha) * tag`, defaults to `alpha=0.6`). Uses `sentence-transformers/all-mpnet-base-v2` (768-dim) by default; `MTG_EMBEDDING_MODEL` env var overrides. |
 
 Tests live under `tests/` and are offline — every HTTP call is mocked, every
 Mongo op goes through `mongomock`.
@@ -173,8 +173,30 @@ mtg-embed cards --limit 50
 Vectors land as `list[float]` on the card doc (`text_embedding`) and the tag
 doc (`embedding`). Default model is `sentence-transformers/all-mpnet-base-v2`
 (768-dim); override via the `MTG_EMBEDDING_MODEL` env var without touching
-code. The weighted-average fuse into a single `card_vector` is the next
-Phase 2 slice.
+code.
+
+Once both sides are populated, fuse them into a single per-card vector:
+
+```bash
+# Default: fuse every card that has text_embedding but no card_vector.
+mtg-embed fuse
+
+# Tweak the text/tag blend (default alpha=0.6, i.e. 60% text / 40% tags).
+mtg-embed fuse --alpha 0.7
+mtg-embed fuse --alpha 1.0        # ignore tags entirely
+mtg-embed fuse --alpha 0.0        # ignore text entirely
+
+# Re-fuse everything (needed when alpha changes or an input was re-embedded).
+mtg-embed fuse --refresh
+```
+
+The result lands as a unit-length `card_vector` on each card doc. Fuse logic
+L2-normalizes `text_embedding` and the mean of the card's tag embeddings
+before combining them, then renormalizes — so cosine similarity on
+`card_vector` is well-behaved and `alpha` only steers direction, never
+magnitude. Cards with no tags fall back to the normalized text vector
+(effectively `alpha=1.0` for those cards). Freshness is still manual: when
+you change `alpha` or re-embed either input, rerun with `--refresh`.
 
 ### Extract a decklist subset
 
