@@ -87,6 +87,10 @@ populate *ARGS:
     mtg-embed tags {{ARGS}}
     mtg-embed fuse {{ARGS}}
 
+# Cluster a decklist's tags into themes (`mtg-deck-profile` wrapper). Pass a decklist with --file or positional names.
+profile *ARGS:
+    mtg-deck-profile {{ARGS}}
+
 # Export a trimmed JSON subset for a decklist file (`extract-oracle` wrapper).
 extract FILE *ARGS:
     extract-oracle --file {{FILE}} {{ARGS}}

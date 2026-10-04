@@ -61,14 +61,14 @@ A [`justfile`](justfile) wraps the common dev + CLI flows. Install
 [just](https://just.systems) and run `just` with no target to list recipes.
 `just install` runs the editable install above; `just test` runs the offline
 suite; `just lint` runs ruff; `just check`, `just inspect`, `just extract`,
-`just embed`, `just fuse` delegate to the console scripts (the embed ones
-with argument pass-through); `just fetch` and `just tags` are flagless
-because the underlying fetchers are idempotent + diff-aware. `just populate`
-runs the whole `fetch → tag → embed → fuse` pipeline end-to-end — the single
-command that takes a cold Mongo cluster to a recommendation-ready state
-(slow on first run: embedding ~40k cards on CPU is a few minutes plus a
-one-time ~420 MB sentence-transformers download; reruns on an unchanged
-Scryfall snapshot are near-instant).
+`just embed`, `just fuse`, `just profile` delegate to the console scripts
+(the embed and profile ones with argument pass-through); `just fetch` and
+`just tags` are flagless because the underlying fetchers are idempotent +
+diff-aware. `just populate` runs the whole `fetch → tag → embed → fuse`
+pipeline end-to-end — the single command that takes a cold Mongo cluster
+to a recommendation-ready state (slow on first run: embedding ~40k cards
+on CPU is a few minutes plus a one-time ~420 MB sentence-transformers
+download; reruns on an unchanged Scryfall snapshot are near-instant).
 
 ### MongoDB
 
@@ -106,10 +106,11 @@ the error you care about shows up first.
 ## Usage
 
 The console scripts (`scryfall-fetch`, `scryfall-fetch-tags`, `mtg-embed`,
-`mtg-inspect`, `mtg-check`, `extract-oracle`) are installed by
-`pip install -e .`. Equivalent `python -m mtg_recommender.<module>` forms
-also work from a source checkout. Phase 3's `edhrec_fetch` ships as a
-library only for now — the recommender CLI will land in a follow-up PR.
+`mtg-inspect`, `mtg-check`, `extract-oracle`, `mtg-deck-profile`) are
+installed by `pip install -e .`. Equivalent `python -m mtg_recommender.<module>`
+forms also work from a source checkout. Phase 3's `edhrec_fetch` ships
+as a library only for now — the full recommender CLI will land in a
+follow-up PR.
 
 ### Fetch oracle text
 
@@ -285,36 +286,60 @@ one fewer transitive dep, and gives us the signals we actually need.
 
 ### Deck profile and tag clustering (Phase 3)
 
-The `deck_profile` module takes a decklist and surfaces its themes by
-clustering the union of per-card tags in embedding space. Library-only
-until the recommender CLI lands:
+Cluster a decklist's tags into themes using the stored tag embeddings.
+Requires `cards` + `tags` collections populated (`just populate` or the
+equivalent individual steps):
+
+```bash
+# From a decklist file (one card per line; '#' comments, Moxfield /
+# MTGGoldfish / Arena export formats tolerated).
+mtg-deck-profile --file deck.txt
+
+# Or inline card names.
+mtg-deck-profile "Lightning Bolt" "Wrath of God" "Sol Ring" "Brainstorm"
+
+# Tune the clusterer. Lower --min-cluster-size for small decks;
+# raise it (3–4) to surface only strong themes.
+mtg-deck-profile --file deck.txt --min-cluster-size 3
+
+# Cap per-cluster display (default: 10 tags + 10 cards each; everything
+# beyond collapses to a "(+N more)" marker).
+mtg-deck-profile --file deck.txt --limit 20
+```
+
+Sample output:
+
+```text
+resolved 99 unique cards (0 missing)
+tag universe: 142 unique tags
+4 theme(s) clustered, 8 tag(s) in noise
+
+theme 'spot-removal'  (18 tags, 12 cards)
+  tags : burn-any, exile-creature, removal-creature, spot-removal, ...
+  cards: Anguished Unmaking, Beast Within, Despark, ..., (+2 more)
+
+theme 'mana-rock'  (11 tags, 14 cards)
+  ...
+```
+
+Also usable as a library — the CLI is a thin wrapper over
+`build_deck_profile`:
 
 ```python
 from mtg_recommender import deck_profile as dp
 
-profile = dp.build_deck_profile([
-    "Lightning Bolt", "Wrath of God", "Sol Ring",
-    "Birds of Paradise", "Brainstorm",
-])
-
-print(f"deck resolved: {len(profile.deck_card_ids)} cards")
-print(f"missing: {profile.missing_names}")
+profile = dp.build_deck_profile(["Lightning Bolt", "Wrath of God", ...])
 for cluster in profile.clusters:
-    print(f"  theme {cluster.label!r}: {len(cluster.tags)} tags, "
-          f"{len(cluster.deck_card_ids)} deck cards")
-print(f"noise (unclustered tags): {profile.noise_tags}")
+    print(cluster.label, cluster.tags, cluster.centroid.shape)
 ```
 
-Each cluster's `centroid` is a unit vector in the tag embedding space —
-Phase 3 step 4 (candidate ranking) uses it as a query vector against
-`card_vector` to find candidate cards, with EDHREC lift (from
-`edhrec_fetch`) layered on as a per-commander quality signal.
-
 **Clustering details:** `sklearn.cluster.HDBSCAN` with `metric="cosine"`
-and `min_cluster_size=2` by default. Lower `min_cluster_size` for small
-decks; raise it (3–4) to keep only strong themes. Tags without a stored
-embedding (or that HDBSCAN flags as noise) land in `profile.noise_tags`
-so the caller can audit what was dropped.
+and `min_cluster_size=2` by default. Each cluster's `centroid` is a unit
+vector in the tag embedding space — Phase 3 step 4 (candidate ranking)
+will use it as a query vector against `card_vector`, with EDHREC lift
+(from `edhrec_fetch`) layered on as a per-commander quality signal. Tags
+without a stored embedding (or that HDBSCAN flags as noise) land in
+`profile.noise_tags` so you can audit what was dropped.
 
 ## Testing
 

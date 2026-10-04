@@ -14,10 +14,17 @@ Test classes:
                                  degenerate universe returns empty
     TestCentroidAndLabel        picks nearest tag; L2-normalises centroid
     TestBuildDeckProfile        end-to-end on a seeded mongomock cluster
+    TestRenderProfile           truncation marker, cluster display shape
+    TestMainCLI                 argparse: --file, --min-cluster-size, --limit,
+                                 empty-input error
 """
 from __future__ import annotations
 
+import io
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import mongomock
 import numpy as np
@@ -321,6 +328,148 @@ class TestBuildDeckProfile(_MongoBackedTestCase):
         self.assertEqual(profile.deck_card_ids, ())
         self.assertEqual(profile.clusters, ())
         self.assertEqual(profile.tag_universe, ())
+
+
+# ---------------------------------------------------------------------------
+# _render_profile
+# ---------------------------------------------------------------------------
+
+class TestRenderProfile(unittest.TestCase):
+
+    def _make_profile(self, cluster_tags, cluster_card_ids):
+        return dp.DeckProfile(
+            deck_card_ids=tuple(cluster_card_ids),
+            missing_names=(),
+            tag_universe=tuple(sorted(cluster_tags)),
+            clusters=(
+                dp.DeckCluster(
+                    label=cluster_tags[0],
+                    tags=tuple(cluster_tags),
+                    centroid=np.array([1.0, 0.0, 0.0, 0.0]),
+                    deck_card_ids=tuple(cluster_card_ids),
+                ),
+            ),
+            noise_tags=(),
+        )
+
+    def test_truncation_marker_appears_when_items_exceed_limit(self):
+        profile = self._make_profile(
+            cluster_tags=["a", "b", "c", "d", "e"],
+            cluster_card_ids=["id-1", "id-2", "id-3"],
+        )
+        text = dp._render_profile(
+            profile,
+            name_lookup={f"id-{i}": f"Card {i}" for i in (1, 2, 3)},
+            limit=2,
+        )
+        self.assertIn("(+3 more)", text)
+        self.assertIn("(+1 more)", text)
+
+    def test_no_truncation_marker_when_within_limit(self):
+        profile = self._make_profile(["a", "b"], ["id-1"])
+        text = dp._render_profile(
+            profile, name_lookup={"id-1": "Card 1"}, limit=10
+        )
+        self.assertNotIn("more)", text)
+
+    def test_missing_names_listed(self):
+        profile = dp.DeckProfile(
+            deck_card_ids=(),
+            missing_names=("Nonexistent Card",),
+            tag_universe=(),
+            clusters=(),
+            noise_tags=(),
+        )
+        text = dp._render_profile(profile, name_lookup={}, limit=10)
+        self.assertIn("1 missing", text)
+        self.assertIn("Nonexistent Card", text)
+
+
+# ---------------------------------------------------------------------------
+# main() CLI
+# ---------------------------------------------------------------------------
+
+def _run_cli(argv: list[str]) -> tuple[int, str, str]:
+    """Invoke the CLI with argv, returning (rc, stdout, stderr)."""
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = dp.main(argv)
+    return rc, out.getvalue(), err.getvalue()
+
+
+class TestMainCLI(_MongoBackedTestCase):
+
+    def _seed_full_deck(self):
+        """Same fixture TestBuildDeckProfile uses, lifted here so the CLI
+        tests don't depend on test-class inheritance."""
+        self._seed_tags()
+        self._seed_card("id-bolt",      "Lightning Bolt",   ["spot-removal", "burn-any"])
+        self._seed_card("id-wrath",     "Wrath of God",     ["spot-removal", "removal-creature"])
+        self._seed_card("id-sol",       "Sol Ring",         ["mana-rock"])
+        self._seed_card("id-mystic",    "Birds of Paradise", ["mana-dork", "ramp"])
+        self._seed_card("id-brainstorm", "Brainstorm",      ["card-draw", "cantrip"])
+
+    def test_prints_cluster_summary_from_positional_names(self):
+        self._seed_full_deck()
+        rc, out, _ = _run_cli([
+            "Lightning Bolt", "Wrath of God", "Sol Ring",
+            "Birds of Paradise", "Brainstorm",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertIn("resolved 5 unique cards", out)
+        self.assertIn("theme ", out)
+        # Card names appear in the rendered output (not just scryfall ids).
+        self.assertIn("Lightning Bolt", out)
+        # And the three themes line is correct.
+        self.assertIn("3 theme(s) clustered", out)
+
+    def test_file_input_reads_decklist(self):
+        self._seed_full_deck()
+        with TemporaryDirectory() as d:
+            deck = Path(d) / "deck.txt"
+            deck.write_text(
+                "# commander\n"
+                "1 Lightning Bolt\n"
+                "1 Wrath of God\n"
+                "1 Sol Ring\n"
+                "1 Birds of Paradise\n"
+                "1 Brainstorm\n",
+                encoding="utf-8",
+            )
+            rc, out, _ = _run_cli(["--file", str(deck)])
+        self.assertEqual(rc, 0)
+        self.assertIn("resolved 5 unique cards", out)
+
+    def test_limit_flag_truncates(self):
+        self._seed_full_deck()
+        rc, out, _ = _run_cli([
+            "Lightning Bolt", "Wrath of God", "Sol Ring",
+            "Birds of Paradise", "Brainstorm", "--limit", "1",
+        ])
+        self.assertEqual(rc, 0)
+        # With only 1 item per cluster shown, truncation markers must appear.
+        self.assertIn("more)", out)
+
+    def test_min_cluster_size_pipes_through(self):
+        # min_cluster_size=10 is larger than any single theme's membership,
+        # so no themes should emerge — everything lands in noise.
+        self._seed_full_deck()
+        rc, out, _ = _run_cli([
+            "Lightning Bolt", "Wrath of God", "Sol Ring",
+            "Birds of Paradise", "Brainstorm", "--min-cluster-size", "10",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertIn("0 theme(s) clustered", out)
+
+    def test_missing_names_surfaced_in_output(self):
+        self._seed_full_deck()
+        rc, out, _ = _run_cli(["Lightning Bolt", "No Such Card"])
+        self.assertEqual(rc, 0)
+        self.assertIn("missing: No Such Card", out)
+
+    def test_empty_input_errors(self):
+        with self.assertRaises(SystemExit):
+            _run_cli([])
 
 
 if __name__ == "__main__":
