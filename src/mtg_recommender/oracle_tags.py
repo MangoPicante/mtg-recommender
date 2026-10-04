@@ -37,7 +37,6 @@ What this module writes:
 
     {
       "_id":            "<slug>",
-      "scryfall_tag_id":"<uuid>",         # kept for cross-ref with the API
       "label":          "...",            # human-readable form of the slug
       "description":    "..." | null,
       "parent_slugs":   ["..."],          # parent uuids resolved to slugs
@@ -47,8 +46,11 @@ What this module writes:
 
    Slugs are used as _id (rather than uuids) because they're stable,
    URL-safe, and human-readable — far more useful at the REPL than
-   32-char hex ids. Parent/child references are translated from uuids
-   to slugs during catalog construction via a one-pass index.
+   32-char hex ids. The raw Scryfall tag UUID isn't stored — nothing
+   in the project cross-refs it against the API, so persisting ~37
+   bytes × 4.5 k tags was pure overhead. Parent/child references are
+   translated from uuids to slugs during catalog construction via a
+   one-pass index.
 
 2. cards collection — every card document gains a `tags: ["<slug>", ...]`
    field. Weight and annotation are dropped: 99.7 % of weights are
@@ -199,10 +201,9 @@ def extract_tag_fields(raw: dict, id_to_slug: dict[str, str]) -> dict:
     absent here — this function is reused by tests that only care
     about field projection.
 
-    `id` on the raw object is Scryfall's internal tag UUID; the
-    projection renames it to `scryfall_tag_id` so it doesn't look like
-    an attempt to set Mongo's reserved `_id` and so readers of the
-    stored doc know what they're looking at.
+    The raw Scryfall tag UUID (`raw["id"]`) is dropped — nothing in
+    the project cross-refs it against the API and persisting it was
+    ~37 bytes × 4.5 k tags of pure overhead.
 
     Taggings are intentionally stripped — they're inverted into the
     per-card tags array by `build_oracle_id_to_slugs` and have no
@@ -215,7 +216,6 @@ def extract_tag_fields(raw: dict, id_to_slug: dict[str, str]) -> dict:
     parent_slugs = [id_to_slug[pid] for pid in raw.get("parent_ids", []) if pid in id_to_slug]
     child_slugs = [id_to_slug[cid] for cid in raw.get("child_ids", []) if cid in id_to_slug]
     return {
-        "scryfall_tag_id": raw.get("id"),
         "label": raw.get("label"),
         "description": raw.get("description"),
         "parent_slugs": parent_slugs,

@@ -35,20 +35,25 @@ Collections:
           "mana_cost":  "...",
           "type_line":  "...",
           "oracle_text":"...",
+          "oracle_text_sha": "<16-hex sha256>",# diff key for incremental merges
           "tags":       ["spot-removal", ...], # populated by oracle_tags import
-          "updated_at": "<UTC ISO 8601 string>"
         }
+        Per-card `updated_at` is intentionally absent: the snapshot
+        timestamp lives once in the `meta` collection under
+        `_id = "oracle_cards"`, since every card from a given bulk
+        merge shares the same value.
 
     tags  : one document per oracle tag, _id = slug. Shape:
         {
           "_id":           "<slug>",
-          "scryfall_tag_id":"<uuid>",
           "label":         "...",
           "description":   "..." | None,
           "parent_slugs":  [...],
           "child_slugs":   [...],
           "aliases":       [...]
         }
+        The raw Scryfall tag UUID isn't stored — nothing in the project
+        cross-refs it against the API, so persisting it was overhead.
 
     meta  : one document per bulk source, _id = source name. Shape:
         {
