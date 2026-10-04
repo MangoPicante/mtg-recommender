@@ -38,9 +38,13 @@ If a block would make a new reader pause, add a comment. If a comment can be cut
 
 One concern per commit — don't batch everything at the end. Prefer "parse decklist formats" → "add tests for decklist parser" → "wire parser into fetcher" over one sweeping commit.
 
-## Keeping README in Sync
+## Keeping README, justfile, and PLAN in Sync
 
-Update `README.md` in the same commit whenever you add or change anything user-visible (new script, new CLI flag, new output file, setup step, env var). Skip for internal refactors, test-only changes, or comment edits.
+Three top-level docs need to move with the code — update them in the same commit that introduces the change, not in a trailing cleanup pass:
+
+- `README.md` — add or change anything user-visible: new script, new CLI flag, new output file, setup step, env var. Skip for internal refactors, test-only changes, or comment edits.
+- `justfile` — add or change a common command a developer would reach for: new console script, new CLI entry point, new routine check like lint/test/smoke. Keep recipe comments one line, matching the surrounding style. Skip for one-off scripts, flags that just tweak existing recipes, or internal-only tooling.
+- `PLAN.md` — the slice you just shipped should land done, a sub-step added, an open question answered or dropped, a trade-off shifted. Skip for pure implementation details that don't move the roadmap or change scope.
 
 ## Testing Policy
 
