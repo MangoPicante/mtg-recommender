@@ -30,7 +30,8 @@ Under `src/mtg_recommender/`:
 | `check` | Read-only health check. Pings the Mongo server, verifies the configured database + indexes, and reports a doc count per collection. Exit 0 on success, 1 if any check fails. |
 | `embeddings` | Phase 2. Encodes each card's `oracle_text` into `text_embedding` on the card doc and each tag's label+description into `embedding` on the tag doc; also fuses the two into a single unit `card_vector` per card via a weighted average (`alpha * text + (1 - alpha) * tag`, defaults to `alpha=0.6`). Uses `sentence-transformers/all-mpnet-base-v2` (768-dim) by default; `MTG_EMBEDDING_MODEL` env var overrides. |
 | `edhrec_fetch` | Phase 3. Thin client over EDHREC's public keyless JSON API at `json.edhrec.com`. Fetches per-commander card signals (lift, synergy, inclusion rate, trend) and caches the payload in the `edhrec` Mongo collection with a 7-day TTL. Each signal carries a Scryfall UUID so joining back to our `cards` collection is a direct `_id` lookup. |
-| `deck_profile` | Phase 3. Given a decklist, resolves cards against the `names` index, unions their tag slugs, loads tag embeddings, and clusters them into themes via `sklearn.cluster.HDBSCAN` (cosine metric). Returns a `DeckProfile` carrying per-cluster unit centroids + member tags + deck-card membership. Labels each cluster with the tag closest to its centroid. |
+| `deck_profile` | Phase 3. Given a decklist, resolves cards against the `names` index and classifies each card into one of ~30 themes discovered from the oracle_tags hierarchy. Multi-theme cards are resolved by cosine similarity between the card's `text_embedding` and each theme's representative vector. Returns a `DeckProfile` carrying per-theme centroids + member tags + deck-card membership + an unassigned bucket. |
+| `theme_classifier` | Phase 3. Owns the data-driven theme discovery (filtering ~900 top-level tags down to ~30 "real themes" via blocklist + min-children + card-coverage window) and the per-card classification logic (candidate intersection → text-embedding tiebreak). Called into by `deck_profile`. |
 
 Tests live under `tests/` and are offline — every HTTP call is mocked, every
 Mongo op goes through `mongomock`.
@@ -284,11 +285,11 @@ different URL shape on EDHREC and are deferred to a follow-up helper.
 in late 2026). Hitting `json.edhrec.com` ourselves is ~200 lines of code,
 one fewer transitive dep, and gives us the signals we actually need.
 
-### Deck profile and tag clustering (Phase 3)
+### Deck profile and theme classification (Phase 3)
 
-Cluster a decklist's tags into themes using the stored tag embeddings.
-Requires `cards` + `tags` collections populated (`just populate` or the
-equivalent individual steps):
+Classify a decklist's cards into themes derived from the oracle_tags
+hierarchy. Requires `cards` + `tags` collections populated (`just
+populate` or the equivalent individual steps):
 
 ```bash
 # From a decklist file (one card per line; '#' comments, Moxfield /
@@ -298,22 +299,25 @@ mtg-deck-profile --file deck.txt
 # Or inline card names.
 mtg-deck-profile "Lightning Bolt" "Wrath of God" "Sol Ring" "Brainstorm"
 
-# Tune the clusterer. The three "inclusivity" knobs:
-#   --min-cluster-size N      smallest group that counts as a theme (default 2)
-#   --min-samples N           HDBSCAN density floor (default 1 — permissive)
-#   --cluster-selection-epsilon F
-#                             merge near-themes under this cosine distance
-#                             (default 0.0; try 0.1–0.3 to lump more)
-mtg-deck-profile --file deck.txt --min-cluster-size 3 --min-samples 2
+# Tune the theme filter. All three decide which top-level tags count
+# as "real themes" worth classifying against; defaults are the ones
+# that survive an audit of the live oracle_tags bulk and feel sensible
+# for Commander play.
+#   --min-children N     min number of child tags under the top-level
+#                         (default 2 — a point concept isn't a theme)
+#   --min-coverage N     min distinct cards tagged under the subtree
+#                         (default 100 — below is niche)
+#   --max-coverage N     max distinct cards (default 5000 — above is
+#                         mechanical, applies to half the format)
+mtg-deck-profile --file deck.txt --min-coverage 50 --max-coverage 8000
 
-# After clustering, orphan tags HDBSCAN flagged as noise get a second
-# chance: each gets absorbed into the nearest real cluster if cosine
-# similarity to its centroid is at least --reassign-threshold.
-# Default 0.6; set negative to disable the pass.
-mtg-deck-profile --file deck.txt --reassign-threshold 0.5     # looser
-mtg-deck-profile --file deck.txt --reassign-threshold -1      # off
+# Override the built-in structural/catalog blocklist. Default drops
+# `triggered-ability`, `cycle`, `card-names`, etc. Pass "" to clear it
+# entirely (useful for exploratory audits).
+mtg-deck-profile --file deck.txt --theme-blocklist "card-names,type-errata"
+mtg-deck-profile --file deck.txt --theme-blocklist ""
 
-# Cap per-cluster display (default: 10 tags + 10 cards each; everything
+# Cap per-cluster display (default: 10 tags + 10 cards; everything
 # beyond collapses to a "(+N more)" marker).
 mtg-deck-profile --file deck.txt --limit 20
 ```
@@ -323,14 +327,16 @@ Sample output:
 ```text
 resolved 99 unique cards (0 missing)
 tag universe: 142 unique tags
-4 theme(s) clustered, 8 tag(s) in noise
+4 theme(s) matched, 3 card(s) unassigned, 8 tag(s) outside any theme
 
-theme 'spot-removal'  (18 tags, 12 cards)
+theme 'removal'  (18 tags from deck, 12 cards)
   tags : burn-any, exile-creature, removal-creature, spot-removal, ...
   cards: Anguished Unmaking, Beast Within, Despark, ..., (+2 more)
 
-theme 'mana-rock'  (11 tags, 14 cards)
+theme 'ramp'  (6 tags from deck, 14 cards)
   ...
+
+unassigned cards: Weird Niche Enchantment, Random Vanilla Creature, ...
 ```
 
 Also usable as a library — the CLI is a thin wrapper over
@@ -342,21 +348,30 @@ from mtg_recommender import deck_profile as dp
 profile = dp.build_deck_profile(["Lightning Bolt", "Wrath of God", ...])
 for cluster in profile.clusters:
     print(cluster.label, cluster.tags, cluster.centroid.shape)
+print("unassigned:", profile.unassigned_card_ids)
 ```
 
-**Clustering details:** `sklearn.cluster.HDBSCAN` with `metric="cosine"`,
-`min_cluster_size=2`, `min_samples=1`, and `cluster_selection_epsilon=0.0`
-by default — all deliberately on the inclusive side so the recommender
-has more signal to work with. After HDBSCAN runs, a second pass sweeps
-through the noise bucket and reassigns each orphan tag to its nearest
-real cluster when cosine similarity to the cluster's centroid is at
-least `0.6` (`--reassign-threshold`); below the floor the tag stays in
-noise. Each cluster's `centroid` is a unit vector in the tag embedding
-space — Phase 3 step 4 (candidate ranking) will use it as a query vector
-against `card_vector`, with EDHREC lift (from `edhrec_fetch`) layered on
-as a per-commander quality signal. Tags without a stored embedding (and
-noise tags whose best-cluster sim was below the reassignment floor) land
-in `profile.noise_tags` so you can audit what was dropped.
+**How the classification works:**
+
+1. **Theme discovery** (`theme_classifier.discover_themes`) walks the
+   top-level tags, drops the ones on the blocklist or outside the
+   children/coverage window, and keeps the rest. For each survivor
+   it computes the subtree of descendant slugs plus a representative
+   vector = L2-normalized mean of the subtree's tag embeddings.
+2. **Per-card classification** (`theme_classifier.classify_card`)
+   intersects the card's tag array with each theme's subtree. Zero
+   matches → unassigned. One match → that theme. Two or more → cosine
+   similarity between the card's stored `text_embedding` and each
+   candidate theme's representative vector; the max wins. (Falls
+   back to the candidate with the highest card_coverage if the
+   card has no `text_embedding` stored.)
+3. **Attribution shape:** each `DeckCluster.tags` lists only the slugs
+   the deck's cards actually brought in — not the theme's full
+   subtree — so the output reflects what mattered on this specific
+   deck. Phase 3 step 4 (candidate ranking) will use each theme's
+   `centroid` as a query vector against `card_vector`, with EDHREC
+   lift (from `edhrec_fetch`) layered on as a per-commander quality
+   signal.
 
 ## Testing
 
@@ -383,7 +398,8 @@ mtg-recommender/
 │       ├── check.py             # read-only Mongo health check
 │       ├── embeddings.py        # Phase 2 encoder + mtg-embed CLI
 │       ├── edhrec_fetch.py      # Phase 3 EDHREC JSON client + per-commander cache
-│       └── deck_profile.py      # Phase 3 per-deck tag clustering (HDBSCAN)
+│       ├── theme_classifier.py  # Phase 3 hierarchy-driven theme discovery + per-card classification
+│       └── deck_profile.py      # Phase 3 deck profile builder (uses theme_classifier) + mtg-deck-profile CLI
 ├── tests/
 │   ├── test_storage.py          # offline, mongomock-backed
 │   ├── test_scryfall_fetch.py
@@ -393,7 +409,7 @@ mtg-recommender/
 │   ├── test_extract_oracle.py
 │   ├── test_embeddings.py
 │   ├── test_edhrec_fetch.py
-│   ├── test_deck_profile.py
+│   ├── test_deck_profile.py     # also covers theme_classifier (shared fixtures)
 │   └── fixtures/                # trimmed sample payloads used by HTTP-mocked tests
 │       └── edhrec_atraxa_trimmed.json
 ├── pyproject.toml               # PEP 621 metadata, build config, entry points
