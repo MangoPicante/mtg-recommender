@@ -1,26 +1,36 @@
-"""Offline tests for mtg_recommender.deck_profile.
+"""Offline tests for mtg_recommender.deck_profile + theme_classifier.
 
-Clustering tests use hand-crafted 4-dim tag embeddings arranged in
-tight groups around orthogonal basis vectors, so HDBSCAN's output
-is deterministic and we can assert on exact group memberships rather
-than fiddling with "about this many clusters" heuristics.
+The fixtures stand up a miniature oracle_tags hierarchy with:
+
+  removal/
+    spot-removal
+    mass-removal
+  ramp/
+    mana-rock
+    mana-dork
+  card-advantage/
+    cantrip
+    draw-outlet
+  cycle/              ← in default blocklist; discover_themes drops it
+    cycle-child-1
+
+Each tag doc carries a packed-float32 `embedding`. Deck cards carry
+`tags` arrays referencing those slugs, plus their own `text_embedding`
+in the same 4-dim space so the multi-theme tiebreak has something
+meaningful to compare.
 
 Test classes:
-    TestResolveDeckCards        name lookup, missing names, dedup by id,
-                                 case-insensitive
-    TestCollectTagUniverse      union across deck cards, sort, empty
-    TestLoadTagEmbeddings       bulk fetch, skips tags without embedding
-    TestClusterTagEmbeddings    3 tight groups -> 3 clusters;
-                                 degenerate universe returns empty
-    TestReassignNoise           noise-reassignment pass: absorb when near,
-                                 skip when far, threshold boundary strict,
-                                 negative threshold disables
-    TestCentroidAndLabel        picks nearest tag; L2-normalises centroid
+    TestResolveDeckCards        name lookup, missing, dedup, case-insensitive
+    TestCollectTagUniverse      union across deck
+    TestDiscoverThemes          blocklist, min_children, coverage window,
+                                 missing embeddings handled
+    TestClassifyCard            0 / 1 / 2+ candidates; text-embedding
+                                 tiebreak; missing embedding falls back
+    TestClassifyDeck            per-theme membership + unassigned bucket
     TestBuildDeckProfile        end-to-end on a seeded mongomock cluster
     TestRenderProfile           truncation marker, cluster display shape
-    TestMainCLI                 argparse: --file, --min-cluster-size, --limit,
-                                 --min-samples / --reassign-threshold piping,
-                                 empty-input error
+    TestMainCLI                 argparse: filters pipe through, --theme-
+                                 blocklist override, --file reads decklist
 """
 from __future__ import annotations
 
@@ -36,40 +46,56 @@ import numpy as np
 from mtg_recommender import deck_profile as dp
 from mtg_recommender import embeddings as emb
 from mtg_recommender import storage
+from mtg_recommender import theme_classifier as tc
 
 
 def _pack(vec: list[float]) -> bytes:
-    """Pack a vector in the storage format `load_tag_embeddings` expects."""
+    """Pack a vector in the storage format `_unpack_embedding` reads."""
     return emb._pack_embedding(np.array(vec, dtype=np.float32))
 
 
 # ---------------------------------------------------------------------------
-# Fixture: three tight clusters in 4-dim space.
+# Fixture tag hierarchy
 # ---------------------------------------------------------------------------
-
-# Cluster A ("removal"): tag embeddings near [1,0,0,0].
-# Cluster B ("ramp"):    tag embeddings near [0,1,0,0].
-# Cluster C ("draw"):    tag embeddings near [0,0,1,0].
 #
-# The exact "nearest tag to centroid" winner within a tight cluster is
-# sensitive to tiny floating-point drift (the centroid of asymmetric
-# satellites doesn't sit exactly on the axis). Tests therefore assert
-# that each cluster's label is drawn from its own tag set rather than
-# naming a specific slug — that's the actual contract we care about.
+# Three thematic top-levels (removal, ramp, card-advantage), each with
+# two children. One blocklisted top-level (`cycle`, in DEFAULT_BLOCKLIST)
+# to exercise the filter. Each theme sits near a different basis vector
+# so the oracle-text tiebreak behaves predictably.
 
-TAG_FIXTURES = {
-    # removal cluster
-    "spot-removal":      [1.00, 0.00, 0.00, 0.00],
-    "burn-any":          [0.95, 0.05, 0.00, 0.00],
-    "removal-creature":  [0.90, 0.10, 0.05, 0.00],
-    # ramp cluster
-    "mana-rock":         [0.00, 1.00, 0.00, 0.00],
-    "mana-dork":         [0.05, 0.95, 0.00, 0.00],
-    "ramp":              [0.00, 0.90, 0.05, 0.10],
-    # draw cluster
-    "card-draw":         [0.00, 0.00, 1.00, 0.00],
-    "cantrip":           [0.00, 0.00, 0.95, 0.10],
-}
+TAG_HIERARCHY = [
+    # removal theme — near [1, 0, 0, 0]
+    {"_id": "removal",            "parent_slugs": [], "child_slugs": ["spot-removal", "mass-removal"],
+     "embedding": _pack([1.00, 0.00, 0.00, 0.00])},
+    {"_id": "spot-removal",       "parent_slugs": ["removal"], "child_slugs": [],
+     "embedding": _pack([0.95, 0.05, 0.00, 0.00])},
+    {"_id": "mass-removal",       "parent_slugs": ["removal"], "child_slugs": [],
+     "embedding": _pack([0.95, -0.05, 0.00, 0.00])},
+
+    # ramp theme — near [0, 1, 0, 0]
+    {"_id": "ramp",               "parent_slugs": [], "child_slugs": ["mana-rock", "mana-dork"],
+     "embedding": _pack([0.00, 1.00, 0.00, 0.00])},
+    {"_id": "mana-rock",          "parent_slugs": ["ramp"], "child_slugs": [],
+     "embedding": _pack([0.05, 0.95, 0.00, 0.00])},
+    {"_id": "mana-dork",          "parent_slugs": ["ramp"], "child_slugs": [],
+     "embedding": _pack([-0.05, 0.95, 0.00, 0.00])},
+
+    # card-advantage theme — near [0, 0, 1, 0]
+    {"_id": "card-advantage",     "parent_slugs": [], "child_slugs": ["cantrip", "draw-outlet"],
+     "embedding": _pack([0.00, 0.00, 1.00, 0.00])},
+    {"_id": "cantrip",            "parent_slugs": ["card-advantage"], "child_slugs": [],
+     "embedding": _pack([0.00, 0.05, 0.95, 0.00])},
+    {"_id": "draw-outlet",        "parent_slugs": ["card-advantage"], "child_slugs": [],
+     "embedding": _pack([0.00, -0.05, 0.95, 0.00])},
+
+    # cycle — top-level BUT in DEFAULT_BLOCKLIST; filter should drop it.
+    {"_id": "cycle",              "parent_slugs": [], "child_slugs": ["cycle-child-1", "cycle-child-2"],
+     "embedding": _pack([0.00, 0.00, 0.00, 1.00])},
+    {"_id": "cycle-child-1",      "parent_slugs": ["cycle"], "child_slugs": [],
+     "embedding": _pack([0.00, 0.00, 0.00, 1.00])},
+    {"_id": "cycle-child-2",      "parent_slugs": ["cycle"], "child_slugs": [],
+     "embedding": _pack([0.00, 0.00, 0.00, 1.00])},
+]
 
 
 class _MongoBackedTestCase(unittest.TestCase):
@@ -80,20 +106,31 @@ class _MongoBackedTestCase(unittest.TestCase):
         storage.ensure_indexes()
         self.cards = storage.cards_collection()
         self.tags = storage.tags_collection()
+        # The theme filter's default min_coverage=100 wants ≥100 cards
+        # per theme — way more than any test fixture builds. All tests
+        # that call discover_themes / build_deck_profile override to a
+        # permissive filter.
+        self.permissive = tc.ThemeFilter(
+            min_children=2, min_coverage=1, max_coverage=10_000,
+            blocklist=tc.DEFAULT_BLOCKLIST,
+        )
 
     def tearDown(self):
         storage.reset_client(None)
 
-    def _seed_tags(self, slugs=TAG_FIXTURES):
-        self.tags.insert_many([
-            {"_id": slug, "label": slug, "embedding": _pack(vec)}
-            for slug, vec in slugs.items()
-        ])
+    def _seed_hierarchy(self):
+        self.tags.insert_many([dict(t) for t in TAG_HIERARCHY])
 
-    def _seed_card(self, sid, name, tags):
-        self.cards.insert_one({
-            "_id": sid, "name": name, "names": [name.lower()], "tags": list(tags),
-        })
+    def _seed_card(
+        self, sid, name, tags, text_embedding=None,
+    ):
+        doc = {
+            "_id": sid, "name": name, "names": [name.lower()],
+            "tags": list(tags),
+        }
+        if text_embedding is not None:
+            doc["text_embedding"] = _pack(text_embedding)
+        self.cards.insert_one(doc)
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +140,7 @@ class _MongoBackedTestCase(unittest.TestCase):
 class TestResolveDeckCards(_MongoBackedTestCase):
 
     def test_resolves_known_names(self):
-        self._seed_card("id-bolt", "Lightning Bolt", ["spot-removal", "burn-any"])
+        self._seed_card("id-bolt", "Lightning Bolt", ["spot-removal"])
         self._seed_card("id-sol", "Sol Ring", ["mana-rock"])
         docs, missing = dp.resolve_deck_cards(
             ["Lightning Bolt", "Sol Ring"], self.cards
@@ -159,200 +196,214 @@ class TestCollectTagUniverse(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# load_tag_embeddings
+# discover_themes
 # ---------------------------------------------------------------------------
 
-class TestLoadTagEmbeddings(_MongoBackedTestCase):
+class TestDiscoverThemes(_MongoBackedTestCase):
 
-    def test_loads_requested_tags_only(self):
-        self._seed_tags()
-        got = dp.load_tag_embeddings(
-            ["spot-removal", "mana-rock"], self.tags
+    def test_blocklisted_top_level_is_dropped(self):
+        # The `cycle` top-level is in DEFAULT_BLOCKLIST — must not appear
+        # in discovered themes even though it has 2 children and would
+        # otherwise clear the coverage filter.
+        self._seed_hierarchy()
+        self._seed_card("c1", "Card 1", ["cycle-child-1"])
+        self._seed_card("c2", "Card 2", ["cycle-child-2"])
+        themes = tc.discover_themes(
+            self.cards, self.tags, theme_filter=self.permissive,
         )
-        self.assertEqual(set(got), {"spot-removal", "mana-rock"})
-        np.testing.assert_allclose(got["spot-removal"], [1.0, 0.0, 0.0, 0.0])
+        theme_names = {t.name for t in themes}
+        self.assertNotIn("cycle", theme_names)
 
-    def test_skips_tags_without_embedding(self):
-        # A tag that exists but has no embedding (new import, pre-mtg-embed-tags)
-        # must not land in the result dict.
+    def test_min_children_filter_drops_point_tags(self):
+        # A top-level with 0 or 1 children isn't a theme umbrella.
+        self.tags.insert_one({
+            "_id": "lonely-top", "parent_slugs": [], "child_slugs": [],
+            "embedding": _pack([1.0, 0.0, 0.0, 0.0]),
+        })
+        self._seed_card("c1", "C1", ["lonely-top"])
+        themes = tc.discover_themes(
+            self.cards, self.tags, theme_filter=self.permissive,
+        )
+        self.assertNotIn("lonely-top", {t.name for t in themes})
+
+    def test_coverage_window_filters_too_few_cards(self):
+        # Fixture themes cover 2 cards each (via their subtree); set a
+        # min_coverage of 10 and nothing survives.
+        self._seed_hierarchy()
+        self._seed_card("c1", "C1", ["spot-removal"])
+        self._seed_card("c2", "C2", ["mana-rock"])
+        filt = tc.ThemeFilter(
+            min_children=2, min_coverage=10, max_coverage=10_000,
+            blocklist=tc.DEFAULT_BLOCKLIST,
+        )
+        themes = tc.discover_themes(self.cards, self.tags, theme_filter=filt)
+        self.assertEqual(themes, [])
+
+    def test_coverage_window_filters_too_many_cards(self):
+        # Dense fixture: a theme that covers 5 cards; cap max at 3.
+        self._seed_hierarchy()
+        for i in range(5):
+            self._seed_card(f"c{i}", f"C{i}", ["spot-removal"])
+        filt = tc.ThemeFilter(
+            min_children=2, min_coverage=1, max_coverage=3,
+            blocklist=tc.DEFAULT_BLOCKLIST,
+        )
+        themes = tc.discover_themes(self.cards, self.tags, theme_filter=filt)
+        self.assertNotIn("removal", {t.name for t in themes})
+
+    def test_surviving_themes_sorted_by_coverage_desc(self):
+        self._seed_hierarchy()
+        # 3 cards tagged with ramp, 1 with removal, 2 with card-advantage.
+        for i in range(3):
+            self._seed_card(f"ramp-{i}", f"Ramp {i}", ["mana-rock"])
+        self._seed_card("rem-0", "Rem 0", ["spot-removal"])
+        for i in range(2):
+            self._seed_card(f"draw-{i}", f"Draw {i}", ["cantrip"])
+        themes = tc.discover_themes(
+            self.cards, self.tags, theme_filter=self.permissive,
+        )
+        # Expect ramp (3) → card-advantage (2) → removal (1).
+        self.assertEqual(
+            [t.name for t in themes],
+            ["ramp", "card-advantage", "removal"],
+        )
+
+    def test_representative_is_unit_length(self):
+        self._seed_hierarchy()
+        self._seed_card("c1", "C1", ["spot-removal"])
+        themes = tc.discover_themes(
+            self.cards, self.tags, theme_filter=self.permissive,
+        )
+        for theme in themes:
+            self.assertAlmostEqual(
+                float(np.linalg.norm(theme.representative)), 1.0, places=5,
+            )
+
+    def test_subtree_contains_descendants(self):
+        self._seed_hierarchy()
+        self._seed_card("c1", "C1", ["spot-removal"])
+        themes = tc.discover_themes(
+            self.cards, self.tags, theme_filter=self.permissive,
+        )
+        removal = next(t for t in themes if t.name == "removal")
+        self.assertEqual(
+            removal.tag_slugs,
+            frozenset({"removal", "spot-removal", "mass-removal"}),
+        )
+
+    def test_subtree_without_embeddings_drops_theme(self):
+        # A top-level whose children have no `embedding` field → the
+        # representative is None → the theme is skipped. Guards against
+        # a half-populated cluster producing junk zero-vector themes.
         self.tags.insert_many([
-            {"_id": "spot-removal", "label": "x", "embedding": _pack([1.0, 0.0, 0.0, 0.0])},
-            {"_id": "new-tag", "label": "new"},
+            {"_id": "x", "parent_slugs": [], "child_slugs": ["xa", "xb"]},
+            {"_id": "xa", "parent_slugs": ["x"], "child_slugs": []},
+            {"_id": "xb", "parent_slugs": ["x"], "child_slugs": []},
         ])
-        got = dp.load_tag_embeddings(["spot-removal", "new-tag"], self.tags)
-        self.assertEqual(set(got), {"spot-removal"})
-
-    def test_empty_input_returns_empty_dict(self):
-        self.assertEqual(dp.load_tag_embeddings([], self.tags), {})
+        self._seed_card("c1", "C1", ["xa"])
+        themes = tc.discover_themes(
+            self.cards, self.tags, theme_filter=self.permissive,
+        )
+        self.assertNotIn("x", {t.name for t in themes})
 
 
 # ---------------------------------------------------------------------------
-# _cluster_tag_embeddings (HDBSCAN)
+# classify_card
 # ---------------------------------------------------------------------------
 
-class TestClusterTagEmbeddings(unittest.TestCase):
+class TestClassifyCard(unittest.TestCase):
 
-    def test_three_tight_groups_yield_three_clusters(self):
-        embeddings = {slug: np.array(vec) for slug, vec in TAG_FIXTURES.items()}
-        groups = dp._cluster_tag_embeddings(
-            embeddings, min_cluster_size=2, min_samples=1,
-            cluster_selection_epsilon=0.0,
+    def _theme(self, name, tag_slugs, representative):
+        return tc.Theme(
+            name=name,
+            tag_slugs=frozenset(tag_slugs),
+            representative=np.array(representative, dtype=np.float64),
+            card_coverage=1,
         )
-        # Drop the noise bucket if present; three themes should emerge.
-        real_clusters = {k: v for k, v in groups.items() if k != dp.NOISE_LABEL}
-        self.assertEqual(len(real_clusters), 3)
-        # Each cluster should contain exactly the slugs we planted near
-        # the same basis vector.
-        memberships = {frozenset(v) for v in real_clusters.values()}
-        self.assertIn(frozenset({"spot-removal", "burn-any", "removal-creature"}), memberships)
-        self.assertIn(frozenset({"mana-rock", "mana-dork", "ramp"}), memberships)
-        self.assertIn(frozenset({"card-draw", "cantrip"}), memberships)
 
-    def test_degenerate_universe_returns_empty(self):
-        # With fewer tags than min_cluster_size, HDBSCAN can't do anything —
-        # we bail early rather than letting sklearn raise.
-        got = dp._cluster_tag_embeddings(
-            {"only-one": np.array([1.0, 0.0, 0.0, 0.0])},
-            min_cluster_size=2, min_samples=1, cluster_selection_epsilon=0.0,
+    def test_zero_candidates_returns_none(self):
+        themes = [self._theme("removal", ["spot-removal"], [1, 0, 0, 0])]
+        got = tc.classify_card(["unrelated-tag"], None, themes)
+        self.assertIsNone(got)
+
+    def test_single_candidate_returns_it(self):
+        themes = [self._theme("removal", ["spot-removal"], [1, 0, 0, 0])]
+        got = tc.classify_card(["spot-removal"], None, themes)
+        self.assertEqual(got.name, "removal")
+
+    def test_multi_candidate_text_embedding_tiebreak(self):
+        # Card has tags from both removal and ramp. Its text embedding
+        # points at the ramp axis → ramp should win the tiebreak.
+        themes = [
+            self._theme("removal", ["spot-removal"], [1, 0, 0, 0]),
+            self._theme("ramp",    ["mana-rock"],    [0, 1, 0, 0]),
+        ]
+        got = tc.classify_card(
+            ["spot-removal", "mana-rock"],
+            np.array([0.1, 0.9, 0.0, 0.0]),
+            themes,
         )
-        self.assertEqual(got, {})
+        self.assertEqual(got.name, "ramp")
 
-
-# ---------------------------------------------------------------------------
-# _reassign_noise_to_nearest_cluster  (Option B)
-# ---------------------------------------------------------------------------
-
-class TestReassignNoise(unittest.TestCase):
-    """The reassignment pass is a pure function — no Mongo involved —
-    so these tests inject hand-built `groups` dicts and embeddings and
-    assert on the shape of the output. HDBSCAN output isn't needed.
-    """
-
-    def _emb(self, mapping):
-        return {k: np.array(v, dtype=np.float64) for k, v in mapping.items()}
-
-    def test_noise_tag_near_cluster_gets_absorbed(self):
-        # Two cluster tags on +x axis, one noise tag ALSO near +x. With
-        # threshold 0.6 the noise tag should jump into the real cluster.
-        embeddings = self._emb({
-            "a": [1.0, 0.0, 0.0],
-            "b": [0.95, 0.05, 0.0],
-            "orphan": [0.9, 0.1, 0.1],
-        })
-        groups = {0: ["a", "b"], dp.NOISE_LABEL: ["orphan"]}
-        got = dp._reassign_noise_to_nearest_cluster(
-            groups, embeddings, threshold=0.6
+    def test_multi_candidate_no_text_embedding_falls_back_to_coverage(self):
+        # Both themes match; neither card_text is available. Pick the
+        # one with higher card_coverage so the degrade is deterministic.
+        removal = tc.Theme(
+            name="removal", tag_slugs=frozenset({"spot-removal"}),
+            representative=np.array([1, 0, 0, 0], dtype=np.float64),
+            card_coverage=10,
         )
-        self.assertIn("orphan", got[0])
-        self.assertEqual(got[dp.NOISE_LABEL], [])
-
-    def test_noise_tag_far_from_all_clusters_stays(self):
-        # Cluster tags on +x; noise tag on +z. Cosine sim ≈ 0, well
-        # below the 0.6 floor → tag stays in noise.
-        embeddings = self._emb({
-            "a": [1.0, 0.0, 0.0],
-            "b": [0.95, 0.05, 0.0],
-            "orphan": [0.0, 0.0, 1.0],
-        })
-        groups = {0: ["a", "b"], dp.NOISE_LABEL: ["orphan"]}
-        got = dp._reassign_noise_to_nearest_cluster(
-            groups, embeddings, threshold=0.6
+        ramp = tc.Theme(
+            name="ramp", tag_slugs=frozenset({"mana-rock"}),
+            representative=np.array([0, 1, 0, 0], dtype=np.float64),
+            card_coverage=100,
         )
-        self.assertEqual(got[0], ["a", "b"])
-        self.assertEqual(got[dp.NOISE_LABEL], ["orphan"])
-
-    def test_noise_picks_nearest_of_multiple_clusters(self):
-        # Two clusters on +x and +z. Orphan is at (0.8, 0, 0.2) —
-        # closer to the +x cluster. Must land there, not +z.
-        embeddings = self._emb({
-            "x-anchor":  [1.0, 0.0, 0.0],
-            "x-pair":    [0.95, 0.05, 0.0],
-            "z-anchor":  [0.0, 0.0, 1.0],
-            "z-pair":    [0.0, 0.05, 0.95],
-            "orphan":    [0.8, 0.0, 0.2],
-        })
-        groups = {
-            0: ["x-anchor", "x-pair"],
-            1: ["z-anchor", "z-pair"],
-            dp.NOISE_LABEL: ["orphan"],
-        }
-        got = dp._reassign_noise_to_nearest_cluster(
-            groups, embeddings, threshold=0.6
+        got = tc.classify_card(
+            ["spot-removal", "mana-rock"], None, [removal, ramp]
         )
-        self.assertIn("orphan", got[0])
-        self.assertNotIn("orphan", got[1])
+        self.assertEqual(got.name, "ramp")
 
-    def test_threshold_boundary_strict(self):
-        # The threshold is a FLOOR we strictly exceed. If a noise tag's
-        # best sim equals the threshold exactly, it stays in noise —
-        # ties shouldn't drag borderline tags into clusters.
-        embeddings = self._emb({
-            "a": [1.0, 0.0, 0.0],
-            "b": [1.0, 0.0, 0.0],
-            # orphan at the exact boundary (sim = 0.6).
-            "orphan": [0.6, 0.8, 0.0],
-        })
-        groups = {0: ["a", "b"], dp.NOISE_LABEL: ["orphan"]}
-        got = dp._reassign_noise_to_nearest_cluster(
-            groups, embeddings, threshold=0.6
-        )
-        self.assertEqual(got[dp.NOISE_LABEL], ["orphan"])
-
-    def test_negative_threshold_disables_pass(self):
-        # A −1 threshold is the "feature off" sentinel. Groups must come
-        # back untouched even for a tag that would otherwise be absorbed.
-        embeddings = self._emb({
-            "a": [1.0, 0.0, 0.0],
-            "orphan": [0.99, 0.01, 0.0],
-        })
-        groups = {0: ["a", "a"], dp.NOISE_LABEL: ["orphan"]}
-        got = dp._reassign_noise_to_nearest_cluster(
-            groups, embeddings, threshold=-1.0
-        )
-        self.assertEqual(got, groups)
-
-    def test_no_real_clusters_leaves_noise_unchanged(self):
-        # Only a noise bucket exists — nothing to reassign TO.
-        embeddings = self._emb({"orphan": [1.0, 0.0, 0.0]})
-        groups = {dp.NOISE_LABEL: ["orphan"]}
-        got = dp._reassign_noise_to_nearest_cluster(
-            groups, embeddings, threshold=0.6
-        )
-        self.assertEqual(got, groups)
-
-    def test_no_noise_bucket_is_a_no_op(self):
-        embeddings = self._emb({"a": [1.0, 0.0], "b": [0.9, 0.1]})
-        groups = {0: ["a", "b"]}
-        got = dp._reassign_noise_to_nearest_cluster(
-            groups, embeddings, threshold=0.6
-        )
-        self.assertEqual(got, groups)
+    def test_empty_tags_returns_none(self):
+        themes = [self._theme("x", ["y"], [1, 0, 0, 0])]
+        self.assertIsNone(tc.classify_card([], None, themes))
+        self.assertIsNone(tc.classify_card(None, None, themes))
 
 
 # ---------------------------------------------------------------------------
-# _centroid_and_label
+# classify_deck
 # ---------------------------------------------------------------------------
 
-class TestCentroidAndLabel(unittest.TestCase):
+class TestClassifyDeck(unittest.TestCase):
 
-    def test_centroid_is_unit_length(self):
-        embeddings = {s: np.array(TAG_FIXTURES[s]) for s in TAG_FIXTURES}
-        centroid, _ = dp._centroid_and_label(
-            ["spot-removal", "burn-any"], embeddings
+    def _theme(self, name, tag_slugs, rep):
+        return tc.Theme(
+            name=name,
+            tag_slugs=frozenset(tag_slugs),
+            representative=np.array(rep, dtype=np.float64),
+            card_coverage=1,
         )
-        self.assertAlmostEqual(float(np.linalg.norm(centroid)), 1.0, places=6)
 
-    def test_label_is_one_of_input_tags(self):
-        # The label contract is "closest tag to centroid", which within
-        # a tight cluster can land on any member depending on which
-        # satellite's offsets happen to point most in the aggregated
-        # direction. The invariant we care about is that the label is
-        # drawn from the cluster's own tag set — not some string from
-        # elsewhere.
-        embeddings = {s: np.array(TAG_FIXTURES[s]) for s in TAG_FIXTURES}
-        tags = ["spot-removal", "burn-any", "removal-creature"]
-        _, label = dp._centroid_and_label(tags, embeddings)
-        self.assertIn(label, tags)
+    def test_distributes_cards_across_themes(self):
+        themes = [
+            self._theme("removal", ["spot-removal"], [1, 0, 0, 0]),
+            self._theme("ramp",    ["mana-rock"],    [0, 1, 0, 0]),
+        ]
+        deck = [
+            {"_id": "a", "tags": ["spot-removal"]},
+            {"_id": "b", "tags": ["mana-rock"]},
+            {"_id": "c", "tags": ["unrelated"]},
+        ]
+        by_theme, unassigned = tc.classify_deck(deck, themes)
+        self.assertEqual(set(by_theme), {"removal", "ramp"})
+        self.assertEqual(by_theme["removal"], ["a"])
+        self.assertEqual(by_theme["ramp"], ["b"])
+        self.assertEqual(unassigned, ["c"])
+
+    def test_empty_themes_everything_unassigned(self):
+        deck = [{"_id": "a", "tags": ["x"]}, {"_id": "b", "tags": ["y"]}]
+        by_theme, unassigned = tc.classify_deck(deck, [])
+        self.assertEqual(by_theme, {})
+        self.assertEqual(unassigned, ["a", "b"])
 
 
 # ---------------------------------------------------------------------------
@@ -362,91 +413,118 @@ class TestCentroidAndLabel(unittest.TestCase):
 class TestBuildDeckProfile(_MongoBackedTestCase):
 
     def _seed_full_deck(self):
-        """Seed tag catalog + a small 'deck' spanning all three themes."""
-        self._seed_tags()
-        # 2 removal cards, 2 ramp cards, 1 draw card.
-        self._seed_card("id-bolt",      "Lightning Bolt",   ["spot-removal", "burn-any"])
-        self._seed_card("id-wrath",     "Wrath of God",     ["spot-removal", "removal-creature"])
-        self._seed_card("id-sol",       "Sol Ring",         ["mana-rock"])
-        self._seed_card("id-mystic",    "Birds of Paradise", ["mana-dork", "ramp"])
-        self._seed_card("id-brainstorm", "Brainstorm",      ["card-draw", "cantrip"])
+        self._seed_hierarchy()
+        # Three single-theme cards + one multi-theme card.
+        self._seed_card(
+            "id-bolt", "Lightning Bolt", ["spot-removal"],
+            text_embedding=[1.0, 0.0, 0.0, 0.0],
+        )
+        self._seed_card(
+            "id-wrath", "Wrath of God", ["mass-removal"],
+            text_embedding=[0.9, 0.1, 0.0, 0.0],
+        )
+        self._seed_card(
+            "id-sol", "Sol Ring", ["mana-rock"],
+            text_embedding=[0.0, 1.0, 0.0, 0.0],
+        )
+        self._seed_card(
+            "id-brainstorm", "Brainstorm", ["cantrip"],
+            text_embedding=[0.0, 0.0, 1.0, 0.0],
+        )
+        # Multi-theme card: has tags from both removal AND ramp. Its
+        # text embedding sits on the ramp axis → ramp wins the tiebreak.
+        self._seed_card(
+            "id-ambiguous", "Hybrid Card", ["spot-removal", "mana-rock"],
+            text_embedding=[0.1, 0.9, 0.0, 0.0],
+        )
 
     def test_profile_reports_resolved_deck_and_missing(self):
         self._seed_full_deck()
         profile = dp.build_deck_profile(
-            ["Lightning Bolt", "Wrath of God", "Nothing Here", "Sol Ring",
-             "Birds of Paradise", "Brainstorm"],
+            ["Lightning Bolt", "Wrath of God", "Nothing Here",
+             "Sol Ring", "Brainstorm", "Hybrid Card"],
             cards_coll=self.cards, tags_coll=self.tags,
+            theme_filter=self.permissive,
         )
         self.assertEqual(
             set(profile.deck_card_ids),
-            {"id-bolt", "id-wrath", "id-sol", "id-mystic", "id-brainstorm"},
+            {"id-bolt", "id-wrath", "id-sol", "id-brainstorm", "id-ambiguous"},
         )
         self.assertEqual(profile.missing_names, ("Nothing Here",))
 
-    def test_profile_surfaces_three_themes(self):
+    def test_three_themes_catch_the_cards(self):
         self._seed_full_deck()
         profile = dp.build_deck_profile(
             ["Lightning Bolt", "Wrath of God", "Sol Ring",
-             "Birds of Paradise", "Brainstorm"],
+             "Brainstorm", "Hybrid Card"],
             cards_coll=self.cards, tags_coll=self.tags,
+            theme_filter=self.permissive,
         )
-        self.assertEqual(len(profile.clusters), 3)
-        # Each cluster's tag set must match one of the three themes we
-        # planted — we don't care which cluster index got which theme,
-        # just that the memberships came out right.
-        memberships = {frozenset(c.tags) for c in profile.clusters}
-        self.assertEqual(memberships, {
-            frozenset({"spot-removal", "burn-any", "removal-creature"}),
-            frozenset({"mana-rock", "mana-dork", "ramp"}),
-            frozenset({"card-draw", "cantrip"}),
-        })
+        self.assertEqual(
+            {c.label for c in profile.clusters},
+            {"removal", "ramp", "card-advantage"},
+        )
 
-    def test_cluster_deck_card_ids_reflect_membership(self):
+    def test_ambiguous_card_goes_to_ramp_via_text_tiebreak(self):
         self._seed_full_deck()
         profile = dp.build_deck_profile(
             ["Lightning Bolt", "Wrath of God", "Sol Ring",
-             "Birds of Paradise", "Brainstorm"],
+             "Brainstorm", "Hybrid Card"],
             cards_coll=self.cards, tags_coll=self.tags,
+            theme_filter=self.permissive,
         )
-        # Look clusters up by what's IN them, not by label (the label
-        # is a nearest-tag pick that drifts with fixture choice).
-        by_tags = {frozenset(c.tags): c for c in profile.clusters}
-        removal = by_tags[frozenset({"spot-removal", "burn-any", "removal-creature"})]
-        ramp    = by_tags[frozenset({"mana-rock", "mana-dork", "ramp"})]
-        draw    = by_tags[frozenset({"card-draw", "cantrip"})]
-        self.assertEqual(set(removal.deck_card_ids), {"id-bolt", "id-wrath"})
-        self.assertEqual(set(ramp.deck_card_ids),    {"id-sol", "id-mystic"})
-        self.assertEqual(set(draw.deck_card_ids),    {"id-brainstorm"})
-        # And every cluster's label must come from its own tag set —
-        # the pivotal invariant for interpretability downstream.
-        for c in profile.clusters:
-            self.assertIn(c.label, c.tags)
+        by_label = {c.label: c for c in profile.clusters}
+        self.assertIn("id-ambiguous", by_label["ramp"].deck_card_ids)
+        self.assertNotIn("id-ambiguous", by_label["removal"].deck_card_ids)
 
-    def test_tag_without_stored_embedding_lands_in_noise(self):
-        self._seed_tags()
-        # Add a card whose tag list references a slug we never embedded.
-        self._seed_card("id-bolt", "Lightning Bolt", ["spot-removal", "burn-any"])
-        self._seed_card("id-sol", "Sol Ring", ["mana-rock", "ramp"])
-        self._seed_card("id-weird", "Weird Card", ["spot-removal", "unknown-slug"])
+    def test_cluster_tags_reflect_what_the_deck_actually_brought(self):
+        # Deck only tagged with `spot-removal` from the removal theme —
+        # `mass-removal` is in the theme's subtree but no card used it,
+        # so the cluster's tags list omits it.
+        self._seed_hierarchy()
+        self._seed_card("id-bolt", "Lightning Bolt", ["spot-removal"],
+                        text_embedding=[1.0, 0.0, 0.0, 0.0])
         profile = dp.build_deck_profile(
-            ["Lightning Bolt", "Sol Ring", "Weird Card"],
+            ["Lightning Bolt"],
             cards_coll=self.cards, tags_coll=self.tags,
+            theme_filter=self.permissive,
         )
-        # unknown-slug has no embedding → degraded to noise. It must
-        # appear in noise_tags, not in any cluster.
-        self.assertIn("unknown-slug", profile.noise_tags)
-        for cluster in profile.clusters:
-            self.assertNotIn("unknown-slug", cluster.tags)
+        removal = next(c for c in profile.clusters if c.label == "removal")
+        self.assertEqual(removal.tags, ("spot-removal",))
+
+    def test_unassigned_card_captured_separately(self):
+        self._seed_hierarchy()
+        self._seed_card("id-unknown", "Unknown", ["unrelated-tag"])
+        profile = dp.build_deck_profile(
+            ["Unknown"],
+            cards_coll=self.cards, tags_coll=self.tags,
+            theme_filter=self.permissive,
+        )
+        self.assertEqual(profile.unassigned_card_ids, ("id-unknown",))
+        self.assertEqual(profile.clusters, ())
+
+    def test_noise_tags_are_deck_tags_outside_any_theme(self):
+        # Fixture doesn't include "random-flavor" in any theme subtree.
+        self._seed_hierarchy()
+        self._seed_card("id-x", "X", ["spot-removal", "random-flavor"],
+                        text_embedding=[1.0, 0.0, 0.0, 0.0])
+        profile = dp.build_deck_profile(
+            ["X"],
+            cards_coll=self.cards, tags_coll=self.tags,
+            theme_filter=self.permissive,
+        )
+        self.assertIn("random-flavor", profile.noise_tags)
+        self.assertNotIn("spot-removal", profile.noise_tags)
 
     def test_empty_deck_returns_empty_profile(self):
-        self._seed_tags()
+        self._seed_hierarchy()
         profile = dp.build_deck_profile(
-            [], cards_coll=self.cards, tags_coll=self.tags
+            [], cards_coll=self.cards, tags_coll=self.tags,
+            theme_filter=self.permissive,
         )
         self.assertEqual(profile.deck_card_ids, ())
         self.assertEqual(profile.clusters, ())
-        self.assertEqual(profile.tag_universe, ())
+        self.assertEqual(profile.unassigned_card_ids, ())
 
 
 # ---------------------------------------------------------------------------
@@ -455,9 +533,9 @@ class TestBuildDeckProfile(_MongoBackedTestCase):
 
 class TestRenderProfile(unittest.TestCase):
 
-    def _make_profile(self, cluster_tags, cluster_card_ids):
+    def _make_profile(self, cluster_tags, cluster_card_ids, *, unassigned=()):
         return dp.DeckProfile(
-            deck_card_ids=tuple(cluster_card_ids),
+            deck_card_ids=tuple(cluster_card_ids) + tuple(unassigned),
             missing_names=(),
             tag_universe=tuple(sorted(cluster_tags)),
             clusters=(
@@ -469,6 +547,7 @@ class TestRenderProfile(unittest.TestCase):
                 ),
             ),
             noise_tags=(),
+            unassigned_card_ids=tuple(unassigned),
         )
 
     def test_truncation_marker_appears_when_items_exceed_limit(self):
@@ -491,17 +570,17 @@ class TestRenderProfile(unittest.TestCase):
         )
         self.assertNotIn("more)", text)
 
-    def test_missing_names_listed(self):
-        profile = dp.DeckProfile(
-            deck_card_ids=(),
-            missing_names=("Nonexistent Card",),
-            tag_universe=(),
-            clusters=(),
-            noise_tags=(),
+    def test_unassigned_cards_listed(self):
+        profile = self._make_profile(
+            cluster_tags=["a"],
+            cluster_card_ids=["id-1"],
+            unassigned=("id-99",),
         )
-        text = dp._render_profile(profile, name_lookup={}, limit=10)
-        self.assertIn("1 missing", text)
-        self.assertIn("Nonexistent Card", text)
+        text = dp._render_profile(
+            profile, name_lookup={"id-1": "Card 1", "id-99": "Mystery"}, limit=10
+        )
+        self.assertIn("unassigned cards: Mystery", text)
+        self.assertIn("1 card(s) unassigned", text)
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +588,6 @@ class TestRenderProfile(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 def _run_cli(argv: list[str]) -> tuple[int, str, str]:
-    """Invoke the CLI with argv, returning (rc, stdout, stderr)."""
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
         rc = dp.main(argv)
@@ -518,96 +596,81 @@ def _run_cli(argv: list[str]) -> tuple[int, str, str]:
 
 class TestMainCLI(_MongoBackedTestCase):
 
-    def _seed_full_deck(self):
-        """Same fixture TestBuildDeckProfile uses, lifted here so the CLI
-        tests don't depend on test-class inheritance."""
-        self._seed_tags()
-        self._seed_card("id-bolt",      "Lightning Bolt",   ["spot-removal", "burn-any"])
-        self._seed_card("id-wrath",     "Wrath of God",     ["spot-removal", "removal-creature"])
-        self._seed_card("id-sol",       "Sol Ring",         ["mana-rock"])
-        self._seed_card("id-mystic",    "Birds of Paradise", ["mana-dork", "ramp"])
-        self._seed_card("id-brainstorm", "Brainstorm",      ["card-draw", "cantrip"])
+    def _seed_cli_deck(self):
+        self._seed_hierarchy()
+        self._seed_card("id-bolt", "Lightning Bolt", ["spot-removal"],
+                        text_embedding=[1.0, 0.0, 0.0, 0.0])
+        self._seed_card("id-sol", "Sol Ring", ["mana-rock"],
+                        text_embedding=[0.0, 1.0, 0.0, 0.0])
+        self._seed_card("id-brainstorm", "Brainstorm", ["cantrip"],
+                        text_embedding=[0.0, 0.0, 1.0, 0.0])
 
-    def test_prints_cluster_summary_from_positional_names(self):
-        self._seed_full_deck()
+    def test_prints_cluster_summary(self):
+        self._seed_cli_deck()
         rc, out, _ = _run_cli([
-            "Lightning Bolt", "Wrath of God", "Sol Ring",
-            "Birds of Paradise", "Brainstorm",
+            "Lightning Bolt", "Sol Ring", "Brainstorm",
+            # Override coverage so fixture themes survive the default
+            # min_coverage=100 floor.
+            "--min-coverage", "1",
         ])
         self.assertEqual(rc, 0)
-        self.assertIn("resolved 5 unique cards", out)
-        self.assertIn("theme ", out)
-        # Card names appear in the rendered output (not just scryfall ids).
+        self.assertIn("resolved 3 unique cards", out)
         self.assertIn("Lightning Bolt", out)
-        # And the three themes line is correct.
-        self.assertIn("3 theme(s) clustered", out)
+        self.assertIn("theme ", out)
 
     def test_file_input_reads_decklist(self):
-        self._seed_full_deck()
+        self._seed_cli_deck()
         with TemporaryDirectory() as d:
             deck = Path(d) / "deck.txt"
             deck.write_text(
                 "# commander\n"
                 "1 Lightning Bolt\n"
-                "1 Wrath of God\n"
                 "1 Sol Ring\n"
-                "1 Birds of Paradise\n"
                 "1 Brainstorm\n",
                 encoding="utf-8",
             )
-            rc, out, _ = _run_cli(["--file", str(deck)])
+            rc, out, _ = _run_cli([
+                "--file", str(deck), "--min-coverage", "1",
+            ])
         self.assertEqual(rc, 0)
-        self.assertIn("resolved 5 unique cards", out)
+        self.assertIn("resolved 3 unique cards", out)
 
-    def test_limit_flag_truncates(self):
-        self._seed_full_deck()
+    def test_theme_blocklist_override_unblocks_cycle(self):
+        # Pass --theme-blocklist "" to clear the default blocklist.
+        # The fixture's `cycle` top-level then survives filtering.
+        self._seed_hierarchy()
+        self._seed_card("id-c1", "Cycle Card 1", ["cycle-child-1"],
+                        text_embedding=[0.0, 0.0, 0.0, 1.0])
+        self._seed_card("id-c2", "Cycle Card 2", ["cycle-child-2"],
+                        text_embedding=[0.0, 0.0, 0.0, 1.0])
         rc, out, _ = _run_cli([
-            "Lightning Bolt", "Wrath of God", "Sol Ring",
-            "Birds of Paradise", "Brainstorm", "--limit", "1",
+            "Cycle Card 1", "Cycle Card 2",
+            "--min-coverage", "1", "--theme-blocklist", "",
         ])
         self.assertEqual(rc, 0)
-        # With only 1 item per cluster shown, truncation markers must appear.
-        self.assertIn("more)", out)
+        self.assertIn("theme 'cycle'", out)
 
-    def test_min_cluster_size_pipes_through(self):
-        # min_cluster_size=10 is larger than any single theme's membership,
-        # so no themes should emerge — everything lands in noise.
-        self._seed_full_deck()
+    def test_min_children_pipes_through(self):
+        self._seed_cli_deck()
         rc, out, _ = _run_cli([
-            "Lightning Bolt", "Wrath of God", "Sol Ring",
-            "Birds of Paradise", "Brainstorm", "--min-cluster-size", "10",
+            "Lightning Bolt", "Sol Ring", "Brainstorm",
+            "--min-coverage", "1",
+            "--min-children", "10",  # no theme has 10 children → zero survive
         ])
         self.assertEqual(rc, 0)
-        self.assertIn("0 theme(s) clustered", out)
+        self.assertIn("0 theme(s) matched", out)
 
     def test_missing_names_surfaced_in_output(self):
-        self._seed_full_deck()
-        rc, out, _ = _run_cli(["Lightning Bolt", "No Such Card"])
+        self._seed_cli_deck()
+        rc, out, _ = _run_cli([
+            "Lightning Bolt", "No Such Card", "--min-coverage", "1",
+        ])
         self.assertEqual(rc, 0)
         self.assertIn("missing: No Such Card", out)
 
     def test_empty_input_errors(self):
         with self.assertRaises(SystemExit):
             _run_cli([])
-
-    def test_reassign_threshold_flag_pipes_through(self):
-        # Force every tag into HDBSCAN noise by setting min_samples
-        # higher than any single cluster's membership (the universe has
-        # 8 tags in groups of 2–3; min_samples=4 means no tag has
-        # enough dense neighbours to seed a cluster). Then set the
-        # reassignment floor to 0.999 so nothing gets rescued.
-        self._seed_full_deck()
-        rc, out, _ = _run_cli([
-            "Lightning Bolt", "Wrath of God", "Sol Ring",
-            "Birds of Paradise", "Brainstorm",
-            "--min-samples", "4",
-            "--reassign-threshold", "0.999",
-        ])
-        self.assertEqual(rc, 0)
-        self.assertIn("0 theme(s) clustered", out)
-        # And at least one embedded tag ended up as noise (otherwise
-        # we'd know the flags didn't thread through).
-        self.assertNotIn("0 tag(s) in noise", out)
 
 
 if __name__ == "__main__":
