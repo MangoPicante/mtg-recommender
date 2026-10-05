@@ -27,7 +27,12 @@ Test classes:
     TestClassifyCard            0 / 1 / 2+ candidates; text-embedding
                                  tiebreak; missing embedding falls back
     TestClassifyDeck            per-theme membership + unassigned bucket
+    TestMergeSimilarThemes      threshold off/negative is a no-op; similar
+                                 themes merge with higher-coverage keeper;
+                                 chain merging via union-find; themes
+                                 without card_vectors stay singleton
     TestBuildDeckProfile        end-to-end on a seeded mongomock cluster
+                                 (incl. default-merge and disabled-merge)
     TestRenderProfile           truncation marker, cluster display shape
     TestMainCLI                 argparse: filters pipe through, --theme-
                                  blocklist override, --file reads decklist
@@ -407,6 +412,153 @@ class TestClassifyDeck(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# merge_similar_themes
+# ---------------------------------------------------------------------------
+
+class TestMergeSimilarThemes(unittest.TestCase):
+    """The merge pass is a pure function over three plain dicts, so
+    these tests inject hand-built inputs and assert on the output
+    shape. No Mongo involved.
+    """
+
+    def _theme(self, name, coverage):
+        # tag_slugs and representative don't matter here — the merge
+        # pass only reads coverage for the keeper tie-break. Give the
+        # representative something non-zero so it's a valid Theme.
+        return tc.Theme(
+            name=name,
+            tag_slugs=frozenset({name}),
+            representative=np.array([1.0, 0.0, 0.0, 0.0]),
+            card_coverage=coverage,
+        )
+
+    def _packed_card(self, card_vector):
+        """Mongo doc shape with a packed card_vector."""
+        return {"card_vector": emb._pack_embedding(np.array(card_vector, dtype=np.float32))}
+
+    def test_zero_threshold_is_no_op(self):
+        # Even blatantly similar profiles stay separate.
+        per_theme = {"a": ["c1"], "b": ["c2"]}
+        themes_by_name = {"a": self._theme("a", 10), "b": self._theme("b", 20)}
+        cards_by_id = {
+            "c1": self._packed_card([1.0, 0.0, 0.0, 0.0]),
+            "c2": self._packed_card([1.0, 0.0, 0.0, 0.0]),
+        }
+        got, merge_map = tc.merge_similar_themes(
+            per_theme, themes_by_name, cards_by_id, threshold=0.0,
+        )
+        self.assertEqual(got, per_theme)
+        self.assertEqual(merge_map, {"a": "a", "b": "b"})
+
+    def test_negative_threshold_disables_pass(self):
+        per_theme = {"a": ["c1"], "b": ["c2"]}
+        themes_by_name = {"a": self._theme("a", 10), "b": self._theme("b", 20)}
+        cards_by_id = {
+            "c1": self._packed_card([1.0, 0.0, 0.0, 0.0]),
+            "c2": self._packed_card([1.0, 0.0, 0.0, 0.0]),
+        }
+        got, _ = tc.merge_similar_themes(
+            per_theme, themes_by_name, cards_by_id, threshold=-1.0,
+        )
+        self.assertEqual(got, per_theme)
+
+    def test_two_similar_themes_merge_and_higher_coverage_keeps(self):
+        # Both themes have card profiles pointing at +x. Threshold 0.9
+        # should merge them; the higher-coverage theme's name wins.
+        per_theme = {"removal": ["c1"], "spot-removal": ["c2"]}
+        themes_by_name = {
+            "removal":      self._theme("removal", 500),
+            "spot-removal": self._theme("spot-removal", 50),
+        }
+        cards_by_id = {
+            "c1": self._packed_card([1.0, 0.0, 0.0, 0.0]),
+            "c2": self._packed_card([0.98, 0.02, 0.0, 0.0]),
+        }
+        got, merge_map = tc.merge_similar_themes(
+            per_theme, themes_by_name, cards_by_id, threshold=0.9,
+        )
+        self.assertEqual(len(got), 1)
+        self.assertIn("removal", got)
+        self.assertEqual(sorted(got["removal"]), ["c1", "c2"])
+        self.assertEqual(merge_map, {"removal": "removal", "spot-removal": "removal"})
+
+    def test_far_apart_themes_stay_separate(self):
+        # Profiles on +x and +z — cosine sim ≈ 0, well below any
+        # reasonable threshold. Both themes survive untouched.
+        per_theme = {"removal": ["c1"], "ramp": ["c2"]}
+        themes_by_name = {
+            "removal": self._theme("removal", 500),
+            "ramp":    self._theme("ramp", 300),
+        }
+        cards_by_id = {
+            "c1": self._packed_card([1.0, 0.0, 0.0, 0.0]),
+            "c2": self._packed_card([0.0, 0.0, 1.0, 0.0]),
+        }
+        got, merge_map = tc.merge_similar_themes(
+            per_theme, themes_by_name, cards_by_id, threshold=0.9,
+        )
+        self.assertEqual(set(got), {"removal", "ramp"})
+        self.assertEqual(merge_map, {"removal": "removal", "ramp": "ramp"})
+
+    def test_chain_merging_via_union_find(self):
+        # Three themes a-b-c where a~b and b~c but NOT a~c.
+        # Expected: all three collapse into one component (union-find
+        # transitively, even when a~c doesn't clear the floor alone).
+        per_theme = {"a": ["c1"], "b": ["c2"], "c": ["c3"]}
+        themes_by_name = {
+            "a": self._theme("a", 100),
+            "b": self._theme("b", 300),  # middle has highest coverage → keeper
+            "c": self._theme("c", 200),
+        }
+        # Place vectors so adjacent pairs are ~0.95 cos-sim but the
+        # outer pair is ~0.86. With threshold 0.9 the chain merges.
+        cards_by_id = {
+            "c1": self._packed_card([1.0, 0.0, 0.0, 0.0]),
+            "c2": self._packed_card([0.72, 0.70, 0.0, 0.0]),
+            "c3": self._packed_card([0.0, 1.0, 0.0, 0.0]),
+        }
+        got, merge_map = tc.merge_similar_themes(
+            per_theme, themes_by_name, cards_by_id, threshold=0.65,
+        )
+        # One cluster, holding all three cards.
+        self.assertEqual(len(got), 1)
+        keeper = next(iter(got))
+        self.assertEqual(sorted(got[keeper]), ["c1", "c2", "c3"])
+        # b has the highest coverage → wins the keeper role.
+        self.assertEqual(keeper, "b")
+        # Every original theme points at b.
+        self.assertEqual(set(merge_map.values()), {"b"})
+
+    def test_theme_without_card_vectors_stays_singleton(self):
+        # One theme has a card with a card_vector, the other doesn't.
+        # The one without a profile can't participate in merging —
+        # must stay a singleton.
+        per_theme = {"with-vec": ["c1"], "no-vec": ["c2"]}
+        themes_by_name = {
+            "with-vec": self._theme("with-vec", 100),
+            "no-vec":   self._theme("no-vec", 200),
+        }
+        cards_by_id = {
+            "c1": self._packed_card([1.0, 0.0, 0.0, 0.0]),
+            "c2": {},  # no card_vector field
+        }
+        got, _ = tc.merge_similar_themes(
+            per_theme, themes_by_name, cards_by_id, threshold=0.5,
+        )
+        # Both themes survive untouched since one has no profile.
+        self.assertEqual(set(got), {"with-vec", "no-vec"})
+
+    def test_single_theme_is_a_no_op(self):
+        per_theme = {"only": ["c1"]}
+        themes_by_name = {"only": self._theme("only", 100)}
+        cards_by_id = {"c1": self._packed_card([1.0, 0.0, 0.0, 0.0])}
+        got, _ = tc.merge_similar_themes(
+            per_theme, themes_by_name, cards_by_id, threshold=0.5,
+        )
+        self.assertEqual(got, per_theme)
+
+
+# ---------------------------------------------------------------------------
 # build_deck_profile — end-to-end
 # ---------------------------------------------------------------------------
 
@@ -525,6 +677,79 @@ class TestBuildDeckProfile(_MongoBackedTestCase):
         self.assertEqual(profile.deck_card_ids, ())
         self.assertEqual(profile.clusters, ())
         self.assertEqual(profile.unassigned_card_ids, ())
+
+    def test_default_merge_threshold_does_not_merge_distant_themes(self):
+        # Cards in each theme have card_vectors pointing at different
+        # basis vectors — merge pass finds no similar-enough pairs.
+        self._seed_hierarchy()
+        self._seed_card("id-bolt", "Lightning Bolt", ["spot-removal"],
+                        text_embedding=[1.0, 0.0, 0.0, 0.0])
+        self._seed_card("id-sol", "Sol Ring", ["mana-rock"],
+                        text_embedding=[0.0, 1.0, 0.0, 0.0])
+        # Give cards a card_vector so the merge pass has profiles to work with.
+        self.cards.update_one({"_id": "id-bolt"},
+            {"$set": {"card_vector": _pack([1.0, 0.0, 0.0, 0.0])}})
+        self.cards.update_one({"_id": "id-sol"},
+            {"$set": {"card_vector": _pack([0.0, 1.0, 0.0, 0.0])}})
+        profile = dp.build_deck_profile(
+            ["Lightning Bolt", "Sol Ring"],
+            cards_coll=self.cards, tags_coll=self.tags,
+            theme_filter=self.permissive,  # default merge_threshold = 0.9
+        )
+        # Two themes, each a singleton cluster.
+        self.assertEqual(len(profile.clusters), 2)
+        for cluster in profile.clusters:
+            self.assertEqual(len(cluster.constituent_themes), 1)
+            self.assertEqual(cluster.constituent_themes[0], cluster.label)
+
+    def test_similar_themes_merge_via_card_vector_profiles(self):
+        # Two themes whose cards' card_vectors all point at +x — the
+        # merge pass should collapse them. Keeper is whichever has
+        # higher card_coverage; in the fixture both themes have 1
+        # card each, so coverage comes from count_documents on tags
+        # — removal (1 card tagged) ties with card-advantage (1 card
+        # tagged). Alphabetical tiebreak means "card-advantage" wins.
+        self._seed_hierarchy()
+        self._seed_card("id-a", "Card A", ["spot-removal"],
+                        text_embedding=[1.0, 0.0, 0.0, 0.0])
+        self._seed_card("id-b", "Card B", ["cantrip"],
+                        text_embedding=[0.0, 0.0, 1.0, 0.0])
+        self.cards.update_one({"_id": "id-a"},
+            {"$set": {"card_vector": _pack([1.0, 0.0, 0.0, 0.0])}})
+        self.cards.update_one({"_id": "id-b"},
+            {"$set": {"card_vector": _pack([0.98, 0.02, 0.0, 0.0])}})
+        profile = dp.build_deck_profile(
+            ["Card A", "Card B"],
+            cards_coll=self.cards, tags_coll=self.tags,
+            theme_filter=self.permissive, merge_threshold=0.9,
+        )
+        # One merged cluster carrying both cards.
+        self.assertEqual(len(profile.clusters), 1)
+        cluster = profile.clusters[0]
+        self.assertEqual(set(cluster.deck_card_ids), {"id-a", "id-b"})
+        self.assertEqual(
+            set(cluster.constituent_themes),
+            {"removal", "card-advantage"},
+        )
+
+    def test_disabled_merge_keeps_themes_separate(self):
+        # Same setup as the "similar themes merge" test, but with
+        # merge_threshold=-1 the pass is skipped and we see both.
+        self._seed_hierarchy()
+        self._seed_card("id-a", "Card A", ["spot-removal"],
+                        text_embedding=[1.0, 0.0, 0.0, 0.0])
+        self._seed_card("id-b", "Card B", ["cantrip"],
+                        text_embedding=[0.0, 0.0, 1.0, 0.0])
+        self.cards.update_one({"_id": "id-a"},
+            {"$set": {"card_vector": _pack([1.0, 0.0, 0.0, 0.0])}})
+        self.cards.update_one({"_id": "id-b"},
+            {"$set": {"card_vector": _pack([0.98, 0.02, 0.0, 0.0])}})
+        profile = dp.build_deck_profile(
+            ["Card A", "Card B"],
+            cards_coll=self.cards, tags_coll=self.tags,
+            theme_filter=self.permissive, merge_threshold=-1.0,
+        )
+        self.assertEqual(len(profile.clusters), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +896,34 @@ class TestMainCLI(_MongoBackedTestCase):
     def test_empty_input_errors(self):
         with self.assertRaises(SystemExit):
             _run_cli([])
+
+    def test_merge_threshold_flag_pipes_through(self):
+        # Seed two cards whose themes should merge at threshold 0.9.
+        # Confirm the "merged:" annotation appears in the render.
+        self._seed_hierarchy()
+        self._seed_card("id-a", "Card A", ["spot-removal"],
+                        text_embedding=[1.0, 0.0, 0.0, 0.0])
+        self._seed_card("id-b", "Card B", ["cantrip"],
+                        text_embedding=[0.0, 0.0, 1.0, 0.0])
+        self.cards.update_one({"_id": "id-a"},
+            {"$set": {"card_vector": _pack([1.0, 0.0, 0.0, 0.0])}})
+        self.cards.update_one({"_id": "id-b"},
+            {"$set": {"card_vector": _pack([0.98, 0.02, 0.0, 0.0])}})
+        rc, out, _ = _run_cli([
+            "Card A", "Card B",
+            "--min-coverage", "1", "--merge-threshold", "0.9",
+        ])
+        self.assertEqual(rc, 0)
+        # Exactly one cluster, with a "merged: ..." annotation naming
+        # the non-keeper constituent.
+        self.assertIn("[merged:", out)
+        # And the no-merge version keeps them split.
+        rc, out_split, _ = _run_cli([
+            "Card A", "Card B",
+            "--min-coverage", "1", "--merge-threshold", "-1",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("[merged:", out_split)
 
 
 if __name__ == "__main__":

@@ -317,6 +317,14 @@ mtg-deck-profile --file deck.txt --min-coverage 50 --max-coverage 8000
 mtg-deck-profile --file deck.txt --theme-blocklist "card-names,type-errata"
 mtg-deck-profile --file deck.txt --theme-blocklist ""
 
+# After classification, themes whose cards' card_vector profiles are
+# cosine-similar enough get merged into one cluster — collapses
+# attributions like "removal" + "mass-removal" when the deck's
+# removal cards semantically overlap. Default 0.9 (cautious). Lower
+# merges more aggressively; negative disables the pass.
+mtg-deck-profile --file deck.txt --merge-threshold 0.75
+mtg-deck-profile --file deck.txt --merge-threshold -1       # off
+
 # Cap per-cluster display (default: 10 tags + 10 cards; everything
 # beyond collapses to a "(+N more)" marker).
 mtg-deck-profile --file deck.txt --limit 20
@@ -365,10 +373,18 @@ print("unassigned:", profile.unassigned_card_ids)
    candidate theme's representative vector; the max wins. (Falls
    back to the candidate with the highest card_coverage if the
    card has no `text_embedding` stored.)
-3. **Attribution shape:** each `DeckCluster.tags` lists only the slugs
+3. **Theme merge** (`theme_classifier.merge_similar_themes`) builds
+   each theme's L2-normalized mean `card_vector` profile and runs
+   Union-Find across pairs whose cosine similarity hits the
+   `--merge-threshold`. Chains (A~B, B~C) collapse into one
+   component even when A~C alone wouldn't. The keeper's label is
+   the component member with the highest `card_coverage`; every
+   constituent name is preserved in `DeckCluster.constituent_themes`
+   so attribution still shows "merged: X, Y, Z" in the render.
+4. **Attribution shape:** each `DeckCluster.tags` lists only the slugs
    the deck's cards actually brought in — not the theme's full
    subtree — so the output reflects what mattered on this specific
-   deck. Phase 3 step 4 (candidate ranking) will use each theme's
+   deck. Phase 3 step 4 (candidate ranking) will use each cluster's
    `centroid` as a query vector against `card_vector`, with EDHREC
    lift (from `edhrec_fetch`) layered on as a per-commander quality
    signal.
