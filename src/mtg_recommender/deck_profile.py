@@ -54,6 +54,30 @@ from . import storage
 # a deck context), 3 is stricter. Overridable per call.
 DEFAULT_MIN_CLUSTER_SIZE = 2
 
+# HDBSCAN's min_samples: how many points must be in a core point's
+# epsilon-neighborhood for it to count as "dense enough" to seed a
+# cluster. Lower = more inclusive (fewer orphans flagged as noise);
+# sklearn defaults to min_cluster_size when None, which is stricter
+# than we want for ~small decks. 1 means every tag can be a core
+# point, so tags only land in noise when they're genuinely isolated
+# in embedding space.
+DEFAULT_MIN_SAMPLES = 1
+
+# HDBSCAN's cluster_selection_epsilon: merges clusters whose boundary
+# distance falls below this value. 0.0 (default) keeps HDBSCAN's
+# natural cluster boundaries; raise it to collapse near-themes that
+# split too eagerly. Users wanting more inclusive clusters can set
+# this to 0.1–0.3 (cosine distance) without changing anything else.
+DEFAULT_CLUSTER_SELECTION_EPSILON = 0.0
+
+# Cosine-similarity threshold for the noise-reassignment pass. After
+# HDBSCAN runs, any tag it flagged as noise gets reassigned to its
+# nearest real cluster when sim ≥ this value. 0.6 is empirically
+# forgiving enough to catch "almost belonged to a theme" tags without
+# gluing unrelated signals together. Set to a negative value to
+# disable the pass entirely and preserve the raw HDBSCAN output.
+DEFAULT_REASSIGN_THRESHOLD = 0.6
+
 # Noise label HDBSCAN assigns to tags that don't fit any cluster. We
 # keep this out of `DeckProfile.clusters` and surface it separately
 # as `noise_tags` so the recommender knows which signals got dropped.
@@ -194,8 +218,15 @@ def _cluster_tag_embeddings(
     embeddings_by_slug: dict[str, np.ndarray],
     *,
     min_cluster_size: int,
+    min_samples: int,
+    cluster_selection_epsilon: float,
 ) -> dict[int, list[str]]:
     """Return `{cluster_label: [tag_slug, ...]}` from HDBSCAN.
+
+    `min_samples` and `cluster_selection_epsilon` are passed through
+    to HDBSCAN so callers can trade inclusivity for strictness without
+    forking the implementation — the defaults in `build_deck_profile`
+    err on the inclusive side, which matches what a recommender wants.
 
     A degenerate universe (0 or 1 tag) can't cluster meaningfully; we
     return the empty labelling and let the caller surface the lone tag
@@ -209,6 +240,8 @@ def _cluster_tag_embeddings(
     # flips in 1.10 and we're being explicit about not mutating input.
     labels = HDBSCAN(
         min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
         metric="cosine",
         copy=True,
     ).fit_predict(matrix)
@@ -216,6 +249,79 @@ def _cluster_tag_embeddings(
     for slug, label in zip(slugs, labels):
         groups.setdefault(int(label), []).append(slug)
     return groups
+
+
+def _reassign_noise_to_nearest_cluster(
+    groups: dict[int, list[str]],
+    embeddings_by_slug: dict[str, np.ndarray],
+    *,
+    threshold: float,
+) -> dict[int, list[str]]:
+    """Move each noise tag to its nearest real cluster if sim ≥ `threshold`.
+
+    HDBSCAN flags a tag as noise when its embedding neighbourhood is
+    too sparse to form a core point. Those tags carry real signal that
+    the recommender would otherwise discard. For each noise tag we:
+
+      1. Compute the unit vector of its embedding.
+      2. For each real cluster, average the member tags' unit vectors
+         (an unweighted cheap centroid) and dot-product against the
+         noise tag's unit vector — that's cosine similarity.
+      3. Reassign the tag to whichever cluster has the highest sim,
+         but only if sim ≥ `threshold`. Below the floor, the tag
+         stays in the noise bucket (its signal was too far from any
+         existing theme to glue in without diluting it).
+
+    The pass runs against the ORIGINAL HDBSCAN groupings — we don't
+    iterate (adding a tag to a cluster slightly shifts its centroid,
+    which could re-rank other noise tags' nearest-cluster choice).
+    For the small matrices this operates on (~hundred-tag decks) a
+    single pass is both simpler and good enough; the recommender's
+    EDHREC-based cluster evaluation downstream is where the real
+    quality filter happens.
+
+    `threshold < 0` disables the pass (returns groups unchanged).
+    """
+    if threshold < 0 or NOISE_LABEL not in groups:
+        return groups
+    real_labels = [lbl for lbl in groups if lbl != NOISE_LABEL]
+    if not real_labels:
+        return groups
+
+    # Precompute each real cluster's unit-norm centroid once.
+    centroids: dict[int, np.ndarray] = {}
+    for lbl in real_labels:
+        vecs = np.vstack([embeddings_by_slug[s] for s in groups[lbl]])
+        mean = vecs.mean(axis=0)
+        n = float(np.linalg.norm(mean))
+        centroids[lbl] = mean / n if n > 0 else mean
+
+    noise_slugs = list(groups[NOISE_LABEL])
+    kept_noise: list[str] = []
+    # Build the new mapping as a copy so we don't mutate the original
+    # groups dict while iterating anything derived from it.
+    updated = {lbl: list(members) for lbl, members in groups.items()}
+    for slug in noise_slugs:
+        vec = embeddings_by_slug[slug]
+        v_norm = float(np.linalg.norm(vec))
+        if v_norm == 0:
+            kept_noise.append(slug)
+            continue
+        unit = vec / v_norm
+        best_label, best_sim = None, threshold
+        for lbl, centroid in centroids.items():
+            sim = float(np.dot(unit, centroid))
+            # Strict > so ties don't drag a tag into a cluster at the
+            # threshold boundary. Threshold is initialised to the floor
+            # so the first clear hit wins.
+            if sim > best_sim:
+                best_label, best_sim = lbl, sim
+        if best_label is None:
+            kept_noise.append(slug)
+        else:
+            updated[best_label].append(slug)
+    updated[NOISE_LABEL] = kept_noise
+    return updated
 
 
 def _centroid_and_label(
@@ -261,13 +367,33 @@ def build_deck_profile(
     cards_coll: Optional[Collection] = None,
     tags_coll: Optional[Collection] = None,
     min_cluster_size: int = DEFAULT_MIN_CLUSTER_SIZE,
+    min_samples: int = DEFAULT_MIN_SAMPLES,
+    cluster_selection_epsilon: float = DEFAULT_CLUSTER_SELECTION_EPSILON,
+    reassign_threshold: float = DEFAULT_REASSIGN_THRESHOLD,
 ) -> DeckProfile:
     """Full pipeline: decklist → resolved cards → tags → clusters.
 
     All Mongo collections default to the project handles; tests pass
-    mongomock collections directly. `min_cluster_size` controls HDBSCAN
-    strictness — lower it (to 2) for small decks; raise it (to 4+) for
-    decks where you want only strong themes.
+    mongomock collections directly.
+
+    Clustering knobs (all defaults err on the inclusive side so the
+    recommender has more signal to work with — the EDHREC-based
+    cluster evaluation downstream filters weak themes):
+
+      min_cluster_size:
+        Minimum tag count for a cluster. Default 2 (any pair counts).
+      min_samples:
+        HDBSCAN density parameter. Default 1 — every tag can be a
+        core point, so tags only land in noise when they're genuinely
+        isolated in embedding space.
+      cluster_selection_epsilon:
+        Merges clusters whose boundary distance (cosine) falls below
+        this value. 0.0 preserves HDBSCAN's natural splits; raise to
+        collapse near-themes.
+      reassign_threshold:
+        After HDBSCAN runs, any tag it flagged as noise gets moved
+        to its nearest real cluster when cosine-sim ≥ this value.
+        Default 0.6. Set negative to disable the pass.
     """
     if cards_coll is None:
         cards_coll = storage.cards_collection()
@@ -280,12 +406,22 @@ def build_deck_profile(
 
     # Tags present in the deck but not in `embeddings_by_slug` have no
     # embedding — treat them as degenerate noise so the profile stays
-    # honest about what the clusterer actually saw.
+    # honest about what the clusterer actually saw. These never get
+    # reassigned (no vector to compare against); they're a different
+    # category of orphan than HDBSCAN-noise.
     embedded_slugs = set(embeddings_by_slug)
     unembedded = [s for s in tag_universe if s not in embedded_slugs]
 
     groups = _cluster_tag_embeddings(
-        embeddings_by_slug, min_cluster_size=min_cluster_size
+        embeddings_by_slug,
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+    )
+    # Reassign HDBSCAN-noise tags to their nearest real cluster when
+    # the fit is close enough. Threshold < 0 skips the pass.
+    groups = _reassign_noise_to_nearest_cluster(
+        groups, embeddings_by_slug, threshold=reassign_threshold
     )
 
     clusters: list[DeckCluster] = []
@@ -419,6 +555,33 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--min-samples", type=int, default=DEFAULT_MIN_SAMPLES,
+        help=(
+            f"HDBSCAN min_samples (default: {DEFAULT_MIN_SAMPLES}). "
+            "Lower = more inclusive (fewer orphans flagged as noise). "
+            "1 means every tag can be a core point."
+        ),
+    )
+    parser.add_argument(
+        "--cluster-selection-epsilon", type=float,
+        default=DEFAULT_CLUSTER_SELECTION_EPSILON,
+        help=(
+            "Cosine-distance threshold for merging near-themes HDBSCAN "
+            "would otherwise split (default: "
+            f"{DEFAULT_CLUSTER_SELECTION_EPSILON}). Try 0.1–0.3 for a "
+            "more lumped output."
+        ),
+    )
+    parser.add_argument(
+        "--reassign-threshold", type=float, default=DEFAULT_REASSIGN_THRESHOLD,
+        help=(
+            "Cosine-similarity threshold for the noise-reassignment "
+            "pass (default: {}). A noise tag whose embedding has "
+            "sim ≥ this to some cluster's centroid gets absorbed into "
+            "that cluster. Set negative to disable the pass."
+        ).format(DEFAULT_REASSIGN_THRESHOLD),
+    )
+    parser.add_argument(
         "--limit", type=int, default=DEFAULT_RENDER_LIMIT,
         help=(
             f"Per-cluster display cap for tags + cards (default: {DEFAULT_RENDER_LIMIT}). "
@@ -438,6 +601,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         cards_coll=cards_coll,
         tags_coll=tags_coll,
         min_cluster_size=args.min_cluster_size,
+        min_samples=args.min_samples,
+        cluster_selection_epsilon=args.cluster_selection_epsilon,
+        reassign_threshold=args.reassign_threshold,
     )
     name_lookup = _name_lookup_for(profile.deck_card_ids, cards_coll)
     print(_render_profile(profile, name_lookup=name_lookup, limit=args.limit))
