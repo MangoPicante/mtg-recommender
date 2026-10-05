@@ -12,10 +12,14 @@ Test classes:
     TestLoadTagEmbeddings       bulk fetch, skips tags without embedding
     TestClusterTagEmbeddings    3 tight groups -> 3 clusters;
                                  degenerate universe returns empty
+    TestReassignNoise           noise-reassignment pass: absorb when near,
+                                 skip when far, threshold boundary strict,
+                                 negative threshold disables
     TestCentroidAndLabel        picks nearest tag; L2-normalises centroid
     TestBuildDeckProfile        end-to-end on a seeded mongomock cluster
     TestRenderProfile           truncation marker, cluster display shape
     TestMainCLI                 argparse: --file, --min-cluster-size, --limit,
+                                 --min-samples / --reassign-threshold piping,
                                  empty-input error
 """
 from __future__ import annotations
@@ -190,7 +194,10 @@ class TestClusterTagEmbeddings(unittest.TestCase):
 
     def test_three_tight_groups_yield_three_clusters(self):
         embeddings = {slug: np.array(vec) for slug, vec in TAG_FIXTURES.items()}
-        groups = dp._cluster_tag_embeddings(embeddings, min_cluster_size=2)
+        groups = dp._cluster_tag_embeddings(
+            embeddings, min_cluster_size=2, min_samples=1,
+            cluster_selection_epsilon=0.0,
+        )
         # Drop the noise bucket if present; three themes should emerge.
         real_clusters = {k: v for k, v in groups.items() if k != dp.NOISE_LABEL}
         self.assertEqual(len(real_clusters), 3)
@@ -205,9 +212,121 @@ class TestClusterTagEmbeddings(unittest.TestCase):
         # With fewer tags than min_cluster_size, HDBSCAN can't do anything —
         # we bail early rather than letting sklearn raise.
         got = dp._cluster_tag_embeddings(
-            {"only-one": np.array([1.0, 0.0, 0.0, 0.0])}, min_cluster_size=2
+            {"only-one": np.array([1.0, 0.0, 0.0, 0.0])},
+            min_cluster_size=2, min_samples=1, cluster_selection_epsilon=0.0,
         )
         self.assertEqual(got, {})
+
+
+# ---------------------------------------------------------------------------
+# _reassign_noise_to_nearest_cluster  (Option B)
+# ---------------------------------------------------------------------------
+
+class TestReassignNoise(unittest.TestCase):
+    """The reassignment pass is a pure function — no Mongo involved —
+    so these tests inject hand-built `groups` dicts and embeddings and
+    assert on the shape of the output. HDBSCAN output isn't needed.
+    """
+
+    def _emb(self, mapping):
+        return {k: np.array(v, dtype=np.float64) for k, v in mapping.items()}
+
+    def test_noise_tag_near_cluster_gets_absorbed(self):
+        # Two cluster tags on +x axis, one noise tag ALSO near +x. With
+        # threshold 0.6 the noise tag should jump into the real cluster.
+        embeddings = self._emb({
+            "a": [1.0, 0.0, 0.0],
+            "b": [0.95, 0.05, 0.0],
+            "orphan": [0.9, 0.1, 0.1],
+        })
+        groups = {0: ["a", "b"], dp.NOISE_LABEL: ["orphan"]}
+        got = dp._reassign_noise_to_nearest_cluster(
+            groups, embeddings, threshold=0.6
+        )
+        self.assertIn("orphan", got[0])
+        self.assertEqual(got[dp.NOISE_LABEL], [])
+
+    def test_noise_tag_far_from_all_clusters_stays(self):
+        # Cluster tags on +x; noise tag on +z. Cosine sim ≈ 0, well
+        # below the 0.6 floor → tag stays in noise.
+        embeddings = self._emb({
+            "a": [1.0, 0.0, 0.0],
+            "b": [0.95, 0.05, 0.0],
+            "orphan": [0.0, 0.0, 1.0],
+        })
+        groups = {0: ["a", "b"], dp.NOISE_LABEL: ["orphan"]}
+        got = dp._reassign_noise_to_nearest_cluster(
+            groups, embeddings, threshold=0.6
+        )
+        self.assertEqual(got[0], ["a", "b"])
+        self.assertEqual(got[dp.NOISE_LABEL], ["orphan"])
+
+    def test_noise_picks_nearest_of_multiple_clusters(self):
+        # Two clusters on +x and +z. Orphan is at (0.8, 0, 0.2) —
+        # closer to the +x cluster. Must land there, not +z.
+        embeddings = self._emb({
+            "x-anchor":  [1.0, 0.0, 0.0],
+            "x-pair":    [0.95, 0.05, 0.0],
+            "z-anchor":  [0.0, 0.0, 1.0],
+            "z-pair":    [0.0, 0.05, 0.95],
+            "orphan":    [0.8, 0.0, 0.2],
+        })
+        groups = {
+            0: ["x-anchor", "x-pair"],
+            1: ["z-anchor", "z-pair"],
+            dp.NOISE_LABEL: ["orphan"],
+        }
+        got = dp._reassign_noise_to_nearest_cluster(
+            groups, embeddings, threshold=0.6
+        )
+        self.assertIn("orphan", got[0])
+        self.assertNotIn("orphan", got[1])
+
+    def test_threshold_boundary_strict(self):
+        # The threshold is a FLOOR we strictly exceed. If a noise tag's
+        # best sim equals the threshold exactly, it stays in noise —
+        # ties shouldn't drag borderline tags into clusters.
+        embeddings = self._emb({
+            "a": [1.0, 0.0, 0.0],
+            "b": [1.0, 0.0, 0.0],
+            # orphan at the exact boundary (sim = 0.6).
+            "orphan": [0.6, 0.8, 0.0],
+        })
+        groups = {0: ["a", "b"], dp.NOISE_LABEL: ["orphan"]}
+        got = dp._reassign_noise_to_nearest_cluster(
+            groups, embeddings, threshold=0.6
+        )
+        self.assertEqual(got[dp.NOISE_LABEL], ["orphan"])
+
+    def test_negative_threshold_disables_pass(self):
+        # A −1 threshold is the "feature off" sentinel. Groups must come
+        # back untouched even for a tag that would otherwise be absorbed.
+        embeddings = self._emb({
+            "a": [1.0, 0.0, 0.0],
+            "orphan": [0.99, 0.01, 0.0],
+        })
+        groups = {0: ["a", "a"], dp.NOISE_LABEL: ["orphan"]}
+        got = dp._reassign_noise_to_nearest_cluster(
+            groups, embeddings, threshold=-1.0
+        )
+        self.assertEqual(got, groups)
+
+    def test_no_real_clusters_leaves_noise_unchanged(self):
+        # Only a noise bucket exists — nothing to reassign TO.
+        embeddings = self._emb({"orphan": [1.0, 0.0, 0.0]})
+        groups = {dp.NOISE_LABEL: ["orphan"]}
+        got = dp._reassign_noise_to_nearest_cluster(
+            groups, embeddings, threshold=0.6
+        )
+        self.assertEqual(got, groups)
+
+    def test_no_noise_bucket_is_a_no_op(self):
+        embeddings = self._emb({"a": [1.0, 0.0], "b": [0.9, 0.1]})
+        groups = {0: ["a", "b"]}
+        got = dp._reassign_noise_to_nearest_cluster(
+            groups, embeddings, threshold=0.6
+        )
+        self.assertEqual(got, groups)
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +589,25 @@ class TestMainCLI(_MongoBackedTestCase):
     def test_empty_input_errors(self):
         with self.assertRaises(SystemExit):
             _run_cli([])
+
+    def test_reassign_threshold_flag_pipes_through(self):
+        # Force every tag into HDBSCAN noise by setting min_samples
+        # higher than any single cluster's membership (the universe has
+        # 8 tags in groups of 2–3; min_samples=4 means no tag has
+        # enough dense neighbours to seed a cluster). Then set the
+        # reassignment floor to 0.999 so nothing gets rescued.
+        self._seed_full_deck()
+        rc, out, _ = _run_cli([
+            "Lightning Bolt", "Wrath of God", "Sol Ring",
+            "Birds of Paradise", "Brainstorm",
+            "--min-samples", "4",
+            "--reassign-threshold", "0.999",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertIn("0 theme(s) clustered", out)
+        # And at least one embedded tag ended up as noise (otherwise
+        # we'd know the flags didn't thread through).
+        self.assertNotIn("0 tag(s) in noise", out)
 
 
 if __name__ == "__main__":

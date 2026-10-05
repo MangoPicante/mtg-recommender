@@ -298,9 +298,20 @@ mtg-deck-profile --file deck.txt
 # Or inline card names.
 mtg-deck-profile "Lightning Bolt" "Wrath of God" "Sol Ring" "Brainstorm"
 
-# Tune the clusterer. Lower --min-cluster-size for small decks;
-# raise it (3–4) to surface only strong themes.
-mtg-deck-profile --file deck.txt --min-cluster-size 3
+# Tune the clusterer. The three "inclusivity" knobs:
+#   --min-cluster-size N      smallest group that counts as a theme (default 2)
+#   --min-samples N           HDBSCAN density floor (default 1 — permissive)
+#   --cluster-selection-epsilon F
+#                             merge near-themes under this cosine distance
+#                             (default 0.0; try 0.1–0.3 to lump more)
+mtg-deck-profile --file deck.txt --min-cluster-size 3 --min-samples 2
+
+# After clustering, orphan tags HDBSCAN flagged as noise get a second
+# chance: each gets absorbed into the nearest real cluster if cosine
+# similarity to its centroid is at least --reassign-threshold.
+# Default 0.6; set negative to disable the pass.
+mtg-deck-profile --file deck.txt --reassign-threshold 0.5     # looser
+mtg-deck-profile --file deck.txt --reassign-threshold -1      # off
 
 # Cap per-cluster display (default: 10 tags + 10 cards each; everything
 # beyond collapses to a "(+N more)" marker).
@@ -333,13 +344,19 @@ for cluster in profile.clusters:
     print(cluster.label, cluster.tags, cluster.centroid.shape)
 ```
 
-**Clustering details:** `sklearn.cluster.HDBSCAN` with `metric="cosine"`
-and `min_cluster_size=2` by default. Each cluster's `centroid` is a unit
-vector in the tag embedding space — Phase 3 step 4 (candidate ranking)
-will use it as a query vector against `card_vector`, with EDHREC lift
-(from `edhrec_fetch`) layered on as a per-commander quality signal. Tags
-without a stored embedding (or that HDBSCAN flags as noise) land in
-`profile.noise_tags` so you can audit what was dropped.
+**Clustering details:** `sklearn.cluster.HDBSCAN` with `metric="cosine"`,
+`min_cluster_size=2`, `min_samples=1`, and `cluster_selection_epsilon=0.0`
+by default — all deliberately on the inclusive side so the recommender
+has more signal to work with. After HDBSCAN runs, a second pass sweeps
+through the noise bucket and reassigns each orphan tag to its nearest
+real cluster when cosine similarity to the cluster's centroid is at
+least `0.6` (`--reassign-threshold`); below the floor the tag stays in
+noise. Each cluster's `centroid` is a unit vector in the tag embedding
+space — Phase 3 step 4 (candidate ranking) will use it as a query vector
+against `card_vector`, with EDHREC lift (from `edhrec_fetch`) layered on
+as a per-commander quality signal. Tags without a stored embedding (and
+noise tags whose best-cluster sim was below the reassignment floor) land
+in `profile.noise_tags` so you can audit what was dropped.
 
 ## Testing
 
