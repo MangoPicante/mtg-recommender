@@ -57,22 +57,35 @@ class DeckCluster:
 
     Attributes:
       label: the theme name (top-level tag slug — "removal", "ramp").
+             For a merged cluster, the keeper's name (highest card
+             coverage among the constituents).
       tags: the deck's tag slugs that fall under this theme's subtree.
             Not the full subtree — only slugs actually present on
             deck cards, so the attribution output reflects what the
             CURRENT deck brought in rather than listing every known
-            member tag.
-      centroid: the theme's representative unit vector in the tag
+            member tag. For a merged cluster, the union of
+            constituent themes' deck-visible slugs.
+      centroid: the cluster's representative unit vector in the tag
                 embedding space. Phase 3 step 4 queries `card_vector`
-                against this to rank candidate cards.
+                against this to rank candidate cards. For a merged
+                cluster, the L2-normalized mean of its constituents'
+                representatives.
       deck_card_ids: scryfall_ids of deck cards classified into this
-                     theme (sorted for stability).
+                     cluster (sorted for stability).
+      constituent_themes: the theme names that got merged into this
+                          cluster. Length-1 tuple containing just
+                          `label` for an unmerged theme; longer when
+                          the post-classification merge pass
+                          collapsed similar themes together. Useful
+                          in attribution to show which themes
+                          collapsed.
     """
 
     label: str
     tags: tuple[str, ...]
     centroid: np.ndarray
     deck_card_ids: tuple[str, ...]
+    constituent_themes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -127,7 +140,14 @@ def resolve_deck_cards(
     seen_ids: set[str] = set()
     docs: list[dict] = []
     missing: list[str] = []
-    projection = {"_id": 1, "name": 1, "tags": 1, "text_embedding": 1}
+    # Project card_vector too: the optional merge-similar-themes pass
+    # needs it to compute per-theme card profiles. Deck cards without
+    # a card_vector are harmless — the merge step just excludes them
+    # from the profile averages.
+    projection = {
+        "_id": 1, "name": 1, "tags": 1,
+        "text_embedding": 1, "card_vector": 1,
+    }
     for name in card_names:
         matches = list(cards_coll.find({"names": name.lower()}, projection))
         if not matches:
@@ -160,13 +180,22 @@ def build_deck_profile(
     cards_coll: Optional[Collection] = None,
     tags_coll: Optional[Collection] = None,
     theme_filter: tc.ThemeFilter = tc.DEFAULT_THEME_FILTER,
+    merge_threshold: float = tc.DEFAULT_MERGE_THRESHOLD,
 ) -> DeckProfile:
     """Full pipeline: decklist → resolved cards → themes → classification.
 
     All Mongo collections default to the project handles; tests pass
-    mongomock collections directly. `theme_filter` tunes which top-level
-    tags count as "themes" worth classifying against; see
-    `theme_classifier.ThemeFilter` for the knobs.
+    mongomock collections directly.
+
+    `theme_filter` tunes which top-level tags count as "themes" worth
+    classifying against (see `theme_classifier.ThemeFilter`).
+
+    `merge_threshold` controls the post-classification merge pass:
+    pairs of themes whose averaged card_vector profiles have cosine
+    similarity ≥ this value collapse into one cluster (chains fold
+    together via Union-Find). The keeper's name is the component
+    member with the highest `card_coverage`. Default 0.9 — cautious.
+    Pass a negative value to disable the pass entirely.
     """
     if cards_coll is None:
         cards_coll = storage.cards_collection()
@@ -180,41 +209,76 @@ def build_deck_profile(
     )
     per_theme_cards, unassigned = tc.classify_deck(deck_cards, themes)
 
-    # Build DeckClusters only for themes that caught at least one deck
-    # card. Keep theme order from discover_themes (coverage-descending)
-    # so output is stable + themes with broader fit lead.
-    name_to_theme = {t.name: t for t in themes}
-    clusters: list[DeckCluster] = []
+    themes_by_name = {t.name: t for t in themes}
     cards_by_id = {doc["_id"]: doc for doc in deck_cards}
+
+    # Optional merge pass. Returns a merged per-theme-cards dict keyed
+    # by the component keeper's name, plus a merge_map saying what each
+    # original theme collapsed into. On a no-op (threshold ≤ 0 or
+    # degenerate inputs) the dict is unchanged and merge_map is identity.
+    merged_per_theme, merge_map = tc.merge_similar_themes(
+        per_theme_cards, themes_by_name, cards_by_id,
+        threshold=merge_threshold,
+    )
+
+    # Invert merge_map so each keeper knows all its constituents.
+    constituents_by_keeper: dict[str, list[str]] = {}
+    for original, keeper in merge_map.items():
+        constituents_by_keeper.setdefault(keeper, []).append(original)
+
+    # Build DeckClusters in coverage-descending order (same order
+    # `discover_themes` returned), using each cluster's keeper as the
+    # anchor and aggregating centroid + subtree + deck tags from all
+    # its constituents.
+    clusters: list[DeckCluster] = []
+    seen_keepers: set[str] = set()
     for theme in themes:
-        card_ids = per_theme_cards.get(theme.name)
+        keeper = merge_map.get(theme.name, theme.name)
+        if keeper in seen_keepers:
+            continue
+        card_ids = merged_per_theme.get(keeper)
         if not card_ids:
             continue
-        # The "tags" field for a cluster is the deck's own tag slugs
-        # that fall under this theme — the output reflects what the
-        # current deck actually brought, not the full subtree.
-        deck_tags_in_theme = set()
+        seen_keepers.add(keeper)
+
+        constituent_names = sorted(constituents_by_keeper.get(keeper, [keeper]))
+        constituent_themes = [themes_by_name[n] for n in constituent_names
+                              if n in themes_by_name]
+
+        # Aggregate centroid: L2-normalized mean of the constituents'
+        # representative vectors. For a singleton (unmerged) cluster
+        # this is just the one representative.
+        reps = np.vstack([t.representative for t in constituent_themes])
+        mean = reps.mean(axis=0)
+        norm = float(np.linalg.norm(mean))
+        centroid = mean / norm if norm > 0 else mean
+
+        # Deck tags attributed to this cluster: union of deck slugs
+        # that fell under any constituent theme's subtree.
+        combined_subtree: set[str] = set()
+        for t in constituent_themes:
+            combined_subtree |= t.tag_slugs
+        deck_tags_in_cluster: set[str] = set()
         for sid in card_ids:
             for slug in cards_by_id[sid].get("tags") or []:
-                if slug in theme.tag_slugs:
-                    deck_tags_in_theme.add(slug)
+                if slug in combined_subtree:
+                    deck_tags_in_cluster.add(slug)
+
         clusters.append(DeckCluster(
-            label=theme.name,
-            tags=tuple(sorted(deck_tags_in_theme)),
-            centroid=theme.representative,
-            deck_card_ids=tuple(card_ids),  # already sorted by classify_deck
+            label=keeper,
+            tags=tuple(sorted(deck_tags_in_cluster)),
+            centroid=centroid,
+            deck_card_ids=tuple(card_ids),  # already sorted by merge_similar_themes
+            constituent_themes=tuple(constituent_names),
         ))
 
-    # Noise: tags in the deck universe that no surviving theme covers.
-    covered = set()
+    # Noise: tags in the deck universe that no surviving theme covers
+    # (irrespective of merging — a tag outside every theme's subtree
+    # stays outside).
+    covered: set[str] = set()
     for t in themes:
         covered |= t.tag_slugs
     noise_tags = tuple(s for s in tag_universe if s not in covered)
-
-    # name_to_theme is unused in the current build but might help a
-    # future caller correlate names to theme objects without a second
-    # discover pass — keep a reference so lint doesn't flag the local.
-    _ = name_to_theme
 
     return DeckProfile(
         deck_card_ids=tuple(doc["_id"] for doc in deck_cards),
@@ -271,11 +335,15 @@ def _render_profile(
         lines.append("(no themes matched — try loosening the filter with "
                      "--max-coverage / --min-coverage / --min-children)")
     for cluster in profile.clusters:
-        lines.append(
+        header = (
             f"theme '{cluster.label}'  "
             f"({len(cluster.tags)} tags from deck, "
             f"{len(cluster.deck_card_ids)} cards)"
         )
+        if len(cluster.constituent_themes) > 1:
+            merged_in = [n for n in cluster.constituent_themes if n != cluster.label]
+            header += f"  [merged: {', '.join(merged_in)}]"
+        lines.append(header)
         lines.append(f"  tags : {_truncate(list(cluster.tags), limit)}")
         card_names = [name_lookup.get(sid, sid) for sid in cluster.deck_card_ids]
         card_names.sort()
@@ -380,6 +448,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--merge-threshold", type=float, default=tc.DEFAULT_MERGE_THRESHOLD,
+        help=(
+            f"Cosine-similarity floor for the post-classification merge "
+            f"pass (default: {tc.DEFAULT_MERGE_THRESHOLD}). Themes whose "
+            "averaged card_vector profiles sit at or above this value "
+            "collapse into one cluster. Lower (e.g. 0.7) merges more "
+            "aggressively; negative disables the pass."
+        ),
+    )
+    parser.add_argument(
         "--limit", type=int, default=DEFAULT_RENDER_LIMIT,
         help=(
             f"Per-cluster display cap for tags + cards (default: {DEFAULT_RENDER_LIMIT}). "
@@ -407,6 +485,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         cards_coll=cards_coll,
         tags_coll=tags_coll,
         theme_filter=theme_filter,
+        merge_threshold=args.merge_threshold,
     )
     name_lookup = _name_lookup_for(profile.deck_card_ids, cards_coll)
     print(_render_profile(profile, name_lookup=name_lookup, limit=args.limit))

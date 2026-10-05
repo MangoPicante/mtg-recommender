@@ -101,6 +101,18 @@ DEFAULT_MAX_COVERAGE = 5000
 # gives us a one-element bucket. 2 is the lowest useful threshold.
 DEFAULT_MIN_CHILDREN = 2
 
+# Default theme-merge threshold. After classification, two themes whose
+# averaged card_vector profiles (oracle_text + aggregated tag blend
+# from the Phase 2 fuse) have cosine similarity ≥ this value get
+# merged into one — attributions like "removal" and "mass-removal" or
+# "recursion" and "reanimation" collapse when their decks overlap
+# semantically.
+#
+# 0.9 is a cautious default — only clearly-related themes merge.
+# Lower (0.75, 0.6) for more aggressive lumping; negative disables
+# the merge pass entirely so you get the raw classifier output.
+DEFAULT_MERGE_THRESHOLD = 0.9
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -333,3 +345,132 @@ def classify_deck(
         per_theme[name].sort()
     unassigned.sort()
     return per_theme, unassigned
+
+
+# ---------------------------------------------------------------------------
+# Post-classification: merge semantically-similar themes
+# ---------------------------------------------------------------------------
+
+def _theme_card_profiles(
+    per_theme_cards: dict[str, list[str]],
+    cards_by_id: dict[str, dict],
+) -> dict[str, np.ndarray]:
+    """Compute each theme's L2-normalized mean card_vector profile.
+
+    A theme profile summarises what its member cards look like in the
+    recommender's `card_vector` space (oracle_text + aggregated tag
+    blend from Phase 2's fuse). Themes whose profiles are cosine-close
+    represent the same real play pattern even if they're separate
+    branches in the oracle_tags hierarchy — "removal" and "mass-
+    removal", "recursion" and "reanimation", etc.
+
+    Themes with zero member cards OR zero members carrying a stored
+    card_vector are silently omitted from the result — they can't
+    participate in the pairwise merge decisions, so the caller leaves
+    them as singletons.
+    """
+    profiles: dict[str, np.ndarray] = {}
+    for name, sids in per_theme_cards.items():
+        vecs = []
+        for sid in sids:
+            doc = cards_by_id.get(sid)
+            if doc is None:
+                continue
+            cv = doc.get("card_vector")
+            if cv is None:
+                continue
+            vecs.append(emb._unpack_embedding(cv))
+        if not vecs:
+            continue
+        mean = np.vstack(vecs).mean(axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm > 0:
+            profiles[name] = mean / norm
+    return profiles
+
+
+def merge_similar_themes(
+    per_theme_cards: dict[str, list[str]],
+    themes_by_name: dict[str, "Theme"],
+    cards_by_id: dict[str, dict],
+    *,
+    threshold: float = DEFAULT_MERGE_THRESHOLD,
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Merge themes whose averaged card_vector profiles exceed `threshold`.
+
+    Union-Find over the pair edges, so chains collapse: if A~B and B~C
+    both clear the threshold, A/B/C merge into one component even when
+    A~C alone wouldn't. The keeper's name is the component member with
+    the highest `card_coverage` (from `Theme.card_coverage`) — the
+    "main" theme wins and sub-aspects merge into it.
+
+    Threshold ≤ 0 disables the pass (returns the original dict + an
+    identity merge map). Themes without a computable profile stay as
+    singletons.
+
+    Returns `(merged_per_theme_cards, merge_map)`:
+      merged_per_theme_cards: {keeper_name: [sorted deduped card_ids]}
+      merge_map: {original_theme_name: keeper_name} for every input
+                 theme, so the caller can audit what collapsed
+                 into what.
+    """
+    identity_map = {name: name for name in per_theme_cards}
+    if threshold <= 0 or len(per_theme_cards) < 2:
+        return per_theme_cards, identity_map
+
+    profiles = _theme_card_profiles(per_theme_cards, cards_by_id)
+    if len(profiles) < 2:
+        return per_theme_cards, identity_map
+
+    # Pairwise edges above threshold. For ~10-30 themes per deck, O(n²)
+    # is nothing — don't bother with a kd-tree.
+    names = sorted(profiles)
+    edges: list[tuple[str, str]] = []
+    for i, a in enumerate(names):
+        va = profiles[a]
+        for b in names[i + 1:]:
+            sim = float(np.dot(va, profiles[b]))
+            if sim >= threshold:
+                edges.append((a, b))
+
+    # Union-Find. Rank by card_coverage: when unioning two roots, the
+    # higher-coverage one becomes the new root. Tie-break by name so
+    # the output is deterministic.
+    parent = dict(identity_map)
+
+    def find(x: str) -> str:
+        # Path-compressed find.
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def coverage_key(name: str) -> tuple[int, str]:
+        t = themes_by_name.get(name)
+        return (t.card_coverage if t else 0, name)
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        # Higher coverage wins; alphabetical first wins ties.
+        if coverage_key(ra) >= coverage_key(rb):
+            parent[rb] = ra
+        else:
+            parent[ra] = rb
+
+    for a, b in edges:
+        union(a, b)
+
+    # Collapse per_theme_cards onto roots. Also build the public
+    # merge_map (full depth, not just immediate parent) for callers
+    # that want to attribute what-merged-into-what.
+    merged: dict[str, list[str]] = {}
+    merge_map: dict[str, str] = {}
+    for name, sids in per_theme_cards.items():
+        root = find(name)
+        merge_map[name] = root
+        merged.setdefault(root, []).extend(sids)
+    for root, sids in merged.items():
+        merged[root] = sorted(set(sids))
+    return merged, merge_map
