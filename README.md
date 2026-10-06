@@ -31,7 +31,8 @@ Under `src/mtg_recommender/`:
 | `embeddings` | Phase 2. Encodes each card's `oracle_text` into `text_embedding` on the card doc and each tag's label+description into `embedding` on the tag doc; also fuses the two into a single unit `card_vector` per card via a weighted average (`alpha * text + (1 - alpha) * tag`, defaults to `alpha=0.6`). Uses `sentence-transformers/all-mpnet-base-v2` (768-dim) by default; `MTG_EMBEDDING_MODEL` env var overrides. |
 | `edhrec_fetch` | Phase 3. Thin client over EDHREC's public keyless JSON API at `json.edhrec.com`. Fetches per-commander card signals (lift, synergy, inclusion rate, trend) and caches the payload in the `edhrec` Mongo collection with a 7-day TTL. Each signal carries a Scryfall UUID so joining back to our `cards` collection is a direct `_id` lookup. |
 | `deck_profile` | Phase 3. Given a decklist, resolves cards against the `names` index and classifies each card into one of ~30 themes discovered from the oracle_tags hierarchy. Multi-theme cards are resolved by cosine similarity between the card's `text_embedding` and each theme's representative vector. Returns a `DeckProfile` carrying per-theme centroids + member tags + deck-card membership + an unassigned bucket. |
-| `theme_classifier` | Phase 3. Owns the data-driven theme discovery (filtering ~900 top-level tags down to ~30 "real themes" via blocklist + min-children + card-coverage window) and the per-card classification logic (candidate intersection → text-embedding tiebreak). Called into by `deck_profile`. |
+| `theme_classifier` | Phase 3. Owns the data-driven theme discovery (filtering ~900 top-level tags down to ~30 "real themes" via blocklist + min-children + card-coverage window) and the per-card classification logic (candidate intersection → text-embedding tiebreak). Also owns the optional post-classification merge pass that collapses themes whose `card_vector` profiles are cosine-similar. Called into by `deck_profile` in theme mode. |
+| `card_clusterer` | Phase 3. Alternative to `theme_classifier`: HDBSCAN over `card_vector` to cluster deck cards directly, then labels each cluster by its most-frequent non-blocklisted top-level tag (fallback: `cluster-N`). Called into by `deck_profile` in cluster mode (`--mode cluster`). |
 
 Tests live under `tests/` and are offline — every HTTP call is mocked, every
 Mongo op goes through `mongomock`.
@@ -328,6 +329,17 @@ mtg-deck-profile --file deck.txt --merge-threshold -1       # off
 # Cap per-cluster display (default: 10 tags + 10 cards; everything
 # beyond collapses to a "(+N more)" marker).
 mtg-deck-profile --file deck.txt --limit 20
+
+# ------- alternative: unsupervised clustering mode -------
+# Cluster cards directly by card_vector (HDBSCAN, cosine) instead of
+# sorting them into pre-defined themes. Each cluster is labelled by
+# the most frequent non-blocklisted top-level tag its member cards
+# share (deduped per-card); falls back to "cluster-N" if every
+# top-level is blocked. Useful for surfacing archetypes the curated
+# top-level vocabulary doesn't name.
+mtg-deck-profile --file deck.txt --mode cluster
+mtg-deck-profile --file deck.txt --mode cluster --cluster-min-size 5
+mtg-deck-profile --file deck.txt --mode cluster --cluster-selection-epsilon 0.1
 ```
 
 Sample output:
@@ -415,7 +427,8 @@ mtg-recommender/
 │       ├── embeddings.py        # Phase 2 encoder + mtg-embed CLI
 │       ├── edhrec_fetch.py      # Phase 3 EDHREC JSON client + per-commander cache
 │       ├── theme_classifier.py  # Phase 3 hierarchy-driven theme discovery + per-card classification
-│       └── deck_profile.py      # Phase 3 deck profile builder (uses theme_classifier) + mtg-deck-profile CLI
+│       ├── card_clusterer.py    # Phase 3 unsupervised card_vector clustering + top-level labelling (--mode cluster)
+│       └── deck_profile.py      # Phase 3 deck profile builder (theme and cluster modes) + mtg-deck-profile CLI
 ├── tests/
 │   ├── test_storage.py          # offline, mongomock-backed
 │   ├── test_scryfall_fetch.py
