@@ -43,6 +43,7 @@ from typing import Iterable, Optional
 import numpy as np
 from pymongo.collection import Collection
 
+from . import card_clusterer as cc
 from . import scryfall_fetch as sf
 from . import storage
 from . import theme_classifier as tc
@@ -291,6 +292,104 @@ def build_deck_profile(
 
 
 # ---------------------------------------------------------------------------
+# Alternative mode: unsupervised card_vector clustering + top-level labels
+# ---------------------------------------------------------------------------
+
+def build_cluster_profile(
+    card_names: Iterable[str],
+    *,
+    cards_coll: Optional[Collection] = None,
+    tags_coll: Optional[Collection] = None,
+    min_cluster_size: int = cc.DEFAULT_CLUSTER_MIN_SIZE,
+    cluster_selection_epsilon: float = cc.DEFAULT_CLUSTER_SELECTION_EPSILON,
+    blocklist: frozenset[str] = tc.DEFAULT_BLOCKLIST,
+) -> DeckProfile:
+    """Alternative to `build_deck_profile`: cluster cards by `card_vector`.
+
+    Where `build_deck_profile` sorts cards into pre-defined themes,
+    this flow goes the other direction — it clusters cards directly
+    by their Phase 2 fused `card_vector` and labels each resulting
+    group by the top-level oracle tag its member cards most
+    frequently share (dropping tags on the blocklist first).
+
+    Shape of the returned `DeckProfile` matches `build_deck_profile`
+    so the CLI render is shared, with these semantic differences:
+      - `clusters` are card-vector groups, not theme-tag groups.
+      - `constituent_themes` is always a single-element tuple naming
+        the cluster's label — no merge pass runs in this mode (the
+        clustering itself is the primary knob).
+      - `noise_tags` is always empty — this mode doesn't partition
+        tags.
+      - `unassigned_card_ids` holds cards HDBSCAN labelled as noise
+        OR cards that lack a stored `card_vector`.
+    """
+    if cards_coll is None:
+        cards_coll = storage.cards_collection()
+    if tags_coll is None:
+        tags_coll = storage.tags_collection()
+
+    deck_cards, missing = resolve_deck_cards(card_names, cards_coll)
+    tag_universe = collect_tag_universe(deck_cards)
+    cards_by_id = {doc["_id"]: doc for doc in deck_cards}
+
+    # Cluster the deck's card_vectors. Cards without a card_vector are
+    # excluded by the clusterer — surface them as unassigned so the
+    # user sees a complete accounting of their deck.
+    raw_clusters, hdbscan_noise = cc.cluster_cards_by_vector(
+        deck_cards,
+        min_cluster_size=min_cluster_size,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+    )
+    clustered_ids: set[str] = set(hdbscan_noise)
+    for sids, _centroid in raw_clusters:
+        clustered_ids.update(sids)
+    cards_without_vector = [
+        doc["_id"] for doc in deck_cards
+        if doc.get("_id") not in clustered_ids
+    ]
+    unassigned = sorted(hdbscan_noise + cards_without_vector)
+
+    # Load the tag hierarchy once; label_cluster walks `parent_slugs`
+    # per cluster to find top-level ancestors for the vote.
+    by_slug = {
+        doc["_id"]: doc for doc in tags_coll.find(
+            {}, {"_id": 1, "parent_slugs": 1}
+        )
+    }
+
+    clusters: list[DeckCluster] = []
+    for idx, (sids, centroid) in enumerate(raw_clusters):
+        label = cc.label_cluster(
+            sids, cards_by_id, by_slug,
+            blocklist=blocklist,
+            fallback_name=f"cluster-{idx}",
+        )
+        # Tags attributed to this cluster = union of the member cards'
+        # tag slugs. Keeps attribution interpretable; same semantic
+        # role as DeckCluster.tags under the theme-mode build.
+        deck_tags_in_cluster: set[str] = set()
+        for sid in sids:
+            for slug in cards_by_id[sid].get("tags") or []:
+                deck_tags_in_cluster.add(slug)
+        clusters.append(DeckCluster(
+            label=label,
+            tags=tuple(sorted(deck_tags_in_cluster)),
+            centroid=centroid,
+            deck_card_ids=tuple(sids),
+            constituent_themes=(label,),
+        ))
+
+    return DeckProfile(
+        deck_card_ids=tuple(doc["_id"] for doc in deck_cards),
+        missing_names=tuple(missing),
+        tag_universe=tuple(tag_universe),
+        clusters=tuple(clusters),
+        noise_tags=(),  # not applicable in cluster mode
+        unassigned_card_ids=tuple(unassigned),
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI (mtg-deck-profile)
 # ---------------------------------------------------------------------------
 #
@@ -397,13 +496,25 @@ def _parse_blocklist(raw: Optional[str]) -> Optional[frozenset[str]]:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
-    """`mtg-deck-profile` — classify a decklist into themes and print."""
+    """`mtg-deck-profile` — classify a decklist into themes and print.
+
+    Two modes:
+      theme (default) — sort cards into themes discovered from the
+                        oracle_tags hierarchy (filter + oracle-text
+                        tiebreak + optional merge pass).
+      cluster         — cluster cards directly on `card_vector`
+                        (HDBSCAN, cosine). Label each cluster by its
+                        most frequently shared non-blocklisted
+                        top-level tag.
+    """
     parser = argparse.ArgumentParser(
         prog="mtg-deck-profile",
         description=(
-            "Classify a decklist's cards into themes using the "
-            "Scryfall oracle_tags hierarchy, with an oracle-text "
-            "tiebreak for cards that match multiple themes."
+            "Classify a decklist's cards into themes. Default mode "
+            "uses the Scryfall oracle_tags hierarchy with an "
+            "oracle-text tiebreak; --mode cluster uses unsupervised "
+            "HDBSCAN clustering on card_vector with a top-level-tag "
+            "voting label."
         ),
     )
     parser.add_argument(
@@ -415,53 +526,78 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         help="Path to a decklist file (one card per line; '#' for comments).",
     )
     parser.add_argument(
+        "--mode", choices=("theme", "cluster"), default="theme",
+        help=(
+            "theme (default): sort cards into themes discovered from "
+            "the oracle_tags hierarchy. cluster: cluster cards by "
+            "card_vector and label each group by its most frequent "
+            "top-level tag."
+        ),
+    )
+    # ------- theme-mode flags -------
+    parser.add_argument(
         "--min-children", type=int, default=tc.DEFAULT_MIN_CHILDREN,
         help=(
-            f"Minimum number of child tags a top-level must have to count "
-            f"as a theme (default: {tc.DEFAULT_MIN_CHILDREN}). Raising this "
-            "drops smaller point concepts."
+            f"[theme mode] Minimum number of child tags a top-level must "
+            f"have to count as a theme (default: {tc.DEFAULT_MIN_CHILDREN})."
         ),
     )
     parser.add_argument(
         "--min-coverage", type=int, default=tc.DEFAULT_MIN_COVERAGE,
         help=(
-            f"Minimum distinct cards tagged by a theme (default: "
-            f"{tc.DEFAULT_MIN_COVERAGE}). Below this the theme is too "
-            "niche to be useful."
+            f"[theme mode] Minimum distinct cards tagged by a theme "
+            f"(default: {tc.DEFAULT_MIN_COVERAGE})."
         ),
     )
     parser.add_argument(
         "--max-coverage", type=int, default=tc.DEFAULT_MAX_COVERAGE,
         help=(
-            f"Maximum distinct cards tagged by a theme (default: "
-            f"{tc.DEFAULT_MAX_COVERAGE}). Above this the theme is a "
-            "mechanical signal that applies to almost everything."
-        ),
-    )
-    parser.add_argument(
-        "--theme-blocklist", default=None,
-        help=(
-            "Comma-separated top-level slugs to exclude. Overrides the "
-            "built-in blocklist (defaults to a hand-shaped set of "
-            "structural / catalog tags). Pass an empty string to disable "
-            "blocklisting entirely."
+            f"[theme mode] Maximum distinct cards tagged by a theme "
+            f"(default: {tc.DEFAULT_MAX_COVERAGE})."
         ),
     )
     parser.add_argument(
         "--merge-threshold", type=float, default=tc.DEFAULT_MERGE_THRESHOLD,
         help=(
-            f"Cosine-similarity floor for the post-classification merge "
-            f"pass (default: {tc.DEFAULT_MERGE_THRESHOLD}). Themes whose "
-            "averaged card_vector profiles sit at or above this value "
-            "collapse into one cluster. Lower (e.g. 0.7) merges more "
-            "aggressively; negative disables the pass."
+            f"[theme mode] Cosine-similarity floor for the post-"
+            f"classification merge pass (default: {tc.DEFAULT_MERGE_THRESHOLD}). "
+            "Negative disables."
+        ),
+    )
+    # ------- cluster-mode flags -------
+    parser.add_argument(
+        "--cluster-min-size", type=int, default=cc.DEFAULT_CLUSTER_MIN_SIZE,
+        help=(
+            f"[cluster mode] HDBSCAN min_cluster_size (default: "
+            f"{cc.DEFAULT_CLUSTER_MIN_SIZE}). Smallest card count that "
+            "counts as its own cluster."
+        ),
+    )
+    parser.add_argument(
+        "--cluster-selection-epsilon", type=float,
+        default=cc.DEFAULT_CLUSTER_SELECTION_EPSILON,
+        help=(
+            f"[cluster mode] HDBSCAN cluster_selection_epsilon (default: "
+            f"{cc.DEFAULT_CLUSTER_SELECTION_EPSILON}). Merge near-"
+            "clusters below this cosine distance."
+        ),
+    )
+    # ------- shared flags -------
+    parser.add_argument(
+        "--theme-blocklist", default=None,
+        help=(
+            "Comma-separated top-level slugs to exclude. Overrides the "
+            "built-in blocklist. Applies to both modes: theme mode uses "
+            "it to filter theme discovery; cluster mode uses it to "
+            "filter label candidates. Pass '' to clear entirely."
         ),
     )
     parser.add_argument(
         "--limit", type=int, default=DEFAULT_RENDER_LIMIT,
         help=(
-            f"Per-cluster display cap for tags + cards (default: {DEFAULT_RENDER_LIMIT}). "
-            "Everything beyond collapses to a '(+N more)' marker."
+            f"Per-cluster display cap for tags + cards (default: "
+            f"{DEFAULT_RENDER_LIMIT}). Everything beyond collapses to a "
+            "'(+N more)' marker."
         ),
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -470,23 +606,36 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if not names:
         parser.error("no card names provided (pass names as args or via --file)")
 
-    blocklist = _parse_blocklist(args.theme_blocklist)
-    theme_filter = tc.ThemeFilter(
-        min_children=args.min_children,
-        min_coverage=args.min_coverage,
-        max_coverage=args.max_coverage,
-        blocklist=blocklist if blocklist is not None else tc.DEFAULT_BLOCKLIST,
+    parsed_blocklist = _parse_blocklist(args.theme_blocklist)
+    effective_blocklist = (
+        parsed_blocklist if parsed_blocklist is not None else tc.DEFAULT_BLOCKLIST
     )
 
     cards_coll = storage.cards_collection()
     tags_coll = storage.tags_collection()
-    profile = build_deck_profile(
-        names,
-        cards_coll=cards_coll,
-        tags_coll=tags_coll,
-        theme_filter=theme_filter,
-        merge_threshold=args.merge_threshold,
-    )
+    if args.mode == "cluster":
+        profile = build_cluster_profile(
+            names,
+            cards_coll=cards_coll,
+            tags_coll=tags_coll,
+            min_cluster_size=args.cluster_min_size,
+            cluster_selection_epsilon=args.cluster_selection_epsilon,
+            blocklist=effective_blocklist,
+        )
+    else:
+        theme_filter = tc.ThemeFilter(
+            min_children=args.min_children,
+            min_coverage=args.min_coverage,
+            max_coverage=args.max_coverage,
+            blocklist=effective_blocklist,
+        )
+        profile = build_deck_profile(
+            names,
+            cards_coll=cards_coll,
+            tags_coll=tags_coll,
+            theme_filter=theme_filter,
+            merge_threshold=args.merge_threshold,
+        )
     name_lookup = _name_lookup_for(profile.deck_card_ids, cards_coll)
     print(_render_profile(profile, name_lookup=name_lookup, limit=args.limit))
     return 0

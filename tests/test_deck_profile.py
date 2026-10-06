@@ -31,6 +31,16 @@ Test classes:
                                  themes merge with higher-coverage keeper;
                                  chain merging via union-find; themes
                                  without card_vectors stay singleton
+    TestTopLevelLabelling       _top_ancestors memoisation + walk-up;
+                                 most-frequent voter dedupes per card;
+                                 blocklist respected; fallback label
+    TestClusterCardsByVector    HDBSCAN on card_vector; cards without a
+                                 vector skipped; degenerate inputs don't
+                                 crash
+    TestBuildClusterProfile     end-to-end cluster mode: 2 themes labelled
+                                 by top-level vote, noise_tags always
+                                 empty, missing-vector cards unassigned,
+                                 fallback label when all top-levels blocked
     TestBuildDeckProfile        end-to-end on a seeded mongomock cluster
                                  (incl. default-merge and disabled-merge)
     TestRenderProfile           truncation marker, cluster display shape
@@ -48,6 +58,7 @@ from tempfile import TemporaryDirectory
 import mongomock
 import numpy as np
 
+from mtg_recommender import card_clusterer as cc
 from mtg_recommender import deck_profile as dp
 from mtg_recommender import embeddings as emb
 from mtg_recommender import storage
@@ -753,6 +764,255 @@ class TestBuildDeckProfile(_MongoBackedTestCase):
 
 
 # ---------------------------------------------------------------------------
+# card_clusterer: _top_ancestors + most_frequent_top_level
+# ---------------------------------------------------------------------------
+
+class TestTopLevelLabelling(unittest.TestCase):
+    """Pure-function tests on the top-level ancestor voting path."""
+
+    BY_SLUG = {
+        # removal top-level, two leaves.
+        "removal":          {"parent_slugs": []},
+        "spot-removal":     {"parent_slugs": ["removal"]},
+        "mass-removal":     {"parent_slugs": ["removal"]},
+        # ramp top-level, one leaf.
+        "ramp":             {"parent_slugs": []},
+        "mana-rock":        {"parent_slugs": ["ramp"]},
+        # structural top-level (would be blocklisted).
+        "triggered-ability":{"parent_slugs": []},
+        "etb-trigger":      {"parent_slugs": ["triggered-ability"]},
+    }
+    BLOCKLIST = frozenset({"triggered-ability"})
+
+    def test_top_ancestors_walks_up_to_root(self):
+        memo: dict = {}
+        self.assertEqual(
+            cc._top_ancestors("spot-removal", self.BY_SLUG, memo),
+            frozenset({"removal"}),
+        )
+        # The same slug on a repeated call hits the memo (correctness
+        # check: the memoized value stays correct, not that we observe
+        # a speedup).
+        self.assertEqual(
+            cc._top_ancestors("spot-removal", self.BY_SLUG, memo),
+            frozenset({"removal"}),
+        )
+
+    def test_top_ancestors_handles_unknown_slug(self):
+        memo: dict = {}
+        self.assertEqual(
+            cc._top_ancestors("not-in-catalog", self.BY_SLUG, memo),
+            frozenset(),
+        )
+
+    def test_most_frequent_picks_winning_top_level(self):
+        # Three cards, two under removal, one under ramp → removal wins.
+        cards_by_id = {
+            "a": {"tags": ["spot-removal"]},
+            "b": {"tags": ["mass-removal"]},
+            "c": {"tags": ["mana-rock"]},
+        }
+        winner = cc.most_frequent_top_level(
+            ["a", "b", "c"], cards_by_id, self.BY_SLUG,
+            blocklist=self.BLOCKLIST,
+        )
+        self.assertEqual(winner, "removal")
+
+    def test_most_frequent_dedupes_tags_per_card(self):
+        # A single card with ten removal-flavored tags should still
+        # count once for removal, so the two single-tag ramp cards
+        # tie-or-beat it.
+        cards_by_id = {
+            "stuffed-removal": {"tags": ["spot-removal"] * 10},
+            "r1": {"tags": ["mana-rock"]},
+            "r2": {"tags": ["mana-rock"]},
+        }
+        winner = cc.most_frequent_top_level(
+            ["stuffed-removal", "r1", "r2"], cards_by_id, self.BY_SLUG,
+            blocklist=self.BLOCKLIST,
+        )
+        # 1 vote for removal, 2 votes for ramp → ramp wins.
+        self.assertEqual(winner, "ramp")
+
+    def test_most_frequent_respects_blocklist(self):
+        # Three cards, all under the blocklisted structural top-level.
+        # No surviving candidate → None.
+        cards_by_id = {
+            "a": {"tags": ["etb-trigger"]},
+            "b": {"tags": ["etb-trigger"]},
+            "c": {"tags": ["etb-trigger"]},
+        }
+        winner = cc.most_frequent_top_level(
+            ["a", "b", "c"], cards_by_id, self.BY_SLUG,
+            blocklist=self.BLOCKLIST,
+        )
+        self.assertIsNone(winner)
+
+    def test_label_cluster_falls_back_when_no_winner(self):
+        cards_by_id = {"a": {"tags": ["etb-trigger"]}}
+        label = cc.label_cluster(
+            ["a"], cards_by_id, self.BY_SLUG,
+            blocklist=self.BLOCKLIST, fallback_name="cluster-7",
+        )
+        self.assertEqual(label, "cluster-7")
+
+
+# ---------------------------------------------------------------------------
+# card_clusterer: cluster_cards_by_vector
+# ---------------------------------------------------------------------------
+
+class TestClusterCardsByVector(unittest.TestCase):
+
+    def _card(self, sid, vec, tags=()):
+        return {
+            "_id": sid,
+            "tags": list(tags),
+            "card_vector": emb._pack_embedding(np.array(vec, dtype=np.float32)),
+        }
+
+    def test_three_tight_groups_cluster_cleanly(self):
+        # Three card groups near orthogonal axes; HDBSCAN should split
+        # them into 3 clusters with no noise.
+        deck = [
+            self._card("a1", [1.0, 0.0, 0.0, 0.0]),
+            self._card("a2", [0.95, 0.05, 0.0, 0.0]),
+            self._card("a3", [0.9, 0.1, 0.0, 0.0]),
+            self._card("b1", [0.0, 1.0, 0.0, 0.0]),
+            self._card("b2", [0.05, 0.95, 0.0, 0.0]),
+            self._card("b3", [0.0, 0.9, 0.1, 0.0]),
+            self._card("c1", [0.0, 0.0, 1.0, 0.0]),
+            self._card("c2", [0.0, 0.0, 0.95, 0.05]),
+            self._card("c3", [0.0, 0.0, 0.9, 0.1]),
+        ]
+        clusters, noise = cc.cluster_cards_by_vector(deck, min_cluster_size=2)
+        self.assertEqual(len(clusters), 3)
+        self.assertEqual(noise, [])
+        memberships = {frozenset(sids) for sids, _ in clusters}
+        self.assertEqual(memberships, {
+            frozenset({"a1", "a2", "a3"}),
+            frozenset({"b1", "b2", "b3"}),
+            frozenset({"c1", "c2", "c3"}),
+        })
+
+    def test_cards_without_card_vector_skipped(self):
+        # One card has no card_vector field — doesn't participate in
+        # clustering, doesn't appear in the noise bucket either.
+        deck = [
+            self._card("a", [1.0, 0.0, 0.0, 0.0]),
+            self._card("b", [1.0, 0.0, 0.0, 0.0]),
+            {"_id": "no-vec", "tags": ["x"]},
+        ]
+        clusters, noise = cc.cluster_cards_by_vector(deck, min_cluster_size=2)
+        all_ids = set(noise) | {sid for sids, _ in clusters for sid in sids}
+        self.assertNotIn("no-vec", all_ids)
+
+    def test_degenerate_input_returns_empty(self):
+        # One card < default min_cluster_size → short-circuit, no crash.
+        deck = [self._card("a", [1.0, 0.0, 0.0, 0.0])]
+        clusters, noise = cc.cluster_cards_by_vector(deck, min_cluster_size=3)
+        self.assertEqual(clusters, [])
+        self.assertEqual(noise, [])
+
+
+# ---------------------------------------------------------------------------
+# build_cluster_profile — end-to-end
+# ---------------------------------------------------------------------------
+
+class TestBuildClusterProfile(_MongoBackedTestCase):
+
+    def _seed_cluster_fixture(self):
+        """3 removal cards (card_vector near +x), 3 ramp cards (near +y)."""
+        self._seed_hierarchy()
+        for i in range(3):
+            sid = f"id-rem-{i}"
+            self.cards.insert_one({
+                "_id": sid, "name": f"Rem {i}", "names": [f"rem {i}"],
+                "tags": ["spot-removal"],
+                "card_vector": _pack([1.0, 0.0, 0.0, 0.0]),
+            })
+        for i in range(3):
+            sid = f"id-ramp-{i}"
+            self.cards.insert_one({
+                "_id": sid, "name": f"Ramp {i}", "names": [f"ramp {i}"],
+                "tags": ["mana-rock"],
+                "card_vector": _pack([0.0, 1.0, 0.0, 0.0]),
+            })
+
+    def test_cluster_mode_produces_two_labelled_clusters(self):
+        self._seed_cluster_fixture()
+        profile = dp.build_cluster_profile(
+            ["Rem 0", "Rem 1", "Rem 2", "Ramp 0", "Ramp 1", "Ramp 2"],
+            cards_coll=self.cards, tags_coll=self.tags,
+            min_cluster_size=2,
+        )
+        self.assertEqual(len(profile.clusters), 2)
+        labels = {c.label for c in profile.clusters}
+        # Each cluster's cards all share one top-level ancestor →
+        # labels are deterministic.
+        self.assertEqual(labels, {"removal", "ramp"})
+
+    def test_cluster_mode_noise_tags_is_empty(self):
+        # Cluster mode doesn't partition tags — noise_tags is always ().
+        self._seed_cluster_fixture()
+        profile = dp.build_cluster_profile(
+            ["Rem 0", "Rem 1", "Rem 2"],
+            cards_coll=self.cards, tags_coll=self.tags,
+            min_cluster_size=2,
+        )
+        self.assertEqual(profile.noise_tags, ())
+
+    def test_cluster_mode_cards_without_vector_land_in_unassigned(self):
+        self._seed_hierarchy()
+        self.cards.insert_one({
+            "_id": "id-no-vec", "name": "No Vector",
+            "names": ["no vector"], "tags": ["spot-removal"],
+        })
+        profile = dp.build_cluster_profile(
+            ["No Vector"], cards_coll=self.cards, tags_coll=self.tags,
+            min_cluster_size=2,
+        )
+        self.assertEqual(profile.unassigned_card_ids, ("id-no-vec",))
+        self.assertEqual(profile.clusters, ())
+
+    def test_cluster_mode_label_falls_back_when_blocked(self):
+        # Seed a cluster of cards tagged only with a blocklisted
+        # top-level — label falls back to cluster-N. 5 cards give
+        # HDBSCAN enough density to form one cluster; fewer than that
+        # can trip the density check and all land in noise.
+        self.tags.insert_many([
+            {"_id": "triggered-ability", "parent_slugs": [], "child_slugs": ["etb"],
+             "embedding": _pack([1.0, 0.0, 0.0, 0.0])},
+            {"_id": "etb", "parent_slugs": ["triggered-ability"], "child_slugs": [],
+             "embedding": _pack([1.0, 0.0, 0.0, 0.0])},
+        ])
+        vecs = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.95, 0.05, 0.0, 0.0],
+            [0.9, 0.1, 0.0, 0.0],
+            [0.98, 0.02, 0.0, 0.0],
+            [0.92, 0.08, 0.0, 0.0],
+        ]
+        for i, vec in enumerate(vecs):
+            self.cards.insert_one({
+                "_id": f"id-etb-{i}", "name": f"ETB {i}", "names": [f"etb {i}"],
+                "tags": ["etb"],
+                "card_vector": _pack(vec),
+            })
+        profile = dp.build_cluster_profile(
+            [f"ETB {i}" for i in range(5)],
+            cards_coll=self.cards, tags_coll=self.tags,
+            min_cluster_size=2,
+        )
+        # HDBSCAN may form 1 or 2 clusters depending on local density;
+        # the invariant we care about is that EVERY cluster falls back
+        # to the "cluster-N" label since every cluster's cards only
+        # reach a blocklisted top-level.
+        self.assertGreater(len(profile.clusters), 0)
+        for cluster in profile.clusters:
+            self.assertTrue(cluster.label.startswith("cluster-"))
+
+
+# ---------------------------------------------------------------------------
 # _render_profile
 # ---------------------------------------------------------------------------
 
@@ -896,6 +1156,31 @@ class TestMainCLI(_MongoBackedTestCase):
     def test_empty_input_errors(self):
         with self.assertRaises(SystemExit):
             _run_cli([])
+
+    def test_mode_cluster_dispatches_to_build_cluster_profile(self):
+        # Seed a 3-card removal cluster + 3-card ramp cluster, run the
+        # CLI in cluster mode, and confirm the labels come out via the
+        # most-frequent-top-level voting path.
+        self._seed_hierarchy()
+        for i in range(3):
+            self.cards.insert_one({
+                "_id": f"rem-{i}", "name": f"Rem {i}", "names": [f"rem {i}"],
+                "tags": ["spot-removal"],
+                "card_vector": _pack([1.0, 0.0, 0.0, 0.0]),
+            })
+        for i in range(3):
+            self.cards.insert_one({
+                "_id": f"ramp-{i}", "name": f"Ramp {i}", "names": [f"ramp {i}"],
+                "tags": ["mana-rock"],
+                "card_vector": _pack([0.0, 1.0, 0.0, 0.0]),
+            })
+        rc, out, _ = _run_cli([
+            "Rem 0", "Rem 1", "Rem 2", "Ramp 0", "Ramp 1", "Ramp 2",
+            "--mode", "cluster", "--cluster-min-size", "2",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertIn("theme 'removal'", out)
+        self.assertIn("theme 'ramp'", out)
 
     def test_merge_threshold_flag_pipes_through(self):
         # Seed two cards whose themes should merge at threshold 0.9.
