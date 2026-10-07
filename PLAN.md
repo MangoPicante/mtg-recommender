@@ -58,8 +58,13 @@ The recommender takes a Commander decklist and produces a ranked list of candida
    **Structural feature weights (cluster mode).** The clusterer accepts an optional `feature_weights` dict (`{feature_name: weight}`) that concatenates L2-normalized * weighted structural sub-vectors onto each card's `card_vector` before HDBSCAN runs. Under cosine the overall similarity becomes a weighted mean of per-feature cosines with weights ∝ w_i². Shipped feature builders:
    - **types** (CLI `--type-weight`): multi-hot of a card's supertypes + card types + deck-local subtypes.
    - **mana_cost** (CLI `--mana-cost-weight`): 10-dim symbol-count vector (generic, WUBRG, X, hybrid, phyrexian, snow).
+   - **keywords** (CLI `--keyword-weight`): multi-hot over deck-local keyword vocab (Flying, Lifelink, Haste, …).
+   - **colors** (CLI `--color-weight`): 5-dim WUBRG multi-hot of the card's printed colours.
+   - **color_identity** (CLI `--color-identity-weight`): 5-dim WUBRG multi-hot of the card's identity (printed colours + oracle-text mana symbols) — usually what Commander splits care about.
+   - **power** (CLI `--power-weight`): 2-dim `[value, has-power flag]`. The flag distinguishes non-creatures (`[0, 0]`) from 0-power creatures (`[0, 1]`).
+   - **toughness** (CLI `--toughness-weight`): same shape as power.
 
-   The scryfall-fetched schema also stores `keywords`, `colors`, `color_identity`, `cmc`, `power`, `toughness` so a follow-up PR can add builders for those knobs without re-touching the fetcher. Centroids returned from the clusterer stay in base `card_vector` space (not augmented) so Phase 3 step 4's candidate ranking matches the stored per-card vectors.
+   All weights default to 0.0 (feature off); combinations compose linearly under cosine. Centroids returned from the clusterer stay in base `card_vector` space (not augmented) so Phase 3 step 4's candidate ranking matches the stored per-card vectors.
 
    Both modes return a `DeckProfile` with per-cluster unit centroids, deck tag slugs that landed in each cluster, `constituent_themes` naming the theme(s) that collapsed in (or the label alone in cluster mode), deck card ids per cluster, tags outside any theme (`noise_tags`, always `()` in cluster mode), and cards that matched zero themes or lack a `card_vector` (`unassigned_card_ids`).
 3. **Cluster evaluation via EDHREC.** For each cluster, cross-reference the deck's cards within it against EDHREC's lift/rank for the commander. A cluster whose member cards consistently show high lift is a validated theme for this commander; one with low lift suggests the clustering grouped tags that don't actually co-occur in play. Clusters below a threshold are either dropped or down-weighted when ranking.

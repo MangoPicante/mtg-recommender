@@ -149,8 +149,10 @@ Reruns are cheap on two levels:
    `type_line`, `oracle_text`, `oracle_text_sha`, `keywords`, `colors`,
    `color_identity`, `cmc`, `power`, `toughness`. The `keywords` /
    `colors` / `color_identity` / `cmc` / `power` / `toughness` block
-   is used by `mtg-deck-profile --mode cluster`'s structural feature
-   knobs (`--type-weight`, `--mana-cost-weight` today; more to come).
+   feeds `mtg-deck-profile --mode cluster`'s structural feature knobs
+   (`--type-weight`, `--mana-cost-weight`, `--keyword-weight`,
+   `--color-weight`, `--color-identity-weight`, `--power-weight`,
+   `--toughness-weight`).
 
 Upserts touch only the fields `scryfall_fetch` owns, so a card's `tags`
 array (written by `oracle_tags`) survives every merge. For corruption
@@ -352,14 +354,22 @@ mtg-deck-profile --file deck.txt --mode cluster --cluster-min-size 5
 mtg-deck-profile --file deck.txt --mode cluster --cluster-selection-epsilon 0.1
 
 # Add weighted structural features onto card_vector before clustering.
-# --type-weight pulls in supertypes + card types + deck-local subtypes
-# (multi-hot). --mana-cost-weight pulls in a 10-dim cost shape (generic,
-# WUBRG, X, hybrid, phyrexian, snow). Each sub-vector is L2-normalized,
-# scaled by its weight, and concatenated onto the card_vector so cosine
-# similarity becomes a weighted mean of per-feature cosines.
+# Each sub-vector is L2-normalized, scaled by its weight, and
+# concatenated onto the card_vector so cosine similarity becomes a
+# weighted mean of per-feature cosines.
+#   --type-weight             supertypes + card types + deck-local subtypes (multi-hot)
+#   --mana-cost-weight        10-dim shape: generic, WUBRG, X, hybrid, phyrexian, snow
+#   --keyword-weight          multi-hot over deck-local keyword vocab
+#   --color-weight            5-dim WUBRG multi-hot of printed colors
+#   --color-identity-weight   5-dim WUBRG multi-hot of oracle-text-inclusive identity
+#   --power-weight            2-dim [value, has-power flag] for creature stats
+#   --toughness-weight        2-dim [value, has-toughness flag]
+# All default to 0.0 (feature off). Combine freely.
 mtg-deck-profile --file deck.txt --mode cluster --type-weight 0.4
 mtg-deck-profile --file deck.txt --mode cluster --mana-cost-weight 0.3
-mtg-deck-profile --file deck.txt --mode cluster --type-weight 0.4 --mana-cost-weight 0.3
+mtg-deck-profile --file deck.txt --mode cluster --color-identity-weight 0.5
+mtg-deck-profile --file deck.txt --mode cluster \
+    --type-weight 0.4 --power-weight 0.3 --toughness-weight 0.3
 ```
 
 Sample output:

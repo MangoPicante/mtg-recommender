@@ -993,6 +993,120 @@ class TestBuildManaCostVector(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# card_clusterer: build_keyword_vector
+# ---------------------------------------------------------------------------
+
+class TestBuildKeywordVector(unittest.TestCase):
+
+    def test_multi_hot_against_vocab(self):
+        doc = {"keywords": ["Flying", "Lifelink"]}
+        vocab = ("flying", "haste", "lifelink", "vigilance")
+        vec = cc.build_keyword_vector(doc, vocab)
+        self.assertEqual(vec.shape, (4,))
+        self.assertEqual(vec.dtype, np.float32)
+        self.assertEqual(list(vec), [1.0, 0.0, 1.0, 0.0])
+
+    def test_case_insensitive_match(self):
+        # Vocab is lowercase (deck_profile.build_deck_vocab lowercases
+        # on collect); keyword list on the card may use mixed case.
+        doc = {"keywords": ["FLYING", "haste"]}
+        vocab = ("flying", "haste")
+        vec = cc.build_keyword_vector(doc, vocab)
+        self.assertEqual(list(vec), [1.0, 1.0])
+
+    def test_keyword_outside_vocab_drops(self):
+        # Keyword present on card but not in deck vocab doesn't error.
+        doc = {"keywords": ["Flying", "Horsemanship"]}
+        vocab = ("flying", "haste")
+        vec = cc.build_keyword_vector(doc, vocab)
+        self.assertEqual(list(vec), [1.0, 0.0])
+
+    def test_missing_keywords_field(self):
+        # Older cached doc with no keywords field → zero vector of the
+        # expected vocab size.
+        vec = cc.build_keyword_vector({}, ("flying",))
+        self.assertEqual(vec.shape, (1,))
+        self.assertEqual(float(vec.sum()), 0.0)
+
+
+# ---------------------------------------------------------------------------
+# card_clusterer: build_color_vector + build_color_identity_vector
+# ---------------------------------------------------------------------------
+
+class TestBuildColorVectors(unittest.TestCase):
+
+    def test_colors_simple_multihot(self):
+        vec = cc.build_color_vector({"colors": ["W", "U"]})
+        self.assertEqual(vec.shape, (5,))
+        self.assertEqual(list(vec), [1.0, 1.0, 0.0, 0.0, 0.0])
+
+    def test_colors_colourless_is_zero_vector(self):
+        # Artifacts, lands → empty colors list → all zeros.
+        self.assertEqual(float(cc.build_color_vector({"colors": []}).sum()), 0.0)
+        self.assertEqual(float(cc.build_color_vector({}).sum()), 0.0)
+
+    def test_color_identity_matches_wubrg_order(self):
+        # The WUBRG dim assignment must be stable — spot-check B at
+        # index 2 and G at index 4.
+        vec = cc.build_color_identity_vector({"color_identity": ["B", "G"]})
+        self.assertEqual(vec[2], 1.0)
+        self.assertEqual(vec[4], 1.0)
+        self.assertEqual(float(vec.sum()), 2.0)
+
+    def test_unknown_colour_token_silently_drops(self):
+        # Defensive: a stale cache with an invalid color like "C" doesn't
+        # crash — just contributes nothing. Guards against upstream vocab
+        # drift.
+        vec = cc.build_color_vector({"colors": ["W", "C"]})
+        self.assertEqual(float(vec.sum()), 1.0)
+
+
+# ---------------------------------------------------------------------------
+# card_clusterer: build_power_vector + build_toughness_vector
+# ---------------------------------------------------------------------------
+
+class TestBuildPowerToughnessVectors(unittest.TestCase):
+
+    def test_integer_power_sets_value_and_flag(self):
+        vec = cc.build_power_vector({"power": "3"})
+        self.assertEqual(vec.shape, (2,))
+        self.assertEqual(vec[0], 3.0)
+        self.assertEqual(vec[1], 1.0)
+
+    def test_missing_power_is_all_zero(self):
+        # Non-creature → power=None → [0, 0]. The flag dim distinguishes
+        # this from an actual 0-power creature below.
+        vec = cc.build_power_vector({"power": None})
+        self.assertEqual(list(vec), [0.0, 0.0])
+        # And a missing field (older cached doc) behaves the same.
+        self.assertEqual(list(cc.build_power_vector({})), [0.0, 0.0])
+
+    def test_zero_power_creature_keeps_flag(self):
+        # Walking Wall "0/4" — value 0 but it IS a creature, so flag=1.
+        # Without the flag, this would collapse into non-creature.
+        vec = cc.build_power_vector({"power": "0"})
+        self.assertEqual(list(vec), [0.0, 1.0])
+
+    def test_variable_star_power_parses_as_zero_with_flag(self):
+        # Tarmogoyf-style "*" has no leading integer → value 0, flag 1.
+        vec = cc.build_power_vector({"power": "*"})
+        self.assertEqual(list(vec), [0.0, 1.0])
+
+    def test_hybrid_variable_parses_leading_integer(self):
+        # "1+*" (e.g. some ability-granted creature) → value 1, flag 1.
+        vec = cc.build_power_vector({"power": "1+*"})
+        self.assertEqual(list(vec), [1.0, 1.0])
+        # "7-*" (negative modifier) → leading integer 7.
+        vec2 = cc.build_power_vector({"power": "7-*"})
+        self.assertEqual(list(vec2), [7.0, 1.0])
+
+    def test_toughness_follows_same_rules(self):
+        self.assertEqual(list(cc.build_toughness_vector({"toughness": "4"})), [4.0, 1.0])
+        self.assertEqual(list(cc.build_toughness_vector({})), [0.0, 0.0])
+        self.assertEqual(list(cc.build_toughness_vector({"toughness": "*"})), [0.0, 1.0])
+
+
+# ---------------------------------------------------------------------------
 # card_clusterer: cluster_cards_by_vector
 # ---------------------------------------------------------------------------
 
@@ -1134,6 +1248,75 @@ class TestClusterCardsByVector(unittest.TestCase):
                 min_cluster_size=2,
                 feature_weights={"bogus": 0.5},
             )
+
+    def test_color_identity_weight_splits_otherwise_identical_vectors(self):
+        # Six cards near the +x axis — card_vector alone can't split them.
+        # Three carry WU identity, three carry BR. A dominant
+        # --color-identity-weight should split by colour wedge.
+        def card(sid, offset, ci):
+            return {
+                "_id": sid,
+                "tags": [],
+                "card_vector": emb._pack_embedding(
+                    np.array([1.0, offset, 0.0, 0.0], dtype=np.float32)
+                ),
+                "color_identity": list(ci),
+            }
+        deck = [
+            card("wu1", 0.01, ["W", "U"]),
+            card("wu2", 0.02, ["W", "U"]),
+            card("wu3", 0.03, ["W", "U"]),
+            card("br1", 0.04, ["B", "R"]),
+            card("br2", 0.05, ["B", "R"]),
+            card("br3", 0.06, ["B", "R"]),
+        ]
+        clusters, _ = cc.cluster_cards_by_vector(
+            deck,
+            min_cluster_size=2,
+            feature_weights={"color_identity": 10.0},
+        )
+        memberships = {frozenset(sids) for sids, _ in clusters}
+        self.assertEqual(memberships, {
+            frozenset({"wu1", "wu2", "wu3"}),
+            frozenset({"br1", "br2", "br3"}),
+        })
+
+    def test_power_weight_splits_creatures_from_noncreatures(self):
+        # Half the cards are creatures (power="3"), half are non-creatures
+        # (power=None). card_vector is near-identical. A dominant
+        # --power-weight should split by the has-power flag dim.
+        def card(sid, offset, power):
+            doc = {
+                "_id": sid,
+                "tags": [],
+                "card_vector": emb._pack_embedding(
+                    np.array([1.0, offset, 0.0, 0.0], dtype=np.float32)
+                ),
+            }
+            if power is not None:
+                doc["power"] = power
+            return doc
+        deck = [
+            card("c1", 0.01, "3"),
+            card("c2", 0.02, "4"),
+            card("c3", 0.03, "2"),
+            card("nc1", 0.04, None),
+            card("nc2", 0.05, None),
+            card("nc3", 0.06, None),
+        ]
+        clusters, _ = cc.cluster_cards_by_vector(
+            deck,
+            min_cluster_size=2,
+            feature_weights={"power": 10.0},
+        )
+        memberships = {frozenset(sids) for sids, _ in clusters}
+        # Both groups should surface; exact size depends on HDBSCAN but
+        # creatures must not mix with non-creatures.
+        self.assertEqual(len(clusters), 2)
+        creature_set = frozenset({"c1", "c2", "c3"})
+        noncreature_set = frozenset({"nc1", "nc2", "nc3"})
+        self.assertIn(creature_set, memberships)
+        self.assertIn(noncreature_set, memberships)
 
 
 # ---------------------------------------------------------------------------
@@ -1435,6 +1618,53 @@ class TestMainCLI(_MongoBackedTestCase):
         # Both groups should still surface as their respective themes —
         # the structural features reinforce the base split rather than
         # scrambling it on this orthogonal fixture.
+        self.assertIn("theme 'removal'", out)
+        self.assertIn("theme 'ramp'", out)
+
+    def test_remaining_five_weight_flags_pipe_through(self):
+        # All of --keyword-weight / --color-weight / --color-identity-weight
+        # / --power-weight / --toughness-weight on one CLI call. Seeds the
+        # same orthogonal two-group fixture with full structured fields
+        # populated so every feature builder has real data to consume.
+        self._seed_hierarchy()
+        for i in range(3):
+            self.cards.insert_one({
+                "_id": f"creat-{i}", "name": f"Creat {i}", "names": [f"creat {i}"],
+                "tags": ["spot-removal"],
+                "card_vector": _pack([1.0, 0.0, 0.0, 0.0]),
+                "type_line": "Creature — Human",
+                "mana_cost": "{R}",
+                "keywords": ["Haste", "Lifelink"],
+                "colors": ["R"],
+                "color_identity": ["R"],
+                "power": "2",
+                "toughness": "1",
+            })
+        for i in range(3):
+            self.cards.insert_one({
+                "_id": f"inst-{i}", "name": f"Inst {i}", "names": [f"inst {i}"],
+                "tags": ["mana-rock"],
+                "card_vector": _pack([0.0, 1.0, 0.0, 0.0]),
+                "type_line": "Instant",
+                "mana_cost": "{U}",
+                "keywords": ["Flash"],
+                "colors": ["U"],
+                "color_identity": ["U"],
+                "power": None,
+                "toughness": None,
+            })
+        rc, out, _ = _run_cli([
+            "Creat 0", "Creat 1", "Creat 2", "Inst 0", "Inst 1", "Inst 2",
+            "--mode", "cluster", "--cluster-min-size", "2",
+            "--keyword-weight", "0.3",
+            "--color-weight", "0.2",
+            "--color-identity-weight", "0.2",
+            "--power-weight", "0.3",
+            "--toughness-weight", "0.3",
+        ])
+        self.assertEqual(rc, 0)
+        # On the orthogonal fixture both groups still surface — knobs
+        # reinforce the natural split rather than scrambling it.
         self.assertIn("theme 'removal'", out)
         self.assertIn("theme 'ramp'", out)
 

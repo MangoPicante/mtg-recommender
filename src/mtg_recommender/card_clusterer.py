@@ -230,14 +230,147 @@ def build_mana_cost_vector(mana_cost: Optional[str]) -> np.ndarray:
     return vec
 
 
+def build_keyword_vector(
+    doc: dict, deck_keyword_vocab: tuple[str, ...]
+) -> np.ndarray:
+    """Multi-hot encoding of a card's `keywords` list against a deck-local vocab.
+
+    Keywords here are Scryfall's canonical ability names: "Flying",
+    "Vigilance", "Lifelink", "Haste", "Hexproof", etc. The clustering use
+    case for weighting this knob is "find keyword-cluster archetypes a deck
+    is leaning into" (keyword soup commanders, lifegain decks, etc.). We
+    take the vocab deck-local for the same reason as subtypes — a Commander
+    deck typically has 20-40 unique keywords, not Scryfall's full set.
+
+    Scryfall normalizes keyword capitalization but we lowercase both sides
+    before matching so a stale pre-canonicalization cache still matches.
+    """
+    present = {kw.lower() for kw in (doc.get("keywords") or [])}
+    vec = np.zeros(len(deck_keyword_vocab), dtype=np.float32)
+    for i, kw in enumerate(deck_keyword_vocab):
+        if kw.lower() in present:
+            vec[i] = 1.0
+    return vec
+
+
+# Fixed WUBRG vocab for color + color_identity multi-hot. Order is the
+# canonical Magic colour wheel (White, Blue, Black, Red, Green) so the
+# per-dim slot assignment is stable across any deck.
+_WUBRG_VOCAB: tuple[str, ...] = ("W", "U", "B", "R", "G")
+_WUBRG_INDEX: dict[str, int] = {c: i for i, c in enumerate(_WUBRG_VOCAB)}
+
+
+def build_color_vector(doc: dict) -> np.ndarray:
+    """5-dim WUBRG multi-hot of a card's `colors` list.
+
+    Colors are the mana symbols actually printed on the card (so a card
+    with a hybrid {W/U} cost has colors=["W","U"]). Non-coloured
+    permanents (artifacts, lands without ability-granted colour) give an
+    all-zero vector — same shape as the stat vectors so dims line up.
+    """
+    present = set(doc.get("colors") or [])
+    vec = np.zeros(len(_WUBRG_VOCAB), dtype=np.float32)
+    for c in present:
+        idx = _WUBRG_INDEX.get(c)
+        if idx is not None:
+            vec[idx] = 1.0
+    return vec
+
+
+def build_color_identity_vector(doc: dict) -> np.ndarray:
+    """5-dim WUBRG multi-hot of a card's `color_identity` list.
+
+    color_identity is the broader signal — a card's mana cost PLUS any
+    coloured mana symbols in its oracle text. For Commander format
+    bucketing this is often what you actually want (a card with a {W}
+    ability on a {U}{U} spell has color_identity=["W","U"] even though
+    `colors` would say ["U"]). Shipped as a separate knob from `colors`
+    so the user can lean on whichever interpretation fits the deck.
+    """
+    present = set(doc.get("color_identity") or [])
+    vec = np.zeros(len(_WUBRG_VOCAB), dtype=np.float32)
+    for c in present:
+        idx = _WUBRG_INDEX.get(c)
+        if idx is not None:
+            vec[idx] = 1.0
+    return vec
+
+
+# Scryfall stores power/toughness as strings because non-integer values
+# exist: "*" (variable, see Tarmogoyf), "X" (set by casting cost), "1+*",
+# "2+*", "7-*" (hybrid base + variable), and the odd "∞" from un-sets.
+# We parse out the integer base so arithmetic works, then flag presence
+# separately — see `build_power_vector`.
+_PT_INT_PREFIX_RE = re.compile(r"^-?\d+")
+
+
+def _parse_pt_value(raw: Optional[str]) -> float:
+    """Pull a numeric power/toughness value out of Scryfall's string form.
+
+    Rules, in order:
+      - None / empty / whitespace → 0.0 (caller should use the present
+        flag to distinguish "has stat = 0" from "no stat at all").
+      - Pure digits (possibly negative) → that integer as float.
+      - Leading digits followed by a modifier ("1+*", "7-*") → the
+        leading integer; the "+*" / "-*" suffix is a variable component
+        we don't try to model as a scalar.
+      - Pure "*" / "X" / "∞" / anything else without a leading integer
+        → 0.0. Clustering intent: variable-only cards look like 0/0 in
+        the stat space but their presence flag still fires.
+    """
+    if raw is None:
+        return 0.0
+    s = str(raw).strip()
+    if not s:
+        return 0.0
+    m = _PT_INT_PREFIX_RE.match(s)
+    if m is None:
+        return 0.0
+    return float(m.group(0))
+
+
+def build_power_vector(doc: dict) -> np.ndarray:
+    """2-dim [numeric_power, has_power_flag] for a card.
+
+    Non-creatures (Scryfall sends power=None) give [0.0, 0.0]. A 0/0
+    creature gives [0.0, 1.0]. Variable creatures like "*/*" or "1+*/*"
+    give [base_int_or_zero, 1.0]. The has-flag dim is what distinguishes
+    an Instant from a 0/0 creature when a clustering run leans on this
+    knob — without it, a value-only encoding would collapse the two.
+    """
+    raw = doc.get("power")
+    vec = np.zeros(2, dtype=np.float32)
+    if raw is None:
+        return vec
+    vec[0] = _parse_pt_value(raw)
+    vec[1] = 1.0
+    return vec
+
+
+def build_toughness_vector(doc: dict) -> np.ndarray:
+    """2-dim [numeric_toughness, has_toughness_flag]. See build_power_vector."""
+    raw = doc.get("toughness")
+    vec = np.zeros(2, dtype=np.float32)
+    if raw is None:
+        return vec
+    vec[0] = _parse_pt_value(raw)
+    vec[1] = 1.0
+    return vec
+
+
 # Feature-name → builder registry. The builder receives the card doc and a
 # `deck_vocab` dict so a feature can pull its own deck-local vocabulary
-# (currently only subtypes); features without vocab (mana_cost) ignore it.
-# Adding a feature in a future PR is: write the builder, add it here, add a
-# CLI knob. The rest of the clustering plumbing is unchanged.
+# (subtypes, keywords); features with a fixed vocab or no vocab ignore it.
+# Adding a feature is: write the builder, add it here, add a CLI knob.
+# The rest of the clustering plumbing is unchanged.
 _FEATURE_BUILDERS: dict[str, Callable[[dict, Mapping[str, tuple[str, ...]]], np.ndarray]] = {
     "types": lambda doc, vocab: build_type_vector(doc, vocab.get("subtypes", ())),
     "mana_cost": lambda doc, vocab: build_mana_cost_vector(doc.get("mana_cost")),
+    "keywords": lambda doc, vocab: build_keyword_vector(doc, vocab.get("keywords", ())),
+    "colors": lambda doc, _vocab: build_color_vector(doc),
+    "color_identity": lambda doc, _vocab: build_color_identity_vector(doc),
+    "power": lambda doc, _vocab: build_power_vector(doc),
+    "toughness": lambda doc, _vocab: build_toughness_vector(doc),
 }
 
 

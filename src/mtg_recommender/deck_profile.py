@@ -144,13 +144,15 @@ def resolve_deck_cards(
     # Project card_vector too: the optional merge-similar-themes pass
     # needs it to compute per-theme card profiles. Deck cards without
     # a card_vector are harmless — the merge step just excludes them
-    # from the profile averages. type_line + mana_cost are projected so
-    # cluster-mode feature knobs (--type-weight / --mana-cost-weight)
-    # have the structured fields they need; theme mode just ignores them.
+    # from the profile averages. The structural fields (type_line,
+    # mana_cost, keywords, colors, color_identity, power, toughness)
+    # feed cluster-mode's feature knobs; theme mode just ignores them.
     projection = {
         "_id": 1, "name": 1, "tags": 1,
         "text_embedding": 1, "card_vector": 1,
         "type_line": 1, "mana_cost": 1,
+        "keywords": 1, "colors": 1, "color_identity": 1,
+        "power": 1, "toughness": 1,
     }
     for name in card_names:
         matches = list(cards_coll.find({"names": name.lower()}, projection))
@@ -177,21 +179,32 @@ def collect_tag_universe(deck_cards: Iterable[dict]) -> list[str]:
 def build_deck_vocab(deck_cards: Iterable[dict]) -> dict[str, tuple[str, ...]]:
     """Collect deck-local vocabularies the structural feature builders need.
 
-    Right now that's just subtypes (for `build_type_vector`): every subtype
-    appearing in the deck's cards' type_lines, sorted for stable dim order
-    across runs. Future features will add their own keys (e.g. keyword vocab)
-    without changing this function's call sites — downstream consumers index
-    by name.
+    Currently two vocabs:
+      subtypes — every subtype across the deck's cards' type_lines
+                 (feeds `build_type_vector`).
+      keywords — every Scryfall keyword across the deck's cards (feeds
+                 `build_keyword_vector`). Lowercased for match stability.
+
+    Fixed-vocab features (colors, color_identity, mana_cost, power,
+    toughness) don't need an entry here. Downstream consumers index by
+    name, so adding a new vocab is additive — existing features ignore
+    it.
 
     Sorted output matters: HDBSCAN sees the same per-dim slot for a given
-    subtype across runs, so cluster output is reproducible on identical
-    input instead of depending on dict iteration order.
+    token across runs, so cluster output is reproducible on identical
+    input instead of depending on set iteration order.
     """
     subtypes: set[str] = set()
+    keywords: set[str] = set()
     for doc in deck_cards:
         _supers, _types, subs = cc.parse_type_line(doc.get("type_line") or "")
         subtypes.update(subs)
-    return {"subtypes": tuple(sorted(subtypes))}
+        for kw in doc.get("keywords") or []:
+            keywords.add(kw.lower())
+    return {
+        "subtypes": tuple(sorted(subtypes)),
+        "keywords": tuple(sorted(keywords)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +649,49 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             "Composes under cosine with the card_vector."
         ),
     )
+    parser.add_argument(
+        "--keyword-weight", type=float, default=0.0,
+        help=(
+            "[cluster mode] Extra weight on a card's keyword list "
+            "(multi-hot over deck-local keyword vocab). 0.0 (default) "
+            "disables; try 0.3-0.5 to pull keyword-soup archetypes "
+            "(flying/lifelink/haste decks) apart."
+        ),
+    )
+    parser.add_argument(
+        "--color-weight", type=float, default=0.0,
+        help=(
+            "[cluster mode] Extra weight on a card's `colors` (5-dim "
+            "WUBRG multi-hot). 0.0 (default) disables. Useful when you "
+            "want colour-pie splits dominated by the printed cost."
+        ),
+    )
+    parser.add_argument(
+        "--color-identity-weight", type=float, default=0.0,
+        help=(
+            "[cluster mode] Extra weight on a card's `color_identity` "
+            "(5-dim WUBRG). 0.0 (default) disables. Broader than "
+            "--color-weight — includes coloured mana symbols in oracle "
+            "text, which is usually what Commander splits care about."
+        ),
+    )
+    parser.add_argument(
+        "--power-weight", type=float, default=0.0,
+        help=(
+            "[cluster mode] Extra weight on a creature's power "
+            "(2-dim: value, has-power flag). 0.0 (default) disables. "
+            "Non-creatures land at [0, 0]; the flag dim distinguishes "
+            "a 0/0 creature from an Instant."
+        ),
+    )
+    parser.add_argument(
+        "--toughness-weight", type=float, default=0.0,
+        help=(
+            "[cluster mode] Extra weight on a creature's toughness "
+            "(2-dim: value, has-toughness flag). 0.0 (default) disables. "
+            "Same shape as --power-weight."
+        ),
+    )
     # ------- shared flags -------
     parser.add_argument(
         "--theme-blocklist", default=None,
@@ -670,12 +726,24 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.mode == "cluster":
         # Only pass through knobs that are actually active — avoids
         # noisy "weight=0.0 feature=types" entries flowing into the
-        # clusterer when the user didn't ask for them.
+        # clusterer when the user didn't ask for them. Order of the
+        # dict is irrelevant for correctness but kept consistent with
+        # the CLI flag order for readability on debug prints.
         feature_weights: dict[str, float] = {}
         if args.type_weight > 0.0:
             feature_weights["types"] = args.type_weight
         if args.mana_cost_weight > 0.0:
             feature_weights["mana_cost"] = args.mana_cost_weight
+        if args.keyword_weight > 0.0:
+            feature_weights["keywords"] = args.keyword_weight
+        if args.color_weight > 0.0:
+            feature_weights["colors"] = args.color_weight
+        if args.color_identity_weight > 0.0:
+            feature_weights["color_identity"] = args.color_identity_weight
+        if args.power_weight > 0.0:
+            feature_weights["power"] = args.power_weight
+        if args.toughness_weight > 0.0:
+            feature_weights["toughness"] = args.toughness_weight
         profile = build_cluster_profile(
             names,
             cards_coll=cards_coll,
