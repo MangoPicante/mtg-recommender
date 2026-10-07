@@ -135,12 +135,22 @@ Reruns are cheap on two levels:
    skips without reading any card docs — one meta call total.
 2. **Diff-aware merge.** When the snapshot moves, each card carries an
    `oracle_text_sha` (16-hex sha256 prefix). The merge classifies incoming
-   cards as new / changed / unchanged against the stored sha and writes
-   only new/changed entries. A content change also `$unset`s
-   `text_embedding` and `card_vector` so the next `mtg-embed cards` /
-   `mtg-embed fuse` re-encodes only what moved. On a typical Scryfall
-   snapshot bump that's a tiny bulk_write instead of ~40k pointless
-   `$set` operations.
+   cards as new / changed / **patched** / unchanged against the stored
+   sha and writes only new/changed/patched entries. A content change
+   also `$unset`s `text_embedding` and `card_vector` so the next
+   `mtg-embed cards` / `mtg-embed fuse` re-encodes only what moved;
+   "patched" (sha unchanged but newly-owned schema fields missing from
+   the stored doc) rewrites the owned fields WITHOUT invalidating
+   embeddings — self-healing when the fetcher's owned-field list grows.
+   On a typical Scryfall snapshot bump that's a tiny bulk_write instead
+   of ~40k pointless `$set` operations.
+
+   Owned fields per card: `oracle_id`, `name`, `names`, `mana_cost`,
+   `type_line`, `oracle_text`, `oracle_text_sha`, `keywords`, `colors`,
+   `color_identity`, `cmc`, `power`, `toughness`. The `keywords` /
+   `colors` / `color_identity` / `cmc` / `power` / `toughness` block
+   is used by `mtg-deck-profile --mode cluster`'s structural feature
+   knobs (`--type-weight`, `--mana-cost-weight` today; more to come).
 
 Upserts touch only the fields `scryfall_fetch` owns, so a card's `tags`
 array (written by `oracle_tags`) survives every merge. For corruption
@@ -340,6 +350,16 @@ mtg-deck-profile --file deck.txt --limit 20
 mtg-deck-profile --file deck.txt --mode cluster
 mtg-deck-profile --file deck.txt --mode cluster --cluster-min-size 5
 mtg-deck-profile --file deck.txt --mode cluster --cluster-selection-epsilon 0.1
+
+# Add weighted structural features onto card_vector before clustering.
+# --type-weight pulls in supertypes + card types + deck-local subtypes
+# (multi-hot). --mana-cost-weight pulls in a 10-dim cost shape (generic,
+# WUBRG, X, hybrid, phyrexian, snow). Each sub-vector is L2-normalized,
+# scaled by its weight, and concatenated onto the card_vector so cosine
+# similarity becomes a weighted mean of per-feature cosines.
+mtg-deck-profile --file deck.txt --mode cluster --type-weight 0.4
+mtg-deck-profile --file deck.txt --mode cluster --mana-cost-weight 0.3
+mtg-deck-profile --file deck.txt --mode cluster --type-weight 0.4 --mana-cost-weight 0.3
 ```
 
 Sample output:
