@@ -18,6 +18,14 @@
 
 set windows-shell := ["sh", "-c"]
 
+# Pass each recipe parameter to the shell as a positional argument
+# ($1, $2, …) so variadic *ARGS can be forwarded with `"$@"` instead
+# of `{{ARGS}}`. The {{ARGS}} splat loses quoting around multi-word
+# values (e.g. `--commander "The Notary Hobbits"` became `--commander
+# The` + two stray tokens before this was turned on), while `"$@"`
+# preserves each token verbatim.
+set positional-arguments := true
+
 
 # List every recipe (default when no target is given).
 default:
@@ -53,7 +61,7 @@ test-verbose:
 
 # Verify the Mongo cluster is reachable and healthy (`mtg-check` wrapper).
 check *ARGS:
-    mtg-check {{ARGS}}
+    mtg-check "$@"
 
 # Fetch oracle text into Mongo (`scryfall-fetch` wrapper; idempotent + diff-aware, no flags).
 fetch:
@@ -65,11 +73,11 @@ tags:
 
 # Inspect what's in Mongo (`mtg-inspect` wrapper: card / tag / list / stats).
 inspect *ARGS:
-    mtg-inspect {{ARGS}}
+    mtg-inspect "$@"
 
 # Encode text + tags into dense vectors (`mtg-embed` wrapper: cards / tags / flags).
 embed *ARGS:
-    mtg-embed {{ARGS}}
+    mtg-embed "$@"
 
 # Smoke-test the embedding pipeline end-to-end on 20 cards.
 embed-smoke:
@@ -77,20 +85,21 @@ embed-smoke:
 
 # Fuse text + aggregated tag embeddings into card_vector (`mtg-embed fuse` wrapper).
 fuse *ARGS:
-    mtg-embed fuse {{ARGS}}
+    mtg-embed fuse "$@"
 
 # Populate Mongo end-to-end: fetch → tag → embed cards + tags → fuse. Idempotent and diff-aware — reruns re-encode only cards whose oracle_text or tags changed; `--refresh` on an embed step forces that step.
 populate *ARGS:
     scryfall-fetch
     scryfall-fetch-tags
-    mtg-embed cards {{ARGS}}
-    mtg-embed tags {{ARGS}}
-    mtg-embed fuse {{ARGS}}
+    mtg-embed cards "$@"
+    mtg-embed tags "$@"
+    mtg-embed fuse "$@"
 
-# Cluster a decklist's tags into themes (`mtg-deck-profile` wrapper). Pass a decklist with --file or positional names.
+# Cluster a decklist's cards into themes or vector groups (`mtg-deck-profile` wrapper). Pass a decklist with --file or positional names.
 profile *ARGS:
-    mtg-deck-profile {{ARGS}}
+    mtg-deck-profile "$@"
 
 # Export a trimmed JSON subset for a decklist file (`extract-oracle` wrapper).
+# FILE is $1 under positional-arguments; `shift` lifts it off so "$@" is just the trailing flags.
 extract FILE *ARGS:
-    extract-oracle --file {{FILE}} {{ARGS}}
+    file="$1"; shift; extract-oracle --file "$file" "$@"
