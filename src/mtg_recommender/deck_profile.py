@@ -44,9 +44,11 @@ import numpy as np
 from pymongo.collection import Collection
 
 from . import card_clusterer as cc
+from . import edhrec_fetch as edh
 from . import scryfall_fetch as sf
 from . import storage
 from . import theme_classifier as tc
+from . import weight_trainer as wt
 
 # ---------------------------------------------------------------------------
 # Dataclasses (output shape)
@@ -331,53 +333,40 @@ def build_deck_profile(
 # Alternative mode: unsupervised card_vector clustering + top-level labels
 # ---------------------------------------------------------------------------
 
-def build_cluster_profile(
-    card_names: Iterable[str],
+def build_cluster_profile_from_resolved(
+    deck_cards: list[dict],
+    missing: list[str],
     *,
-    cards_coll: Optional[Collection] = None,
     tags_coll: Optional[Collection] = None,
     min_cluster_size: int = cc.DEFAULT_CLUSTER_MIN_SIZE,
     cluster_selection_epsilon: float = cc.DEFAULT_CLUSTER_SELECTION_EPSILON,
     blocklist: frozenset[str] = tc.DEFAULT_BLOCKLIST,
     feature_weights: Optional[dict[str, float]] = None,
+    deck_vocab: Optional[dict[str, tuple[str, ...]]] = None,
 ) -> DeckProfile:
-    """Alternative to `build_deck_profile`: cluster cards by `card_vector`.
+    """Same shape as `build_cluster_profile`, but takes pre-resolved cards.
 
-    Where `build_deck_profile` sorts cards into pre-defined themes,
-    this flow goes the other direction — it clusters cards directly
-    by their Phase 2 fused `card_vector` and labels each resulting
-    group by the top-level oracle tag its member cards most
-    frequently share (dropping tags on the blocklist first).
+    Exists so the `--train` flow can resolve the deck + build vocab once
+    (expensive-ish: Mongo lookups + type-line parsing), run the random-
+    search trainer against that resolved pack across N trials, and only
+    then build the final rendered profile — all without hitting Mongo
+    again for the deck lookup each pass.
 
-    `feature_weights`: optional structural-feature weights passed through
-    to `cc.cluster_cards_by_vector` (see that function's docstring and
-    `card_clusterer._FEATURE_BUILDERS` for the available knobs). Omitted
-    or all-zero preserves the pure-card_vector behaviour. When any
-    feature with its own deck-local vocab is active, this function
-    builds the vocab from the resolved deck.
+    `deck_cards` must already include every field the clusterer and
+    labeller touch (`_id`, `name`, `tags`, `card_vector`, `type_line`,
+    `mana_cost`, `keywords`, `colors`, `color_identity`, `power`,
+    `toughness`) — i.e. a list produced by `resolve_deck_cards`.
 
-    Shape of the returned `DeckProfile` matches `build_deck_profile`
-    so the CLI render is shared, with these semantic differences:
-      - `clusters` are card-vector groups, not theme-tag groups.
-      - `constituent_themes` is always a single-element tuple naming
-        the cluster's label — no merge pass runs in this mode (the
-        clustering itself is the primary knob).
-      - `noise_tags` is always empty — this mode doesn't partition
-        tags.
-      - `unassigned_card_ids` holds cards HDBSCAN labelled as noise
-        OR cards that lack a stored `card_vector`.
+    `deck_vocab` defaults to the output of `build_deck_vocab(deck_cards)`
+    when None, which matches the public entry point's behaviour.
     """
-    if cards_coll is None:
-        cards_coll = storage.cards_collection()
     if tags_coll is None:
         tags_coll = storage.tags_collection()
 
-    deck_cards, missing = resolve_deck_cards(card_names, cards_coll)
     tag_universe = collect_tag_universe(deck_cards)
     cards_by_id = {doc["_id"]: doc for doc in deck_cards}
-    # Build deck-local vocab unconditionally — cheap, and it keeps the
-    # vocab argument shape stable whether or not any feature is active.
-    deck_vocab = build_deck_vocab(deck_cards)
+    if deck_vocab is None:
+        deck_vocab = build_deck_vocab(deck_cards)
 
     # Cluster the deck's card_vectors. Cards without a card_vector are
     # excluded by the clusterer — surface them as unassigned so the
@@ -435,6 +424,59 @@ def build_cluster_profile(
         clusters=tuple(clusters),
         noise_tags=(),  # not applicable in cluster mode
         unassigned_card_ids=tuple(unassigned),
+    )
+
+
+def build_cluster_profile(
+    card_names: Iterable[str],
+    *,
+    cards_coll: Optional[Collection] = None,
+    tags_coll: Optional[Collection] = None,
+    min_cluster_size: int = cc.DEFAULT_CLUSTER_MIN_SIZE,
+    cluster_selection_epsilon: float = cc.DEFAULT_CLUSTER_SELECTION_EPSILON,
+    blocklist: frozenset[str] = tc.DEFAULT_BLOCKLIST,
+    feature_weights: Optional[dict[str, float]] = None,
+) -> DeckProfile:
+    """Alternative to `build_deck_profile`: cluster cards by `card_vector`.
+
+    Where `build_deck_profile` sorts cards into pre-defined themes,
+    this flow goes the other direction — it clusters cards directly
+    by their Phase 2 fused `card_vector` and labels each resulting
+    group by the top-level oracle tag its member cards most
+    frequently share (dropping tags on the blocklist first).
+
+    `feature_weights`: optional structural-feature weights passed through
+    to `cc.cluster_cards_by_vector` (see that function's docstring and
+    `card_clusterer._FEATURE_BUILDERS` for the available knobs). Omitted
+    or all-zero preserves the pure-card_vector behaviour. When any
+    feature with its own deck-local vocab is active, this function
+    builds the vocab from the resolved deck.
+
+    Shape of the returned `DeckProfile` matches `build_deck_profile`
+    so the CLI render is shared, with these semantic differences:
+      - `clusters` are card-vector groups, not theme-tag groups.
+      - `constituent_themes` is always a single-element tuple naming
+        the cluster's label — no merge pass runs in this mode (the
+        clustering itself is the primary knob).
+      - `noise_tags` is always empty — this mode doesn't partition
+        tags.
+      - `unassigned_card_ids` holds cards HDBSCAN labelled as noise
+        OR cards that lack a stored `card_vector`.
+    """
+    if cards_coll is None:
+        cards_coll = storage.cards_collection()
+    if tags_coll is None:
+        tags_coll = storage.tags_collection()
+
+    deck_cards, missing = resolve_deck_cards(card_names, cards_coll)
+    return build_cluster_profile_from_resolved(
+        deck_cards,
+        missing,
+        tags_coll=tags_coll,
+        min_cluster_size=min_cluster_size,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        blocklist=blocklist,
+        feature_weights=feature_weights,
     )
 
 
@@ -542,6 +584,75 @@ def _parse_blocklist(raw: Optional[str]) -> Optional[frozenset[str]]:
     if not raw.strip():
         return frozenset()
     return frozenset(s.strip() for s in raw.split(",") if s.strip())
+
+
+def _parse_knob_csv(raw: Optional[str]) -> Optional[tuple[str, ...]]:
+    """Parse the --train-knobs CSV. Empty / None → use trainer default."""
+    if raw is None:
+        return None
+    cleaned = tuple(s.strip() for s in raw.split(",") if s.strip())
+    return cleaned or None
+
+
+def _train_cluster_weights(
+    names: list[str],
+    cards_coll: Collection,
+    args,
+) -> tuple[dict[str, float], wt.TrainResult]:
+    """Fetch EDHREC lift, run the trainer, print the best weights, return them.
+
+    Side effect: prints a two-section summary (trial count + score, then
+    per-knob weight table) so the user sees why the final clusters look
+    the way they do. Called ONLY when --train is set — the no-train path
+    skips all of this.
+
+    A commander EDHREC doesn't know about (404) or a payload with no
+    scryfall-id'd signals both abort the training branch cleanly rather
+    than silently falling back to zero weights.
+    """
+    try:
+        signals = edh.get_commander_signals(args.commander)
+    except Exception as exc:
+        raise SystemExit(
+            f"failed to load EDHREC data for commander {args.commander!r}: {exc}"
+        )
+    # Scryfall-id → lift lookup. Multiple cardviews may carry the same id;
+    # extract_card_signals already dedupes to the highest-lift entry.
+    card_lifts = {s.scryfall_id: s.lift for s in signals}
+    if not card_lifts:
+        raise SystemExit(
+            f"EDHREC payload for {args.commander!r} contained no scored cards"
+        )
+
+    knobs = _parse_knob_csv(args.train_knobs) or wt.DEFAULT_TRAIN_KNOBS
+    deck_cards, _missing = resolve_deck_cards(names, cards_coll)
+    deck_vocab = build_deck_vocab(deck_cards)
+    result = wt.train_weights(
+        deck_cards,
+        card_lifts,
+        knobs=knobs,
+        n_trials=args.train_trials,
+        seed=args.train_seed,
+        weight_bounds=(0.0, args.train_max_weight),
+        deck_vocab=deck_vocab,
+        min_cluster_size=args.cluster_min_size,
+        cluster_selection_epsilon=args.cluster_selection_epsilon,
+    )
+    # Pretty-print the search outcome before the clusters render.
+    print(
+        f"trained {args.train_trials} trials against EDHREC lift for "
+        f"{args.commander!r} — best eta^2 = {result.best_score:.3f}"
+    )
+    print("best weights:")
+    for knob in knobs:
+        print(f"  {knob:<16} {result.best_weights.get(knob, 0.0):.3f}")
+    print("")
+    # Only pass positive weights through to the renderer — same hygiene
+    # as the manual-weight path.
+    final: dict[str, float] = {
+        k: v for k, v in result.best_weights.items() if v > 0.0
+    }
+    return final, result
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
@@ -692,6 +803,60 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             "Same shape as --power-weight."
         ),
     )
+    # ------- cluster-mode training flags -------
+    #
+    # When --train is set, the CLI replaces the per-flag weights above
+    # with a random-search over EDHREC lift as the objective. The
+    # per-flag weights still apply when --train is OMITTED.
+    parser.add_argument(
+        "--train", action="store_true",
+        help=(
+            "[cluster mode] Auto-tune the structural feature weights "
+            "against EDHREC lift for --commander. Random search over "
+            "--train-trials configurations; the best one feeds the "
+            "final cluster render. Overrides --type-weight etc."
+        ),
+    )
+    parser.add_argument(
+        "--commander", default=None,
+        help=(
+            "[cluster mode, with --train] Commander name whose EDHREC "
+            "per-card lift drives the training objective. Required when "
+            "--train is set."
+        ),
+    )
+    parser.add_argument(
+        "--train-trials", type=int, default=wt.DEFAULT_TRAIN_TRIALS,
+        help=(
+            f"[cluster mode, with --train] Random-search trial budget "
+            f"(default: {wt.DEFAULT_TRAIN_TRIALS}). Each trial reruns "
+            "HDBSCAN; cost is linear."
+        ),
+    )
+    parser.add_argument(
+        "--train-seed", type=int, default=0,
+        help=(
+            "[cluster mode, with --train] RNG seed for the random "
+            "search. Same (deck, commander, seed) → same best weights."
+        ),
+    )
+    parser.add_argument(
+        "--train-knobs", default=None,
+        help=(
+            "[cluster mode, with --train] Comma-separated knob names "
+            "to tune (default: all seven). Example: 'types,mana_cost'. "
+            "Knobs not listed stay at 0.0 for every trial."
+        ),
+    )
+    parser.add_argument(
+        "--train-max-weight", type=float,
+        default=wt.DEFAULT_WEIGHT_BOUNDS[1],
+        help=(
+            f"[cluster mode, with --train] Upper bound on each knob's "
+            f"weight during sampling (default: "
+            f"{wt.DEFAULT_WEIGHT_BOUNDS[1]}). Lower bound is always 0.0."
+        ),
+    )
     # ------- shared flags -------
     parser.add_argument(
         "--theme-blocklist", default=None,
@@ -724,35 +889,59 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     cards_coll = storage.cards_collection()
     tags_coll = storage.tags_collection()
     if args.mode == "cluster":
-        # Only pass through knobs that are actually active — avoids
-        # noisy "weight=0.0 feature=types" entries flowing into the
-        # clusterer when the user didn't ask for them. Order of the
-        # dict is irrelevant for correctness but kept consistent with
-        # the CLI flag order for readability on debug prints.
-        feature_weights: dict[str, float] = {}
-        if args.type_weight > 0.0:
-            feature_weights["types"] = args.type_weight
-        if args.mana_cost_weight > 0.0:
-            feature_weights["mana_cost"] = args.mana_cost_weight
-        if args.keyword_weight > 0.0:
-            feature_weights["keywords"] = args.keyword_weight
-        if args.color_weight > 0.0:
-            feature_weights["colors"] = args.color_weight
-        if args.color_identity_weight > 0.0:
-            feature_weights["color_identity"] = args.color_identity_weight
-        if args.power_weight > 0.0:
-            feature_weights["power"] = args.power_weight
-        if args.toughness_weight > 0.0:
-            feature_weights["toughness"] = args.toughness_weight
-        profile = build_cluster_profile(
-            names,
-            cards_coll=cards_coll,
-            tags_coll=tags_coll,
-            min_cluster_size=args.cluster_min_size,
-            cluster_selection_epsilon=args.cluster_selection_epsilon,
-            blocklist=effective_blocklist,
-            feature_weights=feature_weights,
-        )
+        if args.train:
+            # --train replaces the per-flag weights with a random-search
+            # over EDHREC lift. Resolve the deck once, train, then render
+            # the final profile from the chosen weights so we only
+            # resolve/vocab-build Mongo state a single time.
+            if not args.commander:
+                parser.error("--train requires --commander NAME for the EDHREC lookup")
+            feature_weights, _train_result = _train_cluster_weights(
+                names, cards_coll, args,
+            )
+            # Resolve + vocab are small, cheap to redo for the final
+            # render. Doing it twice keeps the trainer's data path and
+            # the renderer's data path uncoupled; the alternative would
+            # be a longer refactor for a sub-second saving.
+            deck_cards, missing = resolve_deck_cards(names, cards_coll)
+            profile = build_cluster_profile_from_resolved(
+                deck_cards, missing,
+                tags_coll=tags_coll,
+                min_cluster_size=args.cluster_min_size,
+                cluster_selection_epsilon=args.cluster_selection_epsilon,
+                blocklist=effective_blocklist,
+                feature_weights=feature_weights,
+            )
+        else:
+            # Only pass through knobs that are actually active — avoids
+            # noisy "weight=0.0 feature=types" entries flowing into the
+            # clusterer when the user didn't ask for them. Order of the
+            # dict is irrelevant for correctness but kept consistent with
+            # the CLI flag order for readability on debug prints.
+            feature_weights = {}
+            if args.type_weight > 0.0:
+                feature_weights["types"] = args.type_weight
+            if args.mana_cost_weight > 0.0:
+                feature_weights["mana_cost"] = args.mana_cost_weight
+            if args.keyword_weight > 0.0:
+                feature_weights["keywords"] = args.keyword_weight
+            if args.color_weight > 0.0:
+                feature_weights["colors"] = args.color_weight
+            if args.color_identity_weight > 0.0:
+                feature_weights["color_identity"] = args.color_identity_weight
+            if args.power_weight > 0.0:
+                feature_weights["power"] = args.power_weight
+            if args.toughness_weight > 0.0:
+                feature_weights["toughness"] = args.toughness_weight
+            profile = build_cluster_profile(
+                names,
+                cards_coll=cards_coll,
+                tags_coll=tags_coll,
+                min_cluster_size=args.cluster_min_size,
+                cluster_selection_epsilon=args.cluster_selection_epsilon,
+                blocklist=effective_blocklist,
+                feature_weights=feature_weights,
+            )
     else:
         theme_filter = tc.ThemeFilter(
             min_children=args.min_children,

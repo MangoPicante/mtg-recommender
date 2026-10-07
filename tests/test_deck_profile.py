@@ -54,12 +54,14 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import mongomock
 import numpy as np
 
 from mtg_recommender import card_clusterer as cc
 from mtg_recommender import deck_profile as dp
+from mtg_recommender import edhrec_fetch as edh
 from mtg_recommender import embeddings as emb
 from mtg_recommender import storage
 from mtg_recommender import theme_classifier as tc
@@ -1667,6 +1669,70 @@ class TestMainCLI(_MongoBackedTestCase):
         # reinforce the natural split rather than scrambling it.
         self.assertIn("theme 'removal'", out)
         self.assertIn("theme 'ramp'", out)
+
+    def test_train_flag_requires_commander(self):
+        # --train without --commander should error out via argparse.
+        self._seed_hierarchy()
+        self._seed_card("id-a", "Card A", ["spot-removal"],
+                        text_embedding=[1.0, 0.0, 0.0, 0.0])
+        with self.assertRaises(SystemExit):
+            _run_cli(["Card A", "--mode", "cluster", "--train"])
+
+    def test_train_flag_pipes_through_with_mocked_edhrec(self):
+        # End-to-end --train run: six cards (3 creatures hi-lift, 3
+        # instants lo-lift), EDHREC mocked to return those lifts, trainer
+        # runs 5 trials with --train-knobs restricted to "types" so the
+        # search is deterministic enough to assert on. Verifies: the CLI
+        # path reaches get_commander_signals, prints the trained-weights
+        # summary, and still produces a cluster render below it.
+        self._seed_hierarchy()
+        for i in range(3):
+            sid = f"creat-{i}"
+            self.cards.insert_one({
+                "_id": sid, "name": f"Creat {i}", "names": [f"creat {i}"],
+                "tags": ["spot-removal"],
+                "card_vector": _pack([1.0, 0.0, 0.0, 0.0]),
+                "type_line": "Creature — Human",
+                "mana_cost": "{R}",
+            })
+        for i in range(3):
+            sid = f"inst-{i}"
+            self.cards.insert_one({
+                "_id": sid, "name": f"Inst {i}", "names": [f"inst {i}"],
+                "tags": ["mana-rock"],
+                "card_vector": _pack([1.0, 0.0, 0.0, 0.0]),
+                "type_line": "Instant",
+                "mana_cost": "{U}",
+            })
+
+        fake_signals = [
+            edh.CardSignal(name=f"Creat {i}", scryfall_id=f"creat-{i}",
+                           lift=5.0, synergy=0.0, num_decks=100,
+                           potential_decks=1000)
+            for i in range(3)
+        ] + [
+            edh.CardSignal(name=f"Inst {i}", scryfall_id=f"inst-{i}",
+                           lift=1.0, synergy=0.0, num_decks=10,
+                           potential_decks=1000)
+            for i in range(3)
+        ]
+        with patch.object(dp.edh, "get_commander_signals",
+                          return_value=fake_signals) as mock_edh:
+            rc, out, _err = _run_cli([
+                "Creat 0", "Creat 1", "Creat 2", "Inst 0", "Inst 1", "Inst 2",
+                "--mode", "cluster", "--cluster-min-size", "2",
+                "--train",
+                "--commander", "Fake Commander",
+                "--train-trials", "5",
+                "--train-knobs", "types",
+                "--train-seed", "0",
+            ])
+        self.assertEqual(rc, 0)
+        mock_edh.assert_called_once_with("Fake Commander")
+        # Trainer header shows a score; cluster render follows below.
+        self.assertIn("best eta^2", out)
+        self.assertIn("best weights:", out)
+        self.assertIn("types", out)
 
     def test_merge_threshold_flag_pipes_through(self):
         # Seed two cards whose themes should merge at threshold 0.9.

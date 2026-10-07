@@ -33,6 +33,7 @@ Under `src/mtg_recommender/`:
 | `deck_profile` | Phase 3. Given a decklist, resolves cards against the `names` index and classifies each card into one of ~30 themes discovered from the oracle_tags hierarchy. Multi-theme cards are resolved by cosine similarity between the card's `text_embedding` and each theme's representative vector. Returns a `DeckProfile` carrying per-theme centroids + member tags + deck-card membership + an unassigned bucket. |
 | `theme_classifier` | Phase 3. Owns the data-driven theme discovery (filtering ~900 top-level tags down to ~30 "real themes" via blocklist + min-children + card-coverage window) and the per-card classification logic (candidate intersection → text-embedding tiebreak). Also owns the optional post-classification merge pass that collapses themes whose `card_vector` profiles are cosine-similar. Called into by `deck_profile` in theme mode. |
 | `card_clusterer` | Phase 3. Alternative to `theme_classifier`: HDBSCAN over `card_vector` to cluster deck cards directly, then labels each cluster by its most-frequent non-blocklisted top-level tag (fallback: `cluster-N`). Called into by `deck_profile` in cluster mode (`--mode cluster`). |
+| `weight_trainer` | Phase 3. Per-deck random-search tuner for the cluster-mode structural weight knobs. Scores each candidate configuration by eta-squared of EDHREC per-card lift explained by the clustering (0 = uninformative, 1 = perfectly stratified). Called into by `deck_profile`'s `--train` CLI flag. |
 
 Tests live under `tests/` and are offline — every HTTP call is mocked, every
 Mongo op goes through `mongomock`.
@@ -370,6 +371,20 @@ mtg-deck-profile --file deck.txt --mode cluster --mana-cost-weight 0.3
 mtg-deck-profile --file deck.txt --mode cluster --color-identity-weight 0.5
 mtg-deck-profile --file deck.txt --mode cluster \
     --type-weight 0.4 --power-weight 0.3 --toughness-weight 0.3
+
+# --train auto-tunes the knobs against EDHREC lift for a commander.
+# Random search over --train-trials configurations; the search picks the
+# weights that make eta^2 of per-card lift explained by clustering
+# as high as possible (clusters stratify high- vs. low-lift cards).
+# Prints the best weights found, then renders the final clustering
+# with them. Replaces any manual --*-weight flags.
+mtg-deck-profile --file deck.txt --mode cluster --train \
+    --commander "Atraxa, Praetors' Voice"
+# Restrict the search to a subset of knobs for a cheaper / more
+# interpretable run.
+mtg-deck-profile --file deck.txt --mode cluster --train \
+    --commander "Atraxa, Praetors' Voice" \
+    --train-knobs types,mana_cost,color_identity --train-trials 100
 ```
 
 Sample output:
@@ -458,6 +473,7 @@ mtg-recommender/
 │       ├── edhrec_fetch.py      # Phase 3 EDHREC JSON client + per-commander cache
 │       ├── theme_classifier.py  # Phase 3 hierarchy-driven theme discovery + per-card classification
 │       ├── card_clusterer.py    # Phase 3 unsupervised card_vector clustering + top-level labelling (--mode cluster)
+│       ├── weight_trainer.py    # Phase 3 random-search tuner for cluster-mode structural weight knobs (--train)
 │       └── deck_profile.py      # Phase 3 deck profile builder (theme and cluster modes) + mtg-deck-profile CLI
 ├── tests/
 │   ├── test_storage.py          # offline, mongomock-backed
@@ -468,7 +484,8 @@ mtg-recommender/
 │   ├── test_extract_oracle.py
 │   ├── test_embeddings.py
 │   ├── test_edhrec_fetch.py
-│   ├── test_deck_profile.py     # also covers theme_classifier (shared fixtures)
+│   ├── test_weight_trainer.py
+│   ├── test_deck_profile.py     # also covers theme_classifier + card_clusterer (shared fixtures)
 │   └── fixtures/                # trimmed sample payloads used by HTTP-mocked tests
 │       └── edhrec_atraxa_trimmed.json
 ├── pyproject.toml               # PEP 621 metadata, build config, entry points
