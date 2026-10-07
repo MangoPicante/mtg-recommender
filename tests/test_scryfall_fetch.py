@@ -301,19 +301,19 @@ class TestUpsertCard(_MongoBackedTestCase):
         self.assertEqual(doc["tags"], ["spot-removal", "burn-any"])
 
     def test_bulk_upsert_stores_everything(self):
-        new, changed, unchanged = sf.bulk_upsert_cards(
+        new, changed, patched, unchanged = sf.bulk_upsert_cards(
             self.coll, [LIGHTNING_BOLT_RAW, SOL_RING_RAW, DELVER_RAW]
         )
-        self.assertEqual((new, changed, unchanged), (3, 0, 0))
+        self.assertEqual((new, changed, patched, unchanged), (3, 0, 0, 0))
         self.assertEqual(self.coll.count_documents({}), 3)
         self.assertEqual(self.coll.find_one({"_id": "id-delver"})["name"],
                          "Delver of Secrets // Insectile Aberration")
 
     def test_bulk_upsert_skips_entries_missing_id(self):
-        new, changed, unchanged = sf.bulk_upsert_cards(
+        new, changed, patched, unchanged = sf.bulk_upsert_cards(
             self.coll, [LIGHTNING_BOLT_RAW, {"name": "no id"}]
         )
-        self.assertEqual((new, changed, unchanged), (1, 0, 0))
+        self.assertEqual((new, changed, patched, unchanged), (1, 0, 0, 0))
         self.assertEqual(self.coll.count_documents({}), 1)
 
     def test_bulk_upsert_preserves_existing_tags(self):
@@ -333,27 +333,60 @@ class TestUpsertCard(_MongoBackedTestCase):
         self.assertEqual(doc["tags"], ["spot-removal"])
 
     def test_empty_bulk_is_a_noop(self):
-        new, changed, unchanged = sf.bulk_upsert_cards(self.coll, [])
-        self.assertEqual((new, changed, unchanged), (0, 0, 0))
+        new, changed, patched, unchanged = sf.bulk_upsert_cards(self.coll, [])
+        self.assertEqual((new, changed, patched, unchanged), (0, 0, 0, 0))
 
     def test_unchanged_card_produces_no_write(self):
-        # Pre-seed at a stored sha matching what extract_card_fields will
-        # produce for the incoming raw. The bulk pass should classify
-        # this as unchanged and leave the doc intact.
-        sha = sf.oracle_text_sha(sf.extract_card_fields(LIGHTNING_BOLT_RAW)["oracle_text"])
-        self.coll.insert_one({
-            "_id": "id-lb", "name": "Lightning Bolt",
-            "oracle_text_sha": sha,
-            "text_embedding": [0.0] * 4, "card_vector": [0.0] * 4,
-        })
-        new, changed, unchanged = sf.bulk_upsert_cards(
+        # Pre-seed with EVERY owned field + sha so the diff pass classifies
+        # the card as truly unchanged. If any owned key were missing the
+        # pass would instead patch the schema in — covered separately.
+        doc = sf.extract_card_fields(LIGHTNING_BOLT_RAW)
+        seed = {k: doc[k] for k in doc}  # includes _id + every _OWNED_FIELDS key
+        seed["text_embedding"] = [0.0] * 4
+        seed["card_vector"] = [0.0] * 4
+        self.coll.insert_one(seed)
+        new, changed, patched, unchanged = sf.bulk_upsert_cards(
             self.coll, [LIGHTNING_BOLT_RAW]
         )
-        self.assertEqual((new, changed, unchanged), (0, 0, 1))
-        doc = self.coll.find_one({"_id": "id-lb"})
+        self.assertEqual((new, changed, patched, unchanged), (0, 0, 0, 1))
+        got = self.coll.find_one({"_id": "id-lb"})
         # No write means downstream fields stay as they were.
-        self.assertEqual(doc["text_embedding"], [0.0] * 4)
-        self.assertEqual(doc["card_vector"], [0.0] * 4)
+        self.assertEqual(got["text_embedding"], [0.0] * 4)
+        self.assertEqual(got["card_vector"], [0.0] * 4)
+
+    def test_patched_schema_add_preserves_embeddings(self):
+        # Older schema: sha matches current text, but new owned keys
+        # (keywords/colors/color_identity/cmc/power/toughness) are
+        # absent. Diff pass should classify "patched" — $set the owned
+        # fields in, DO NOT $unset the embeddings (sha unchanged → the
+        # cached vectors are still valid for this oracle text).
+        sha = sf.oracle_text_sha(sf.extract_card_fields(LIGHTNING_BOLT_RAW)["oracle_text"])
+        self.coll.insert_one({
+            "_id": "id-lb",
+            "oracle_id": "oracle-lb",
+            "name": "Lightning Bolt",
+            "names": ["lightning bolt"],
+            "mana_cost": "{R}",
+            "type_line": "Instant",
+            "oracle_text": "Lightning Bolt deals 3 damage to any target.",
+            "oracle_text_sha": sha,
+            # keywords/colors/color_identity/cmc/power/toughness absent.
+            "text_embedding": [0.0] * 4,
+            "card_vector": [0.0] * 4,
+        })
+        new, changed, patched, unchanged = sf.bulk_upsert_cards(
+            self.coll, [LIGHTNING_BOLT_RAW]
+        )
+        self.assertEqual((new, changed, patched, unchanged), (0, 0, 1, 0))
+        got = self.coll.find_one({"_id": "id-lb"})
+        # New schema fields now present…
+        self.assertIn("keywords", got)
+        self.assertIn("colors", got)
+        self.assertIn("color_identity", got)
+        self.assertIn("cmc", got)
+        # …and embeddings preserved (sha didn't change, so no re-encode needed).
+        self.assertEqual(got["text_embedding"], [0.0] * 4)
+        self.assertEqual(got["card_vector"], [0.0] * 4)
 
     def test_changed_content_rewrites_and_clears_downstream_fields(self):
         # Stored sha matches an OLD oracle_text; the incoming raw has
@@ -365,10 +398,10 @@ class TestUpsertCard(_MongoBackedTestCase):
             "text_embedding": [0.0] * 4, "card_vector": [0.0] * 4,
             "tags": ["spot-removal"],
         })
-        new, changed, unchanged = sf.bulk_upsert_cards(
+        new, changed, patched, unchanged = sf.bulk_upsert_cards(
             self.coll, [LIGHTNING_BOLT_RAW]
         )
-        self.assertEqual((new, changed, unchanged), (0, 1, 0))
+        self.assertEqual((new, changed, patched, unchanged), (0, 1, 0, 0))
         doc = self.coll.find_one({"_id": "id-lb"})
         self.assertEqual(doc["name"], "Lightning Bolt")
         # Owned-by-oracle_tags field intact across the content change.
@@ -386,10 +419,10 @@ class TestUpsertCard(_MongoBackedTestCase):
             "_id": "id-lb", "name": "Lightning Bolt",
             "text_embedding": [0.0] * 4,
         })
-        new, changed, unchanged = sf.bulk_upsert_cards(
+        new, changed, patched, unchanged = sf.bulk_upsert_cards(
             self.coll, [LIGHTNING_BOLT_RAW]
         )
-        self.assertEqual((new, changed, unchanged), (0, 1, 0))
+        self.assertEqual((new, changed, patched, unchanged), (0, 1, 0, 0))
         doc = self.coll.find_one({"_id": "id-lb"})
         self.assertIn("oracle_text_sha", doc)
         self.assertNotIn("text_embedding", doc)
