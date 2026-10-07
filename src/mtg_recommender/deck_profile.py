@@ -144,10 +144,13 @@ def resolve_deck_cards(
     # Project card_vector too: the optional merge-similar-themes pass
     # needs it to compute per-theme card profiles. Deck cards without
     # a card_vector are harmless — the merge step just excludes them
-    # from the profile averages.
+    # from the profile averages. type_line + mana_cost are projected so
+    # cluster-mode feature knobs (--type-weight / --mana-cost-weight)
+    # have the structured fields they need; theme mode just ignores them.
     projection = {
         "_id": 1, "name": 1, "tags": 1,
         "text_embedding": 1, "card_vector": 1,
+        "type_line": 1, "mana_cost": 1,
     }
     for name in card_names:
         matches = list(cards_coll.find({"names": name.lower()}, projection))
@@ -169,6 +172,26 @@ def collect_tag_universe(deck_cards: Iterable[dict]) -> list[str]:
         for slug in doc.get("tags") or []:
             universe.add(slug)
     return sorted(universe)
+
+
+def build_deck_vocab(deck_cards: Iterable[dict]) -> dict[str, tuple[str, ...]]:
+    """Collect deck-local vocabularies the structural feature builders need.
+
+    Right now that's just subtypes (for `build_type_vector`): every subtype
+    appearing in the deck's cards' type_lines, sorted for stable dim order
+    across runs. Future features will add their own keys (e.g. keyword vocab)
+    without changing this function's call sites — downstream consumers index
+    by name.
+
+    Sorted output matters: HDBSCAN sees the same per-dim slot for a given
+    subtype across runs, so cluster output is reproducible on identical
+    input instead of depending on dict iteration order.
+    """
+    subtypes: set[str] = set()
+    for doc in deck_cards:
+        _supers, _types, subs = cc.parse_type_line(doc.get("type_line") or "")
+        subtypes.update(subs)
+    return {"subtypes": tuple(sorted(subtypes))}
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +326,7 @@ def build_cluster_profile(
     min_cluster_size: int = cc.DEFAULT_CLUSTER_MIN_SIZE,
     cluster_selection_epsilon: float = cc.DEFAULT_CLUSTER_SELECTION_EPSILON,
     blocklist: frozenset[str] = tc.DEFAULT_BLOCKLIST,
+    feature_weights: Optional[dict[str, float]] = None,
 ) -> DeckProfile:
     """Alternative to `build_deck_profile`: cluster cards by `card_vector`.
 
@@ -311,6 +335,13 @@ def build_cluster_profile(
     by their Phase 2 fused `card_vector` and labels each resulting
     group by the top-level oracle tag its member cards most
     frequently share (dropping tags on the blocklist first).
+
+    `feature_weights`: optional structural-feature weights passed through
+    to `cc.cluster_cards_by_vector` (see that function's docstring and
+    `card_clusterer._FEATURE_BUILDERS` for the available knobs). Omitted
+    or all-zero preserves the pure-card_vector behaviour. When any
+    feature with its own deck-local vocab is active, this function
+    builds the vocab from the resolved deck.
 
     Shape of the returned `DeckProfile` matches `build_deck_profile`
     so the CLI render is shared, with these semantic differences:
@@ -331,6 +362,9 @@ def build_cluster_profile(
     deck_cards, missing = resolve_deck_cards(card_names, cards_coll)
     tag_universe = collect_tag_universe(deck_cards)
     cards_by_id = {doc["_id"]: doc for doc in deck_cards}
+    # Build deck-local vocab unconditionally — cheap, and it keeps the
+    # vocab argument shape stable whether or not any feature is active.
+    deck_vocab = build_deck_vocab(deck_cards)
 
     # Cluster the deck's card_vectors. Cards without a card_vector are
     # excluded by the clusterer — surface them as unassigned so the
@@ -339,6 +373,8 @@ def build_cluster_profile(
         deck_cards,
         min_cluster_size=min_cluster_size,
         cluster_selection_epsilon=cluster_selection_epsilon,
+        feature_weights=feature_weights or {},
+        deck_vocab=deck_vocab,
     )
     clustered_ids: set[str] = set(hdbscan_noise)
     for sids, _centroid in raw_clusters:
@@ -582,6 +618,24 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             "clusters below this cosine distance."
         ),
     )
+    parser.add_argument(
+        "--type-weight", type=float, default=0.0,
+        help=(
+            "[cluster mode] Extra weight on a card's type-line features "
+            "(supertypes + card types + deck-local subtypes). 0.0 (default) "
+            "disables; try 0.3-0.6 to pull creature-vs-noncreature splits "
+            "apart. Composes under cosine with the card_vector."
+        ),
+    )
+    parser.add_argument(
+        "--mana-cost-weight", type=float, default=0.0,
+        help=(
+            "[cluster mode] Extra weight on a card's mana_cost shape "
+            "(10-dim: generic, WUBRG, X, hybrid, phyrexian, snow). 0.0 "
+            "(default) disables; try 0.2-0.4 to group by cost pattern. "
+            "Composes under cosine with the card_vector."
+        ),
+    )
     # ------- shared flags -------
     parser.add_argument(
         "--theme-blocklist", default=None,
@@ -614,6 +668,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     cards_coll = storage.cards_collection()
     tags_coll = storage.tags_collection()
     if args.mode == "cluster":
+        # Only pass through knobs that are actually active — avoids
+        # noisy "weight=0.0 feature=types" entries flowing into the
+        # clusterer when the user didn't ask for them.
+        feature_weights: dict[str, float] = {}
+        if args.type_weight > 0.0:
+            feature_weights["types"] = args.type_weight
+        if args.mana_cost_weight > 0.0:
+            feature_weights["mana_cost"] = args.mana_cost_weight
         profile = build_cluster_profile(
             names,
             cards_coll=cards_coll,
@@ -621,6 +683,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             min_cluster_size=args.cluster_min_size,
             cluster_selection_epsilon=args.cluster_selection_epsilon,
             blocklist=effective_blocklist,
+            feature_weights=feature_weights,
         )
     else:
         theme_filter = tc.ThemeFilter(

@@ -858,16 +858,153 @@ class TestTopLevelLabelling(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# card_clusterer: structural feature-vector helpers
+# ---------------------------------------------------------------------------
+
+class TestParseTypeLine(unittest.TestCase):
+
+    def test_simple_creature_line(self):
+        supers, types, subs = cc.parse_type_line("Creature — Human Wizard")
+        self.assertEqual(supers, [])
+        self.assertEqual(types, ["Creature"])
+        self.assertEqual(subs, ["Human", "Wizard"])
+
+    def test_legendary_supertype_picked_up(self):
+        supers, types, subs = cc.parse_type_line(
+            "Legendary Creature — Human Wizard"
+        )
+        self.assertEqual(supers, ["Legendary"])
+        self.assertEqual(types, ["Creature"])
+        self.assertEqual(subs, ["Human", "Wizard"])
+
+    def test_no_subtypes(self):
+        # "Instant" has no em-dash section — subs should be empty.
+        supers, types, subs = cc.parse_type_line("Instant")
+        self.assertEqual((supers, types, subs), ([], ["Instant"], []))
+
+    def test_multi_face_line_merges_both_sides(self):
+        # DFC: " // " splits faces; each face is parsed independently and
+        # the subs across faces concatenate so "Insect" doesn't vanish.
+        supers, types, subs = cc.parse_type_line(
+            "Creature — Human Wizard // Creature — Human Insect"
+        )
+        self.assertEqual(supers, [])
+        self.assertEqual(types, ["Creature", "Creature"])
+        self.assertEqual(subs, ["Human", "Wizard", "Human", "Insect"])
+
+    def test_empty_or_missing_line(self):
+        self.assertEqual(cc.parse_type_line(""), ([], [], []))
+        self.assertEqual(cc.parse_type_line(None), ([], [], []))
+
+
+class TestBuildTypeVector(unittest.TestCase):
+
+    def test_multi_hot_shape_and_hits(self):
+        # Vector has fixed supertype + type blocks then the deck-local
+        # subtype block. A Legendary Creature — Human Wizard should
+        # trigger exactly 4 dims: Legendary, Creature, Human, Wizard.
+        doc = {"type_line": "Legendary Creature — Human Wizard"}
+        vocab = ("Elf", "Human", "Wizard")
+        vec = cc.build_type_vector(doc, vocab)
+        expected_dim = len(cc._SUPERTYPES) + len(cc._TYPES) + len(vocab)
+        self.assertEqual(vec.shape, (expected_dim,))
+        self.assertEqual(vec.dtype, np.float32)
+        self.assertEqual(float(vec.sum()), 4.0)
+        # Spot-check the right dims lit up.
+        super_offset = cc._SUPERTYPES.index("Legendary")
+        type_offset = len(cc._SUPERTYPES) + cc._TYPES.index("Creature")
+        human_offset = len(cc._SUPERTYPES) + len(cc._TYPES) + vocab.index("Human")
+        wizard_offset = len(cc._SUPERTYPES) + len(cc._TYPES) + vocab.index("Wizard")
+        self.assertEqual(vec[super_offset], 1.0)
+        self.assertEqual(vec[type_offset], 1.0)
+        self.assertEqual(vec[human_offset], 1.0)
+        self.assertEqual(vec[wizard_offset], 1.0)
+
+    def test_subtype_outside_vocab_silently_drops(self):
+        # "Elf" isn't in vocab → that dim doesn't exist and no error raised.
+        # Only the vocab subtypes count. Protects against subtypes that
+        # appear in one card but not elsewhere in the deck.
+        doc = {"type_line": "Creature — Elf Druid"}
+        vocab = ("Human", "Wizard")  # neither matches
+        vec = cc.build_type_vector(doc, vocab)
+        # Only "Creature" dim should fire.
+        self.assertEqual(float(vec.sum()), 1.0)
+
+    def test_empty_type_line_returns_zero_vector(self):
+        vec = cc.build_type_vector({}, ("Human",))
+        self.assertEqual(
+            vec.shape,
+            (len(cc._SUPERTYPES) + len(cc._TYPES) + 1,),
+        )
+        self.assertEqual(float(vec.sum()), 0.0)
+
+
+class TestBuildManaCostVector(unittest.TestCase):
+
+    def test_coloured_pips_counted(self):
+        # Birds of Paradise — one green pip, no other symbols.
+        vec = cc.build_mana_cost_vector("{G}")
+        self.assertEqual(vec.shape, (10,))
+        self.assertEqual(vec[5], 1.0)  # G
+        self.assertEqual(float(vec.sum()), 1.0)
+
+    def test_generic_plus_coloured(self):
+        # {3}{W}{W} — generic bucket gets 3.0, white bucket gets 2.
+        vec = cc.build_mana_cost_vector("{3}{W}{W}")
+        self.assertEqual(vec[0], 3.0)  # generic
+        self.assertEqual(vec[1], 2.0)  # W
+        self.assertEqual(float(vec.sum()), 5.0)
+
+    def test_variable_x_counted_separately(self):
+        # {X}{R}{R} — X goes in its own bucket, not generic.
+        vec = cc.build_mana_cost_vector("{X}{R}{R}")
+        self.assertEqual(vec[0], 0.0)
+        self.assertEqual(vec[4], 2.0)  # R
+        self.assertEqual(vec[6], 1.0)  # X/Y/Z
+
+    def test_hybrid_pip_counted_once_in_hybrid_bucket(self):
+        # {W/U} is one hybrid pip — not half-and-half across W and U.
+        vec = cc.build_mana_cost_vector("{W/U}")
+        self.assertEqual(vec[1], 0.0)  # not W
+        self.assertEqual(vec[2], 0.0)  # not U
+        self.assertEqual(vec[7], 1.0)  # hybrid
+
+    def test_phyrexian_pip_counted_in_phyrexian_bucket(self):
+        # {W/P} — phyrexian takes precedence over hybrid.
+        vec = cc.build_mana_cost_vector("{W/P}")
+        self.assertEqual(vec[1], 0.0)
+        self.assertEqual(vec[7], 0.0)
+        self.assertEqual(vec[8], 1.0)  # phyrexian
+
+    def test_snow_pip(self):
+        vec = cc.build_mana_cost_vector("{S}{2}")
+        self.assertEqual(vec[9], 1.0)
+        self.assertEqual(vec[0], 2.0)
+
+    def test_empty_or_none_cost_is_zero_vector(self):
+        self.assertEqual(float(cc.build_mana_cost_vector(None).sum()), 0.0)
+        self.assertEqual(float(cc.build_mana_cost_vector("").sum()), 0.0)
+
+    def test_multi_face_cost_sums_both_faces(self):
+        # MDFC-style " // " join — both faces' pips contribute.
+        vec = cc.build_mana_cost_vector("{2}{G} // {3}{G}")
+        self.assertEqual(vec[0], 5.0)
+        self.assertEqual(vec[5], 2.0)
+
+
+# ---------------------------------------------------------------------------
 # card_clusterer: cluster_cards_by_vector
 # ---------------------------------------------------------------------------
 
 class TestClusterCardsByVector(unittest.TestCase):
 
-    def _card(self, sid, vec, tags=()):
+    def _card(self, sid, vec, tags=(), type_line=None, mana_cost=None):
         return {
             "_id": sid,
             "tags": list(tags),
             "card_vector": emb._pack_embedding(np.array(vec, dtype=np.float32)),
+            "type_line": type_line,
+            "mana_cost": mana_cost,
         }
 
     def test_three_tight_groups_cluster_cleanly(self):
@@ -912,6 +1049,91 @@ class TestClusterCardsByVector(unittest.TestCase):
         clusters, noise = cc.cluster_cards_by_vector(deck, min_cluster_size=3)
         self.assertEqual(clusters, [])
         self.assertEqual(noise, [])
+
+    def test_type_weight_separates_otherwise_similar_vectors(self):
+        # Six cards packed tightly on the +x axis (small perturbations so
+        # HDBSCAN's mutual-reachability doesn't degenerate). Without
+        # feature weighting the cluster shape depends on tiny perturbations
+        # alone; adding a dominant --type-weight should force a split
+        # along Creature vs. Instant irrespective of those perturbations.
+        deck = [
+            self._card("c1", [1.0, 0.01, 0.0, 0.0], type_line="Creature — Human"),
+            self._card("c2", [1.0, 0.02, 0.0, 0.0], type_line="Creature — Elf"),
+            self._card("c3", [1.0, 0.03, 0.0, 0.0], type_line="Creature — Human"),
+            self._card("i1", [1.0, 0.04, 0.0, 0.0], type_line="Instant"),
+            self._card("i2", [1.0, 0.05, 0.0, 0.0], type_line="Instant"),
+            self._card("i3", [1.0, 0.06, 0.0, 0.0], type_line="Instant"),
+        ]
+        # Dominant type weight: Creature-vs-Instant distance >> within-type
+        # distance → two clusters, one per type.
+        weighted_clusters, _ = cc.cluster_cards_by_vector(
+            deck,
+            min_cluster_size=2,
+            feature_weights={"types": 10.0},
+            deck_vocab={"subtypes": ("Human", "Elf")},
+        )
+        memberships = {frozenset(sids) for sids, _ in weighted_clusters}
+        self.assertEqual(memberships, {
+            frozenset({"c1", "c2", "c3"}),
+            frozenset({"i1", "i2", "i3"}),
+        })
+
+    def test_centroid_stays_in_base_card_vector_space(self):
+        # Centroid dim must equal card_vector dim regardless of feature
+        # weights — downstream ranking expects base-space centroids.
+        # Reuse the 6-card type-split setup so HDBSCAN reliably produces
+        # clusters under cosine metric; what we check here is that EACH
+        # cluster's centroid is 4-dim (base space), not 4 + augmented dims.
+        deck = [
+            self._card("c1", [1.0, 0.01, 0.0, 0.0], type_line="Creature — Human"),
+            self._card("c2", [1.0, 0.02, 0.0, 0.0], type_line="Creature — Elf"),
+            self._card("c3", [1.0, 0.03, 0.0, 0.0], type_line="Creature — Human"),
+            self._card("i1", [1.0, 0.04, 0.0, 0.0], type_line="Instant"),
+            self._card("i2", [1.0, 0.05, 0.0, 0.0], type_line="Instant"),
+            self._card("i3", [1.0, 0.06, 0.0, 0.0], type_line="Instant"),
+        ]
+        clusters, _ = cc.cluster_cards_by_vector(
+            deck,
+            min_cluster_size=2,
+            feature_weights={"types": 10.0, "mana_cost": 2.0},
+            deck_vocab={"subtypes": ("Human", "Elf")},
+        )
+        self.assertGreater(len(clusters), 0)
+        for _sids, centroid in clusters:
+            self.assertEqual(centroid.shape, (4,))
+
+    def test_zero_weight_feature_is_a_noop(self):
+        # Weight 0.0 shouldn't change cluster membership vs. no feature
+        # at all — the sub-vector is simply skipped.
+        deck = [
+            self._card("a", [1.0, 0.01, 0.0, 0.0], type_line="Creature"),
+            self._card("b", [1.0, 0.02, 0.0, 0.0], type_line="Instant"),
+            self._card("c", [1.0, 0.03, 0.0, 0.0], type_line="Sorcery"),
+        ]
+        bare, _ = cc.cluster_cards_by_vector(deck, min_cluster_size=2)
+        with_zero, _ = cc.cluster_cards_by_vector(
+            deck,
+            min_cluster_size=2,
+            feature_weights={"types": 0.0},
+            deck_vocab={"subtypes": ()},
+        )
+        self.assertEqual(
+            [sorted(sids) for sids, _ in bare],
+            [sorted(sids) for sids, _ in with_zero],
+        )
+
+    def test_unknown_feature_name_raises(self):
+        # Typo in feature name should surface loudly, not silently drop.
+        deck = [
+            self._card("a", [1.0, 0.0, 0.0, 0.0]),
+            self._card("b", [1.0, 0.0, 0.0, 0.0]),
+        ]
+        with self.assertRaises(KeyError):
+            cc.cluster_cards_by_vector(
+                deck,
+                min_cluster_size=2,
+                feature_weights={"bogus": 0.5},
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1401,40 @@ class TestMainCLI(_MongoBackedTestCase):
             "--mode", "cluster", "--cluster-min-size", "2",
         ])
         self.assertEqual(rc, 0)
+        self.assertIn("theme 'removal'", out)
+        self.assertIn("theme 'ramp'", out)
+
+    def test_type_and_mana_cost_weight_flags_pipe_through(self):
+        # Confirms the two new cluster-mode knobs are accepted by argparse
+        # and reach the clusterer without crashing. Seeds the same two
+        # groups as the prior test with type_line + mana_cost populated so
+        # the feature builders have real data to consume.
+        self._seed_hierarchy()
+        for i in range(3):
+            self.cards.insert_one({
+                "_id": f"rem-{i}", "name": f"Rem {i}", "names": [f"rem {i}"],
+                "tags": ["spot-removal"],
+                "card_vector": _pack([1.0, 0.0, 0.0, 0.0]),
+                "type_line": "Instant",
+                "mana_cost": "{R}",
+            })
+        for i in range(3):
+            self.cards.insert_one({
+                "_id": f"ramp-{i}", "name": f"Ramp {i}", "names": [f"ramp {i}"],
+                "tags": ["mana-rock"],
+                "card_vector": _pack([0.0, 1.0, 0.0, 0.0]),
+                "type_line": "Artifact",
+                "mana_cost": "{1}",
+            })
+        rc, out, _ = _run_cli([
+            "Rem 0", "Rem 1", "Rem 2", "Ramp 0", "Ramp 1", "Ramp 2",
+            "--mode", "cluster", "--cluster-min-size", "2",
+            "--type-weight", "0.4", "--mana-cost-weight", "0.3",
+        ])
+        self.assertEqual(rc, 0)
+        # Both groups should still surface as their respective themes —
+        # the structural features reinforce the base split rather than
+        # scrambling it on this orthogonal fixture.
         self.assertIn("theme 'removal'", out)
         self.assertIn("theme 'ramp'", out)
 
