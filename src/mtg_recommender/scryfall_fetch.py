@@ -37,6 +37,12 @@ Storage (MongoDB — see `storage.py` for connection details):
           "type_line":        "...",
           "oracle_text":      "...",
           "oracle_text_sha":  "<16-hex sha256 prefix>", # the diff key
+          "keywords":         ["Flying", ...],       # Scryfall keywords array
+          "colors":           ["W", "U", ...],       # face colors (WUBRG)
+          "color_identity":   ["W", "U", ...],       # Commander-rules legality
+          "cmc":              <float>,               # converted mana value
+          "power":            "<str>" | None,        # creatures only
+          "toughness":        "<str>" | None,        # creatures only
         }
 
     Per-card `updated_at` is not stored — the snapshot timestamp lives
@@ -241,6 +247,22 @@ def extract_card_fields(data: dict) -> dict:
         # decide which docs actually need re-writing and which embedding
         # fields to invalidate.
         "oracle_text_sha": oracle_text_sha(oracle_text),
+        # Scryfall-provided structural fields used by Phase 3 cluster
+        # mode as weighted features. Stored verbatim — downstream code
+        # does its own parsing of mana_cost + type_line and doesn't
+        # need Scryfall's redundant representations beyond what's here.
+        #
+        # Nulls: non-creatures carry power/toughness = None; a card
+        # without a mana_cost still has cmc=0.0. Keywords and colors
+        # arrays are always present (empty list if Scryfall doesn't
+        # populate them), so downstream code can rely on the key
+        # existing even when the content is empty.
+        "keywords": list(data.get("keywords") or []),
+        "colors": list(data.get("colors") or []),
+        "color_identity": list(data.get("color_identity") or []),
+        "cmc": float(data.get("cmc") or 0.0),
+        "power": data.get("power"),
+        "toughness": data.get("toughness"),
     }
 
 
@@ -264,7 +286,8 @@ def http_get_json(url: str, timeout: int = 30) -> dict:
 # oracle_tags module — survives a bulk merge. The fields owned here are:
 #
 #     _id, oracle_id, name, names, mana_cost, type_line, oracle_text,
-#     oracle_text_sha
+#     oracle_text_sha, keywords, colors, color_identity, cmc, power,
+#     toughness
 #
 # A content-change merge also $unsets `text_embedding` and `card_vector`
 # — not owned here, but conceptually downstream of oracle_text, so a
@@ -276,6 +299,8 @@ def http_get_json(url: str, timeout: int = 30) -> dict:
 _OWNED_FIELDS = (
     "oracle_id", "name", "names",
     "mana_cost", "type_line", "oracle_text", "oracle_text_sha",
+    "keywords", "colors", "color_identity",
+    "cmc", "power", "toughness",
 )
 
 # Downstream fields the fetcher $unsets when a card's oracle_text changes.
@@ -310,57 +335,65 @@ def upsert_card(coll: Collection, raw: dict) -> bool:
     return True
 
 
-def bulk_upsert_cards(coll: Collection, bulk: list[dict]) -> tuple[int, int, int]:
-    """Diff-aware upsert of a bulk list. Returns (new, changed, unchanged).
+def bulk_upsert_cards(
+    coll: Collection, bulk: list[dict]
+) -> tuple[int, int, int, int]:
+    """Diff-aware upsert. Returns (new, changed, patched, unchanged).
 
-    Loads every stored `oracle_text_sha` into memory first (one Mongo
-    read of ~40 k tiny docs), then classifies each incoming card against
-    its stored sha:
+    Loads existing docs' sha AND owned-field presence into memory first
+    (one Mongo projection scan of ~40k tiny docs), then classifies each
+    incoming card:
 
-      - unchanged (stored sha matches): emits no write at all.
-      - changed (stored sha differs): $set the owned fields AND $unset
-        `text_embedding` + `card_vector` so downstream re-encodes pick
-        up only the cards that actually need redoing.
-      - new (no stored sha): $set the owned fields with upsert=True; no
-        downstream fields exist yet so there's nothing to unset.
+      - new (no stored doc): $set the owned fields with upsert=True;
+        nothing downstream to invalidate yet.
+      - changed (stored sha differs from incoming): $set the owned
+        fields AND $unset `text_embedding` + `card_vector` so the next
+        `mtg-embed` run re-encodes only the cards that actually need it.
+      - patched (sha matches but at least one newly-owned field is
+        missing from the stored doc): $set the owned fields WITHOUT
+        $unset. The content is the same — just the schema is older
+        than this module expects. Keeps embeddings valid across a
+        schema add (the whole point of this case).
+      - unchanged (sha matches, every owned field present): no write.
 
     `bulk_write(ordered=False)` lets individual failed ops not stop the
     rest. A card without an `id` in the raw dict is skipped (same
     semantics as the single-doc path).
 
-    Why return a 3-tuple instead of just a count: the CLI reports it to
-    the user, and tests assert on the breakdown so a regression that
-    secretly rewrites every card is caught.
+    Why return a 4-tuple instead of just a count: the CLI reports the
+    breakdown to the user, and tests assert on it so a regression that
+    secretly rewrites every card (or quietly misses the schema patch)
+    is caught.
     """
-    # One projection scan of the whole collection. The index on _id makes
-    # this a sequential read of the smallest possible subdocument.
-    existing_shas: dict[str, str | None] = {
-        doc["_id"]: doc.get("oracle_text_sha")
-        for doc in coll.find({}, {"_id": 1, "oracle_text_sha": 1})
+    # Project every owned field so we can detect schema drift (field
+    # missing from the stored doc even though sha matches). The index
+    # on _id keeps the server-side scan cheap; the extra bytes per
+    # doc are modest.
+    projection: dict[str, int] = {"_id": 1}
+    for field in _OWNED_FIELDS:
+        projection[field] = 1
+    existing: dict[str, dict] = {
+        doc["_id"]: doc for doc in coll.find({}, projection)
     }
 
-    new_count = changed_count = unchanged_count = 0
+    new_count = changed_count = patched_count = unchanged_count = 0
     ops: list[UpdateOne] = []
     for raw in bulk:
         doc = extract_card_fields(raw)
         sid = doc["_id"]
         if not sid:
             continue
-        new_sha = doc["oracle_text_sha"]
-        stored_sha = existing_shas.get(sid)
-        if stored_sha == new_sha and sid in existing_shas:
-            # Content unchanged; owned-field churn (name case-fix, etc.)
-            # isn't worth a write. Downstream embeddings stay valid.
-            unchanged_count += 1
-            continue
-        if sid not in existing_shas:
+        stored = existing.get(sid)
+        if stored is None:
             # New card — nothing downstream to invalidate.
             ops.append(UpdateOne({"_id": sid}, {"$set": _set_payload(doc)}, upsert=True))
             new_count += 1
-        else:
+            continue
+        new_sha = doc["oracle_text_sha"]
+        stored_sha = stored.get("oracle_text_sha")
+        if stored_sha != new_sha:
             # Changed card — clear the two downstream fields so the
             # next `mtg-embed cards` / `mtg-embed fuse` re-encodes it.
-            # Everything else owned by this module gets refreshed.
             ops.append(
                 UpdateOne(
                     {"_id": sid},
@@ -371,10 +404,26 @@ def bulk_upsert_cards(coll: Collection, bulk: list[dict]) -> tuple[int, int, int
                 )
             )
             changed_count += 1
+            continue
+        # sha matches. Check for schema drift: any owned field that
+        # the stored doc is missing. `None` as a stored value is NOT
+        # drift — it's a legitimately-null field (e.g. non-creature
+        # power/toughness); only the key being absent counts.
+        missing_fields = [f for f in _OWNED_FIELDS if f not in stored]
+        if missing_fields:
+            # Patch rewrite — same content, newer schema. Do NOT $unset
+            # the embedding fields; the sha hasn't changed, so the
+            # cached text_embedding + card_vector are still valid.
+            ops.append(
+                UpdateOne({"_id": sid}, {"$set": _set_payload(doc)})
+            )
+            patched_count += 1
+        else:
+            unchanged_count += 1
 
     if ops:
         coll.bulk_write(ops, ordered=False)
-    return new_count, changed_count, unchanged_count
+    return new_count, changed_count, patched_count, unchanged_count
 
 
 def find_cards_by_name(coll: Collection, name: str) -> list[dict]:
@@ -555,16 +604,23 @@ def run_bulk_mode(coll: Collection) -> bool:
         return False
 
     bulk = download_bulk_oracle_cards(meta)
-    new_count, changed_count, unchanged_count = bulk_upsert_cards(coll, bulk)
-    total = new_count + changed_count + unchanged_count
+    new_count, changed_count, patched_count, unchanged_count = bulk_upsert_cards(
+        coll, bulk
+    )
+    total = new_count + changed_count + patched_count + unchanged_count
     print(
         f"bulk  : {new_count} new, {changed_count} changed, "
-        f"{unchanged_count} unchanged (of {total} in snapshot)"
+        f"{patched_count} patched, {unchanged_count} unchanged "
+        f"(of {total} in snapshot)"
     )
     # Record the snapshot last so a crash mid-merge leaves meta un-set and
     # the next run retries rather than falsely claiming freshness.
     storage.set_meta_value(META_SOURCE, snapshot_updated_at)
-    return new_count > 0 or changed_count > 0
+    # "Did we touch Mongo?" — new/changed are obvious; patched also
+    # writes (schema migration), so flip the summary message to "saved…"
+    # for the user instead of "no changes" even though no embeddings
+    # got invalidated.
+    return new_count > 0 or changed_count > 0 or patched_count > 0
 
 
 # ---------------------------------------------------------------------------
