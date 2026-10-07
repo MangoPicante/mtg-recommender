@@ -42,6 +42,27 @@ Tests: offline unittest + mongomock suite only — no integration suite. `mtg-ch
     - `mtg-embed cards` / `tags` / `fuse` compare the active `MTG_EMBEDDING_MODEL` / `--alpha` against the previous run's values stored in `meta`, and `$unset` the stale fields on drift. The subsequent "skip if field exists" loop then re-encodes exactly what was invalidated.
   `--refresh` remains on `mtg-embed *` as a nuclear override but no normal workflow needs it.
 
+### Phase 2.5 — tag relationship graph + card role classification
+
+The embeddings in Phase 2 capture what a card does in isolation, but a card's value in a deck is almost entirely about how it couples to the rest of the deck. A ritual is a ritual because something downstream wants extra mana on turn N; a `triggers-on-noncreature-cast` body is only a payoff if the deck is actually casting noncreature spells. We need a representation of those couplings before we can meaningfully rank candidates (Phase 3 step 4) or explain why a card belongs.
+
+1. **Oracle-tag relationship graph.** Build a directed graph over oracle-tag slugs where an edge `A -> B` means "a card tagged `A` produces something a card tagged `B` consumes." Example edges: `instant` -> `triggers-on-noncreature-cast`, `token-maker` -> `sacrifice-outlet`, `mana-ritual` -> `expensive-x-spell`. Stored as a new `tag_relationships` collection keyed by `(producer, consumer)` with a relationship-type label (`cast-trigger`, `resource-produces-resource`, `enables-cost`, …) and provenance for why the edge exists.
+
+   Edge discovery is the hard part — tag labels + descriptions are short and noisy. Likely a hybrid: a hand-curated seed set of relationship types, LLM-assisted labelling over tag label+description pairs for breadth, and co-occurrence validation against EDHREC deck lists (edges whose endpoints never co-appear in strong decks for any commander are probably spurious). Exact approach is an open question.
+
+2. **Per-card relationship footprint.** Each card gets a `produces` set and a `consumes` set derived by expanding its tag array through the relationship graph: `produces = union over card.tags of outgoing edges`, `consumes = union over card.tags of incoming edges`. Persisted on the card doc so the role classifier doesn't re-walk the graph per deck. Invalidated the same way `card_vector` is — on tag-array change or relationship-graph version bump stored in `meta`.
+
+3. **Deck-contextual role classifier.** Given a decklist + commander, compute the deck's aggregate `produces` / `consumes` multisets (and the commander's separately — the commander is weighted heavier because it's always on the battlefield). Then classify each card by how its own footprint lines up with the rest:
+   - **engine** — produces resources that many other deck cards consume.
+   - **payoff** — consumes resources the commander or deck heavily produces.
+   - **enabler** — produces a resource that unlocks a specific consumer already in the deck.
+   - **utility** — produces/consumes resources that the deck mostly doesn't care about (removal, ramp, draw that any deck would want).
+   - **off-theme** — footprint doesn't overlap the deck's at all.
+
+   Output per card: a role label plus a continuous "fit score" so weak engines don't get lumped with strong ones. The labels are what the recommender will attribute suggestions against ("fills missing payoff for commander's token production").
+
+4. **Feeds Phase 3.** The role classifier is what makes Phase 3 step 4's ranking explainable and gap-aware — instead of "cards near this cluster centroid," candidates are "cards whose `consumes` set matches the deck's unmet `produces` set." Step 3's cluster-evaluation step becomes more interpretable too: a cluster's lift signal gets attributed to the roles its member cards play.
+
 ### Phase 3 — recommendation
 
 The recommender takes a Commander decklist and produces a ranked list of candidate cards. The ranking combines the deck's own tag-cluster themes with EDHREC's per-commander lift / rank signal, so suggestions are "cards that fit the deck's themes AND empirically show up in strong decks for this commander."
@@ -83,6 +104,12 @@ Partner / background commanders are deferred to a follow-up — the EDHREC clien
 - Optional thin web UI.
 
 ## Open questions
+
+### Phase 2.5 kickoff
+
+- **Edge discovery for the tag relationship graph.** Hand-curated seeds, LLM-assisted labelling over tag label+description pairs, co-occurrence mining against EDHREC decks, or some hybrid. Precision matters more than recall at first — a sparse, trustworthy graph beats a dense noisy one for role classification. Needs a small eval set of known producer/consumer pairs to measure against before we commit.
+- **Relationship-type vocabulary.** Start minimal (`cast-trigger`, `resource-produces-resource`, `enables-cost`, `sacrifice-fodder`, `targets`) and grow only when a role can't be expressed with what we have. Over-splitting hurts the classifier more than under-splitting.
+- **Commander weighting in the role classifier.** The commander is always available, so its production/consumption should outweigh a single deck card — but by how much? Pick a default and leave it tunable; evaluate once the recommender has an eval loop.
 
 ### Phase 2 kickoff
 
